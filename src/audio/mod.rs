@@ -407,6 +407,13 @@ where
     fn total_duration(&self) -> Option<Duration> {
         self.input.total_duration()
     }
+    fn try_seek(&mut self, pos: Duration) -> Result<(), rodio::source::SeekError> {
+        let res = self.input.try_seek(pos);
+        if res.is_ok() {
+            self.buffer.clear();
+        }
+        res
+    }
 }
 
 // Complex number structure for raw Cooley-Tukey FFT implementation
