@@ -1,0 +1,11 @@
+# Cargo build artifacts
+/target
+
+# IDE files
+.idea/
+.vscode/
+
+# Backup and temp files
+*.rs.bk
+*.swp
+*~
