@@ -70,6 +70,12 @@ pub struct App {
     pub colls_list_state: ListState,
     pub coll_files_list_state: ListState,
     pub add_coll_list_state: ListState,
+    
+    // Media Controls Integration (MPRIS / Playerctl)
+    pub media_controls: Option<souvlaki::MediaControls>,
+    pub last_media_status: Option<PlaybackStatus>,
+    pub last_media_track: Option<PathBuf>,
+    pub last_media_elapsed: u64,
 }
 
 impl App {
@@ -99,10 +105,44 @@ impl App {
         };
 
         let browser = BrowserState::new(starting_dir, config.show_hidden);
-        let audio = AudioEngine::new(event_tx, config.default_volume);
+        let audio = AudioEngine::new(event_tx.clone(), config.default_volume);
         let queue = PlaybackQueue::new();
         let collections = Collections::load();
         let search = SearchState::new();
+
+        let media_controls = {
+            #[cfg(not(target_os = "windows"))]
+            let hwnd = None;
+            #[cfg(target_os = "windows")]
+            let hwnd = None;
+
+            let platform_config = souvlaki::PlatformConfig {
+                dbus_name: "stash",
+                display_name: "STASH Music Player",
+                hwnd,
+            };
+
+            if let Ok(mut controls) = souvlaki::MediaControls::new(platform_config) {
+                let tx_clone = event_tx.clone();
+                let _ = controls.attach(move |event| {
+                    match event {
+                        souvlaki::MediaControlEvent::Play | souvlaki::MediaControlEvent::Pause | souvlaki::MediaControlEvent::Toggle => {
+                            let _ = tx_clone.send(Event::MediaPlayPause);
+                        }
+                        souvlaki::MediaControlEvent::Next => {
+                            let _ = tx_clone.send(Event::MediaNext);
+                        }
+                        souvlaki::MediaControlEvent::Previous => {
+                            let _ = tx_clone.send(Event::MediaPrev);
+                        }
+                        _ => {}
+                    }
+                });
+                Some(controls)
+            } else {
+                None
+            }
+        };
 
         Self {
             config,
@@ -128,6 +168,10 @@ impl App {
             colls_list_state: ListState::default(),
             coll_files_list_state: ListState::default(),
             add_coll_list_state: ListState::default(),
+            media_controls,
+            last_media_status: None,
+            last_media_track: None,
+            last_media_elapsed: 0,
         }
     }
 
@@ -149,9 +193,33 @@ impl App {
                     self.browser.clear_selections();
                     self.browser.refresh();
                 }
+                self.update_media_controls();
             }
             Event::AudioFinished => {
                 self.handle_audio_finished();
+            }
+            Event::MediaPlayPause => {
+                self.toggle_playback();
+            }
+            Event::MediaNext => {
+                let shuffle = {
+                    let state = self.audio.shared_state.lock().unwrap();
+                    state.shuffle
+                };
+                if let Some(next_path) = self.queue.next(shuffle) {
+                    self.audio.play(next_path);
+                    self.sync_queue_selection();
+                }
+            }
+            Event::MediaPrev => {
+                let shuffle = {
+                    let state = self.audio.shared_state.lock().unwrap();
+                    state.shuffle
+                };
+                if let Some(prev_path) = self.queue.prev(shuffle) {
+                    self.audio.play(prev_path);
+                    self.sync_queue_selection();
+                }
             }
         }
     }
@@ -175,6 +243,7 @@ impl App {
             // Move to next track in queue
             if let Some(next_path) = self.queue.next(shuffle) {
                 self.audio.play(next_path);
+                self.sync_queue_selection();
             }
         }
     }
@@ -277,6 +346,7 @@ impl App {
                 };
                 if let Some(next_path) = self.queue.next(shuffle) {
                     self.audio.play(next_path);
+                    self.sync_queue_selection();
                 }
             }
             KeyCode::Char('b') => {
@@ -286,6 +356,7 @@ impl App {
                 };
                 if let Some(prev_path) = self.queue.prev(shuffle) {
                     self.audio.play(prev_path);
+                    self.sync_queue_selection();
                 }
             }
             KeyCode::Char('s') => {
@@ -319,6 +390,7 @@ impl App {
                 if next_shuffle {
                     self.queue.shuffle_items();
                 }
+                self.sync_queue_selection();
             }
             
             // Queue & Collections triggers
@@ -656,6 +728,7 @@ impl App {
                             self.queue.add(path.clone());
                             self.queue.current_index = Some(0);
                             self.audio.play(path);
+                            self.sync_queue_selection();
                         }
                     }
                 } else {
@@ -682,6 +755,7 @@ impl App {
                                     }
                                     
                                     self.audio.play(path);
+                                    self.sync_queue_selection();
                                 }
                             }
                         }
@@ -690,9 +764,21 @@ impl App {
             }
             AppScreen::Queue => {
                 if !self.queue.items.is_empty() && self.queue_selected_index < self.queue.items.len() {
-                    let path = self.queue.items[self.queue_selected_index].clone();
-                    self.queue.current_index = Some(self.queue_selected_index);
+                    let is_shuffle = {
+                        let state = self.audio.shared_state.lock().unwrap();
+                        state.shuffle
+                    };
+                    
+                    let original_idx = if is_shuffle && !self.queue.shuffle_indices.is_empty() {
+                        self.queue.shuffle_indices[self.queue_selected_index]
+                    } else {
+                        self.queue_selected_index
+                    };
+
+                    let path = self.queue.items[original_idx].clone();
+                    self.queue.current_index = Some(original_idx);
                     self.audio.play(path);
+                    self.sync_queue_selection();
                 }
             }
             AppScreen::Collections => {
@@ -709,6 +795,7 @@ impl App {
                                 self.queue.current_index = Some(self.active_collection_file_index);
                                 
                                 self.audio.play(path);
+                                self.sync_queue_selection();
                             }
                         }
                     }
@@ -729,6 +816,74 @@ impl App {
                 elapsed.saturating_add(seconds as u64).min(duration)
             };
             self.audio.seek(std::time::Duration::from_secs(new_pos));
+        }
+    }
+
+    pub fn sync_queue_selection(&mut self) {
+        if let Some(idx) = self.queue.current_index {
+            let is_shuffle = {
+                let state = self.audio.shared_state.lock().unwrap();
+                state.shuffle
+            };
+            if is_shuffle && !self.queue.shuffle_indices.is_empty() {
+                if let Some(shuffled_idx) = self.queue.shuffle_indices.iter().position(|&x| x == idx) {
+                    self.queue_selected_index = shuffled_idx;
+                }
+            } else {
+                self.queue_selected_index = idx;
+            }
+        }
+    }
+
+    fn update_media_controls(&mut self) {
+        if let Some(ref mut controls) = self.media_controls {
+            let (status, current_track, metadata, elapsed, duration) = {
+                let state = self.audio.shared_state.lock().unwrap();
+                (state.status, state.current_track.clone(), state.metadata.clone(), state.elapsed_secs, state.duration_secs)
+            };
+
+            let status_changed = Some(status) != self.last_media_status;
+            let track_changed = current_track != self.last_media_track;
+            let elapsed_changed = elapsed != self.last_media_elapsed;
+
+            if status_changed || track_changed || elapsed_changed {
+                if track_changed {
+                    if let Some(meta) = metadata {
+                        let title = meta.title.as_deref();
+                        let artist = meta.artist.as_deref();
+                        let album = meta.album.as_deref();
+                        let m_meta = souvlaki::MediaMetadata {
+                            title,
+                            artist,
+                            album,
+                            duration: Some(std::time::Duration::from_secs(duration)),
+                            ..Default::default()
+                        };
+                        let _ = controls.set_metadata(m_meta);
+                    } else {
+                        let _ = controls.set_metadata(souvlaki::MediaMetadata::default());
+                    }
+                    self.last_media_track = current_track;
+                }
+
+                if status_changed || elapsed_changed {
+                    let progress = if duration > 0 {
+                        Some(souvlaki::MediaPosition(std::time::Duration::from_secs(elapsed)))
+                    } else {
+                        None
+                    };
+
+                    let playback = match status {
+                        PlaybackStatus::Playing => souvlaki::MediaPlayback::Playing { progress },
+                        PlaybackStatus::Paused => souvlaki::MediaPlayback::Paused { progress },
+                        PlaybackStatus::Stopped => souvlaki::MediaPlayback::Stopped,
+                    };
+                    let _ = controls.set_playback(playback);
+
+                    self.last_media_status = Some(status);
+                    self.last_media_elapsed = elapsed;
+                }
+            }
         }
     }
 

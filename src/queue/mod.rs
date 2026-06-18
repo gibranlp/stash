@@ -176,6 +176,12 @@ impl PlaybackQueue {
     fn regenerate_shuffle_indices(&mut self) {
         let mut indices: Vec<usize> = (0..self.items.len()).collect();
         indices.shuffle(&mut thread_rng());
+        if let Some(curr) = self.current_index {
+            if let Some(pos) = indices.iter().position(|&x| x == curr) {
+                indices.remove(pos);
+            }
+            indices.insert(0, curr);
+        }
         self.shuffle_indices = indices;
     }
 }

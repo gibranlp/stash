@@ -7,6 +7,9 @@ pub enum Event {
     Key(KeyEvent),
     Tick,
     AudioFinished,
+    MediaPlayPause,
+    MediaNext,
+    MediaPrev,
 }
 
 pub fn spawn_event_handler(tx: std::sync::mpsc::Sender<Event>) {

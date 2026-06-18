@@ -11,12 +11,12 @@ Designed for terminal power users, it supports smooth, standard list scrolling, 
 1. **Dual-Pane File Browser**: Navigate directories recursively on the left, and view/play files on the right.
 2. **Dynamic FFT Visualizer**: Real-time 160-channel audio frequency spectrum analyzer (Cooley-Tukey Radix-2 FFT + Hanning window) that adjusts dynamically to your terminal width, styled with standard ANSI colors to work out of the box with `pywal` schemes.
 3. **Asynchronous File Operations**: Perform copy (`v`), move (`y`), and delete (`d`) operations on background worker threads with a progress bar and current filename overlay, ensuring the UI remains completely responsive.
-4. **Stateful Viewport Scrolling**: Standard scroll list handling where the cursor moves within the visible screen first, only scrolling the list viewport when hitting the top or bottom edges.
-5. **Quick Page Navigation**: Press `PageUp` and `PageDown` to jump selection cursor by 10 items.
-6. **Virtual Collections**: Organize favorite tracks or files into virtual playlists (persisted in `~/.config/stash/collections.json`) without duplicate disk space.
-7. **Playback Queue**: Queue multiple songs using standard commands and skip tracks cleanly with shuffle/repeat toggles.
-8. **Live Search**: Recursively search directory items live with incremental character matching using walkdir.
-9. **Directory Navigation Prepends**: Quick navigation directories `.` and `..` are automatically sorted at the top of the folder list.
+4. **Quick Page Navigation**: Press `PageUp` and `PageDown` to jump selection cursor by 10 items.
+5. **Virtual Collections**: Organize favorite tracks or files into virtual playlists (persisted in `~/.config/stash/collections.json`) without duplicate disk space.
+6. **Playback Queue**: Queue multiple songs using standard commands and skip tracks cleanly with shuffle/repeat toggles.
+7. **Live Search**: Recursively search directory items live with incremental character matching using walkdir.
+8. **Directory Navigation Prepends**: Quick navigation directories `.` and `..` are automatically sorted at the top of the folder list.
+9. **MPRIS D-Bus Integration**: Native support for OS media controls, letting you control playback (play/pause, next, previous) using `playerctl`, lock screens, or system media keys (like `XF86AudioPlay`).
 
 ---
 

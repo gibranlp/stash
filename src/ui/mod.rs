@@ -181,41 +181,84 @@ pub fn render(f: &mut Frame, app: &mut App) {
         AppScreen::Queue => {
             // Render Playlist Queue view
             let queue_border_style = Style::default().fg(Color::Cyan);
-            let queue_list_items: Vec<ListItem> = app
-                .queue
-                .items
-                .iter()
-                .enumerate()
-                .map(|(idx, path)| {
-                    let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Unknown".to_string());
-                    let is_highlighted = idx == app.queue_selected_index;
-                    
-                    let active_track = {
-                        let state = app.audio.shared_state.lock().unwrap();
-                        state.current_track.clone()
-                    };
-                    
-                    let is_playing_track = Some(path) == active_track.as_ref();
-                    
-                    let prefix = if is_highlighted { "> " } else { "  " };
-                    let playing_marker = if is_playing_track { "=> " } else { "   " };
-                    
-                    let text_style = if is_playing_track {
-                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-                    } else if is_highlighted {
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::White)
-                    };
+            
+            let is_shuffle = {
+                let state = app.audio.shared_state.lock().unwrap();
+                state.shuffle
+            };
 
-                    ListItem::new(Line::from(vec![
-                        Span::styled(prefix, Style::default().fg(Color::Cyan)),
-                        Span::styled(playing_marker, Style::default().fg(Color::Green)),
-                        Span::styled(format!("{}. ", idx + 1), Style::default().fg(Color::DarkGray)),
-                        Span::styled(name, text_style),
-                    ]))
-                })
-                .collect();
+            let queue_list_items: Vec<ListItem> = if is_shuffle && !app.queue.shuffle_indices.is_empty() {
+                app.queue
+                    .shuffle_indices
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &orig_idx)| {
+                        let path = &app.queue.items[orig_idx];
+                        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Unknown".to_string());
+                        let is_highlighted = idx == app.queue_selected_index;
+                        
+                        let active_track = {
+                            let state = app.audio.shared_state.lock().unwrap();
+                            state.current_track.clone()
+                        };
+                        
+                        let is_playing_track = Some(path) == active_track.as_ref();
+                        
+                        let prefix = if is_highlighted { "> " } else { "  " };
+                        let playing_marker = if is_playing_track { "=> " } else { "   " };
+                        
+                        let text_style = if is_playing_track {
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                        } else if is_highlighted {
+                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+
+                        ListItem::new(Line::from(vec![
+                            Span::styled(prefix, Style::default().fg(Color::Cyan)),
+                            Span::styled(playing_marker, Style::default().fg(Color::Green)),
+                            Span::styled(format!("{}. ", idx + 1), Style::default().fg(Color::DarkGray)),
+                            Span::styled(name, text_style),
+                        ]))
+                    })
+                    .collect()
+            } else {
+                app.queue
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, path)| {
+                        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Unknown".to_string());
+                        let is_highlighted = idx == app.queue_selected_index;
+                        
+                        let active_track = {
+                            let state = app.audio.shared_state.lock().unwrap();
+                            state.current_track.clone()
+                        };
+                        
+                        let is_playing_track = Some(path) == active_track.as_ref();
+                        
+                        let prefix = if is_highlighted { "> " } else { "  " };
+                        let playing_marker = if is_playing_track { "=> " } else { "   " };
+                        
+                        let text_style = if is_playing_track {
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                        } else if is_highlighted {
+                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+
+                        ListItem::new(Line::from(vec![
+                            Span::styled(prefix, Style::default().fg(Color::Cyan)),
+                            Span::styled(playing_marker, Style::default().fg(Color::Green)),
+                            Span::styled(format!("{}. ", idx + 1), Style::default().fg(Color::DarkGray)),
+                            Span::styled(name, text_style),
+                        ]))
+                    })
+                    .collect()
+            };
 
             let queue_list = List::new(queue_list_items)
                 .block(
