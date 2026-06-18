@@ -90,3 +90,44 @@ pub fn matches_audio_extension(path: &Path) -> bool {
         false
     }
 }
+
+pub fn matches_image_extension(path: &Path) -> bool {
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp")
+    } else {
+        false
+    }
+}
+
+pub fn matches_text_extension(path: &Path) -> bool {
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        matches!(
+            ext.to_lowercase().as_str(),
+            "txt"
+                | "rs"
+                | "py"
+                | "js"
+                | "ts"
+                | "json"
+                | "toml"
+                | "yaml"
+                | "yml"
+                | "md"
+                | "sh"
+                | "html"
+                | "css"
+                | "c"
+                | "cpp"
+                | "h"
+                | "hpp"
+                | "go"
+                | "java"
+                | "kt"
+                | "xml"
+                | "sql"
+        )
+    } else {
+        false
+    }
+}
+

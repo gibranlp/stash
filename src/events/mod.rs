@@ -10,6 +10,8 @@ pub enum Event {
     MediaPlayPause,
     MediaNext,
     MediaPrev,
+    MediaSeek(souvlaki::SeekDirection, std::time::Duration),
+    MediaSetPosition(std::time::Duration),
 }
 
 pub fn spawn_event_handler(tx: std::sync::mpsc::Sender<Event>) {

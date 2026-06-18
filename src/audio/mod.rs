@@ -31,6 +31,7 @@ pub struct AudioSharedState {
     pub metadata: Option<AudioMetadata>,
     pub device_error: Option<String>,
     pub visualizer_data: Vec<f32>,
+    pub visualizer_decay: f32,
 }
 
 pub struct AudioEngine {
@@ -39,7 +40,7 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
-    pub fn new(event_tx: Sender<crate::events::Event>, default_volume: u32) -> Self {
+    pub fn new(event_tx: Sender<crate::events::Event>, default_volume: u32, default_repeat: RepeatMode, default_shuffle: bool, default_decay: f32) -> Self {
         let (command_tx, command_rx) = channel::<AudioCommand>();
         let shared_state = Arc::new(Mutex::new(AudioSharedState {
             current_track: None,
@@ -47,11 +48,12 @@ impl AudioEngine {
             elapsed_secs: 0,
             duration_secs: 0,
             volume: default_volume,
-            repeat: RepeatMode::Off,
-            shuffle: false,
+            repeat: default_repeat,
+            shuffle: default_shuffle,
             metadata: None,
             device_error: None,
             visualizer_data: vec![0.0; 160],
+            visualizer_decay: default_decay,
         }));
 
         let state_clone = Arc::clone(&shared_state);
@@ -252,8 +254,9 @@ impl AudioEngine {
                     if st.visualizer_data.len() != num_bars {
                         st.visualizer_data = vec![0.0; num_bars];
                     }
+                    let decay = st.visualizer_decay;
                     for i in 0..num_bars {
-                        st.visualizer_data[i] = (st.visualizer_data[i] * 0.70).max(new_bars[i]);
+                        st.visualizer_data[i] = (st.visualizer_data[i] * decay).max(new_bars[i]);
                     }
                 } else {
                     let mut st = state_clone.lock().unwrap();
@@ -261,8 +264,9 @@ impl AudioEngine {
                         st.visualizer_data.fill(0.0);
                     } else {
                         // Smoothly decay visuals if no new samples are actively fetched
+                        let decay = (st.visualizer_decay + 0.15).min(0.95);
                         for val in &mut st.visualizer_data {
-                            *val = (*val * 0.85).max(0.0);
+                            *val = (*val * decay).max(0.0);
                         }
                     }
                 }

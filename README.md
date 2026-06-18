@@ -61,7 +61,17 @@ Designed for terminal power users, it supports smooth, standard list scrolling, 
 
 ## Installation & Compilation
 
-Ensure you have Rust and Cargo installed. On Linux, ensure `alsa-lib` development dependencies are installed (e.g. `libasound2-dev` on Debian/Ubuntu).
+Ensure you have Rust and Cargo installed.
+
+### Prerequisites by Operating System:
+
+- **Linux**: Ensure the `alsa-lib` development packages are installed (e.g. `libasound2-dev` on Debian/Ubuntu, `alsa-lib-devel` on Fedora/RHEL/openSUSE).
+- **macOS (Mac)**: Works natively out of the box using CoreAudio. No additional external libraries or dependencies are required.
+
+1. Install Rust (if not already installed):
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   ```
 
 ### 1. Compile and Install globally
 Run the following inside the project directory to install `stash` globally under your cargo binaries path:
@@ -107,9 +117,46 @@ STASH stores configuration and database files under your user config directory:
 
 ---
 
+
+## Midnight Commander (mc) Integration
+
+You can integrate STASH directly into Midnight Commander (`mc`) to quickly play files or browse folders:
+
+### 1. File Associations (Open audio in STASH)
+Open Midnight Commander, go to **Command -> Edit extension file** (or edit `~/.config/mc/mc.ext` directly), and add the following block:
+```ini
+# Open audio files in STASH
+regex/\.(mp3|flac|ogg|wav|m4a|aac)$
+    Open=stash "%f"
+```
+Pressing `Enter` on audio files inside `mc` will now queue and play them in `stash`.
+
+### 2. User Menu Shortcut (Open folder in STASH)
+To open the highlighted folder directly in STASH using the `mc` User Menu (accessible via `F2` key), add this to `~/.config/mc/menu` (or `mc.menu`):
+```ini
+s       Open current folder in STASH
+    stash "%d"
+```
+
+---
+
+## Recent Version Changelog (v0.2.0)
+
+- **Recursive Directory Operations**: Enabled selecting folders entirely (using `Space` key) to copy, move, or delete them recursively.
+- **Path Autocompletion**: Added `Tab` autocompletion for copy/move target inputs.
+- **Subdirectory Indicators**: Added visual markers (`▸`) in the browser list indicating folders that contain further subdirectories.
+- **Clean Layout Redraws**: Resolved screen corruption and leftover visual artifacts when closing file preview panels.
+- **Improved Audio Feedback**: Handled connection and ALSA device playback issues gracefully in the visual player dashboard.
+- **Preview Line Wrapping**: Enabled line wrapping in the code/text preview pane.
+- **Cursor Visibility**: Added support for standard visual text cursor positioning in all text dialog windows (`Rename`, `CopyPath`, `MovePath`, `CreateCollection`, `Search`).
+- **Compact Dialog Heights**: Shrunk progress, confirm, and rename/input dialog box heights to align closely with content limits.
+- **Sudo-Safe Helper Launcher**: Handled spawning GUI and audio players (like VLC) safely when `stash` runs with `sudo` permissions by dropping root privileges to the original `SUDO_USER` and forwarding essential display/audio variables (`DISPLAY`, `XAUTHORITY`, `WAYLAND_DISPLAY`, etc.).
+
 ## Author
 
 - **gibranlp**
 - Homepage: [gibranlp.dev](https://gibranlp.dev)
 - Repository: [github.com/gibranlp/stash](https://github.com/gibranlp/stash)
 - Email: thisdoesnotwork@gibranlp.dev
+
+---

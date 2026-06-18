@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -7,10 +7,12 @@ use crate::browser::{BrowserState, PaneType};
 use crate::collections::Collections;
 use crate::config::{AppConfig, resolve_path};
 use crate::events::Event;
-use crate::models::{PlaybackStatus, RepeatMode};
+use crate::models::{PlaybackStatus, RepeatMode, VisualizerMode};
 use crate::queue::PlaybackQueue;
-use crate::search::{SearchState, matches_audio_extension};
+use crate::search::{SearchState, matches_audio_extension, matches_image_extension, matches_text_extension};
 use ratatui::widgets::ListState;
+use lofty::prelude::*;
+use lofty::probe::Probe;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppScreen {
@@ -28,6 +30,7 @@ pub enum InputMode {
     CopyPath,
     MovePath,
     ConfirmDelete,
+    Rename,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +41,7 @@ pub struct FileOperationProgress {
     pub total_files: usize,
     pub finished: bool,
     pub error: Option<String>,
+    pub canceled: bool,
 }
 
 pub struct App {
@@ -75,9 +79,48 @@ pub struct App {
     pub last_media_status: Option<PlaybackStatus>,
     pub last_media_track: Option<PathBuf>,
     pub last_media_elapsed: u64,
+    pub rename_target: Option<PathBuf>,
+    pub image_zoom: f64,
+    pub image_offset_x: i32,
+    pub image_offset_y: i32,
+    pub last_previewed_file: Option<PathBuf>,
+    pub current_image_data: Option<(PathBuf, image::DynamicImage)>,
+    pub text_scroll_offset: usize,
+    pub current_text_data: Option<(PathBuf, Vec<String>)>,
+    pub config: AppConfig,
+    pub last_operation_dest: String,
 }
 
 impl App {
+    pub fn open_file_with_default_app(path: &Path) {
+        let mut cmd = if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+            if !sudo_user.is_empty() {
+                let mut c = std::process::Command::new("sudo");
+                c.arg("-u").arg(&sudo_user).arg("xdg-open").arg(path);
+                // Forward GUI and audio environments
+                for var in &["DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+                    if let Ok(val) = std::env::var(var) {
+                        c.env(var, val);
+                    }
+                }
+                c
+            } else {
+                let mut c = std::process::Command::new("xdg-open");
+                c.arg(path);
+                c
+            }
+        } else {
+            let mut c = std::process::Command::new("xdg-open");
+            c.arg(path);
+            c
+        };
+
+        let _ = cmd
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+
     pub fn new(event_tx: std::sync::mpsc::Sender<Event>, initial_path: Option<PathBuf>) -> Self {
         let config = AppConfig::load();
         
@@ -104,7 +147,7 @@ impl App {
         };
 
         let browser = BrowserState::new(starting_dir, config.show_hidden);
-        let audio = AudioEngine::new(event_tx.clone(), config.default_volume);
+        let audio = AudioEngine::new(event_tx.clone(), config.default_volume, config.repeat, config.shuffle, config.visualizer_decay);
         let queue = PlaybackQueue::new();
         let collections = Collections::load();
         let search = SearchState::new();
@@ -133,6 +176,15 @@ impl App {
                         }
                         souvlaki::MediaControlEvent::Previous => {
                             let _ = tx_clone.send(Event::MediaPrev);
+                        }
+                        souvlaki::MediaControlEvent::Seek(direction) => {
+                            let _ = tx_clone.send(Event::MediaSeek(direction, std::time::Duration::from_secs(5)));
+                        }
+                        souvlaki::MediaControlEvent::SeekBy(direction, duration) => {
+                            let _ = tx_clone.send(Event::MediaSeek(direction, duration));
+                        }
+                        souvlaki::MediaControlEvent::SetPosition(position) => {
+                            let _ = tx_clone.send(Event::MediaSetPosition(position.0));
                         }
                         _ => {}
                     }
@@ -170,6 +222,16 @@ impl App {
             last_media_status: None,
             last_media_track: None,
             last_media_elapsed: 0,
+            rename_target: None,
+            image_zoom: 1.0,
+            image_offset_x: 0,
+            image_offset_y: 0,
+            last_previewed_file: None,
+            current_image_data: None,
+            text_scroll_offset: 0,
+            current_text_data: None,
+            config,
+            last_operation_dest: String::new(),
         }
     }
 
@@ -181,7 +243,7 @@ impl App {
                 {
                     let p = self.file_progress.lock().unwrap();
                     if let Some(ref state) = *p {
-                        if state.finished {
+                        if state.finished && state.error.is_none() && !state.canceled {
                             should_refresh = true;
                         }
                     }
@@ -191,6 +253,25 @@ impl App {
                     self.browser.clear_selections();
                     self.browser.refresh();
                 }
+                let current_preview_path = if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
+                    let path = &self.browser.files[self.browser.file_index].path;
+                    if matches_image_extension(path) || matches_text_extension(path) {
+                        Some(path.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if current_preview_path != self.last_previewed_file {
+                    self.last_previewed_file = current_preview_path;
+                    self.image_zoom = 1.0;
+                    self.image_offset_x = 0;
+                    self.image_offset_y = 0;
+                    self.text_scroll_offset = 0;
+                }
+
                 self.update_media_controls();
             }
             Event::AudioFinished => {
@@ -218,6 +299,17 @@ impl App {
                     self.audio.play(prev_path);
                     self.sync_queue_selection();
                 }
+            }
+            Event::MediaSeek(direction, duration) => {
+                let seconds = duration.as_secs() as i64;
+                let sign = match direction {
+                    souvlaki::SeekDirection::Forward => 1,
+                    souvlaki::SeekDirection::Backward => -1,
+                };
+                self.seek_relative(seconds * sign);
+            }
+            Event::MediaSetPosition(duration) => {
+                self.audio.seek(duration);
             }
         }
     }
@@ -268,8 +360,27 @@ impl App {
             return;
         }
 
-        // Ignore input if a file operation is active
+        // Intercept keys if a file operation is active
         if self.is_file_operation_active() {
+            let mut dismiss = false;
+            {
+                let mut p = self.file_progress.lock().unwrap();
+                if let Some(ref mut state) = *p {
+                    if state.finished || state.error.is_some() || state.canceled {
+                        if key.code == KeyCode::Esc || key.code == KeyCode::Enter {
+                            dismiss = true;
+                        }
+                    } else if key.code == KeyCode::Esc {
+                        state.canceled = true;
+                        state.current_file = "Canceling...".to_string();
+                    }
+                }
+            }
+            if dismiss {
+                *self.file_progress.lock().unwrap() = None;
+                self.browser.clear_selections();
+                self.browser.refresh();
+            }
             return;
         }
 
@@ -286,10 +397,95 @@ impl App {
             InputMode::CopyPath => self.handle_copy_path_key(key),
             InputMode::MovePath => self.handle_move_path_key(key),
             InputMode::ConfirmDelete => self.handle_confirm_delete_key(key),
+            InputMode::Rename => self.handle_rename_key(key),
         }
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
+        if self.screen == AppScreen::Browser && self.browser.focused_pane == PaneType::Preview {
+            let is_txt = if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
+                matches_text_extension(&self.browser.files[self.browser.file_index].path)
+            } else {
+                false
+            };
+
+            if is_txt {
+                let file_path = self.browser.files[self.browser.file_index].path.clone();
+                let needs_load = match &self.current_text_data {
+                    Some((path, _)) => *path != file_path,
+                    None => true,
+                };
+                if needs_load {
+                    if let Ok(content) = std::fs::read_to_string(&file_path) {
+                        let parsed_lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+                        self.current_text_data = Some((file_path, parsed_lines));
+                    }
+                }
+
+                match key.code {
+                    KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') => {
+                        self.browser.focused_pane = PaneType::Files;
+                        return;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.text_scroll_offset = self.text_scroll_offset.saturating_sub(1);
+                        return;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if let Some((_, ref lines)) = self.current_text_data {
+                            if self.text_scroll_offset + 1 < lines.len() {
+                                self.text_scroll_offset += 1;
+                            }
+                        }
+                        return;
+                    }
+                    KeyCode::PageUp => {
+                        self.text_scroll_offset = self.text_scroll_offset.saturating_sub(10);
+                        return;
+                    }
+                    KeyCode::PageDown => {
+                        if let Some((_, ref lines)) = self.current_text_data {
+                            self.text_scroll_offset = (self.text_scroll_offset + 10).min(lines.len().saturating_sub(1));
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') => {
+                        self.browser.focused_pane = PaneType::Files;
+                        return;
+                    }
+                    KeyCode::Up => {
+                        self.image_offset_y = self.image_offset_y.saturating_sub(10);
+                        return;
+                    }
+                    KeyCode::Down => {
+                        self.image_offset_y = self.image_offset_y.saturating_add(10);
+                        return;
+                    }
+                    KeyCode::Left => {
+                        self.image_offset_x = self.image_offset_x.saturating_sub(10);
+                        return;
+                    }
+                    KeyCode::Right => {
+                        self.image_offset_x = self.image_offset_x.saturating_add(10);
+                        return;
+                    }
+                    KeyCode::Char('+') | KeyCode::Char('=') => {
+                        self.image_zoom = (self.image_zoom + 0.25).min(10.0);
+                        return;
+                    }
+                    KeyCode::Char('-') => {
+                        self.image_zoom = (self.image_zoom - 0.25).max(1.0);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         match key.code {
             KeyCode::Char('?') => {
                 self.show_help = true;
@@ -308,7 +504,11 @@ impl App {
                 }
             }
             KeyCode::Char('C') => {
-                if self.screen == AppScreen::Collections {
+                if self.screen == AppScreen::Queue {
+                    self.queue.clear();
+                    self.audio.stop();
+                    self.queue_selected_index = 0;
+                } else if self.screen == AppScreen::Collections {
                     self.screen = AppScreen::Browser;
                 } else {
                     self.screen = AppScreen::Collections;
@@ -324,8 +524,32 @@ impl App {
                 self.search.active = false;
                 self.search.query.clear();
             }
-            KeyCode::Up | KeyCode::Char('k') => self.navigate_up(),
-            KeyCode::Down | KeyCode::Char('j') => self.navigate_down(),
+            KeyCode::Up => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && self.screen == AppScreen::Queue {
+                    self.move_highlighted_queue_item(true);
+                } else {
+                    self.navigate_up();
+                }
+            }
+            KeyCode::Char('k') => self.navigate_up(),
+            KeyCode::Char('K') => {
+                if self.screen == AppScreen::Queue {
+                    self.move_highlighted_queue_item(true);
+                }
+            }
+            KeyCode::Down => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && self.screen == AppScreen::Queue {
+                    self.move_highlighted_queue_item(false);
+                } else {
+                    self.navigate_down();
+                }
+            }
+            KeyCode::Char('j') => self.navigate_down(),
+            KeyCode::Char('J') => {
+                if self.screen == AppScreen::Queue {
+                    self.move_highlighted_queue_item(false);
+                }
+            }
             KeyCode::PageUp => self.navigate_page_up(),
             KeyCode::PageDown => self.navigate_page_down(),
             KeyCode::Left => {
@@ -351,7 +575,7 @@ impl App {
             
             // Selection & Editing
             KeyCode::Char(' ') => {
-                if self.screen == AppScreen::Browser && self.browser.focused_pane == PaneType::Files {
+                if self.screen == AppScreen::Browser && (self.browser.focused_pane == PaneType::Files || self.browser.focused_pane == PaneType::Directories) {
                     self.browser.toggle_select_highlighted();
                 } else {
                     // Space acts as pause/resume on other screens/panes
@@ -390,22 +614,33 @@ impl App {
                     let state = self.audio.shared_state.lock().unwrap();
                     state.volume
                 };
-                self.audio.set_volume(current_vol.saturating_add(5).min(100));
+                let new_vol = current_vol.saturating_add(5).min(100);
+                self.audio.set_volume(new_vol);
+                self.config.default_volume = new_vol;
+                let _ = self.config.save();
             }
             KeyCode::Char('-') => {
                 let current_vol = {
                     let state = self.audio.shared_state.lock().unwrap();
                     state.volume
                 };
-                self.audio.set_volume(current_vol.saturating_sub(5));
+                let new_vol = current_vol.saturating_sub(5);
+                self.audio.set_volume(new_vol);
+                self.config.default_volume = new_vol;
+                let _ = self.config.save();
             }
             KeyCode::Char('r') => {
-                let mut state = self.audio.shared_state.lock().unwrap();
-                state.repeat = match state.repeat {
-                    RepeatMode::Off => RepeatMode::All,
-                    RepeatMode::All => RepeatMode::One,
-                    RepeatMode::One => RepeatMode::Off,
+                let new_repeat = {
+                    let mut state = self.audio.shared_state.lock().unwrap();
+                    state.repeat = match state.repeat {
+                        RepeatMode::Off => RepeatMode::All,
+                        RepeatMode::All => RepeatMode::One,
+                        RepeatMode::One => RepeatMode::Off,
+                    };
+                    state.repeat
                 };
+                self.config.repeat = new_repeat;
+                let _ = self.config.save();
             }
             KeyCode::Char('z') => {
                 let next_shuffle = {
@@ -417,6 +652,8 @@ impl App {
                     self.queue.shuffle_items();
                 }
                 self.sync_queue_selection();
+                self.config.shuffle = next_shuffle;
+                let _ = self.config.save();
             }
             
             // Queue & Collections triggers
@@ -426,11 +663,57 @@ impl App {
                     let paths: Vec<PathBuf> = self.browser.selected_paths.iter().cloned().collect();
                     self.queue.add_many(paths);
                     self.browser.clear_selections();
-                } else if self.screen == AppScreen::Browser && self.browser.focused_pane == PaneType::Files && !self.browser.files.is_empty() {
-                    // If no selections, add highlighted file
-                    let path = self.browser.files[self.browser.file_index].path.clone();
-                    if matches_audio_extension(&path) {
-                        self.queue.add(path);
+                } else if self.screen == AppScreen::Browser {
+                    match self.browser.focused_pane {
+                        PaneType::Directories => {
+                            if !self.browser.directories.is_empty() {
+                                let dir_path = self.browser.directories[self.browser.dir_index].clone();
+                                if !dir_path.ends_with("..") {
+                                    let walk_path = if dir_path.ends_with(".") {
+                                        self.browser.current_dir.clone()
+                                    } else {
+                                        dir_path
+                                    };
+                                    let mut paths = Vec::new();
+                                    for entry in walkdir::WalkDir::new(&walk_path)
+                                        .into_iter()
+                                        .filter_entry(|e| {
+                                            let name = e.file_name().to_string_lossy();
+                                            !name.starts_with('.')
+                                        })
+                                        .flatten()
+                                    {
+                                        let p = entry.path();
+                                        if p.is_file() && matches_audio_extension(p) {
+                                            paths.push(p.to_path_buf());
+                                        }
+                                    }
+                                    if !paths.is_empty() {
+                                        paths.sort();
+                                        self.queue.add_many(paths);
+                                        
+                                        // Shuffle queue if shuffle is active
+                                        let shuffle = {
+                                            let state = self.audio.shared_state.lock().unwrap();
+                                            state.shuffle
+                                        };
+                                        if shuffle {
+                                            self.queue.shuffle_items();
+                                        }
+                                        self.sync_queue_selection();
+                                    }
+                                }
+                            }
+                        }
+                        PaneType::Files => {
+                            if !self.browser.files.is_empty() {
+                                let path = self.browser.files[self.browser.file_index].path.clone();
+                                if matches_audio_extension(&path) {
+                                    self.queue.add(path);
+                                }
+                            }
+                        }
+                        PaneType::Preview => {}
                     }
                 }
             }
@@ -450,20 +733,90 @@ impl App {
                 self.search.query.clear();
             }
             KeyCode::Char('v') => {
-                if !self.browser.selected_paths.is_empty() {
-                    self.input_mode = InputMode::CopyPath;
-                    self.input_value = "~/.config/stash/favorites".to_string();
+                if self.screen == AppScreen::Queue {
+                    self.config.visualizer_mode = match self.config.visualizer_mode {
+                        VisualizerMode::Spectrum => VisualizerMode::Waveform,
+                        VisualizerMode::Waveform => VisualizerMode::SignalLevels,
+                        VisualizerMode::SignalLevels => VisualizerMode::Spectrum,
+                    };
+                    let _ = self.config.save();
+                } else {
+                    if !self.browser.selected_paths.is_empty() {
+                        self.input_mode = InputMode::CopyPath;
+                        self.input_value = self.last_operation_dest.clone();
+                    }
                 }
             }
             KeyCode::Char('y') => {
                 if !self.browser.selected_paths.is_empty() {
                     self.input_mode = InputMode::MovePath;
-                    self.input_value = "~/.config/stash/favorites".to_string();
+                    self.input_value = self.last_operation_dest.clone();
                 }
             }
             KeyCode::Char('d') => {
-                if !self.browser.selected_paths.is_empty() {
-                    self.input_mode = InputMode::ConfirmDelete;
+                if self.screen == AppScreen::Queue {
+                    self.delete_highlighted_queue_item();
+                } else {
+                    if !self.browser.selected_paths.is_empty() {
+                        self.input_mode = InputMode::ConfirmDelete;
+                    }
+                }
+            }
+            KeyCode::Char('x') => {
+                if self.screen == AppScreen::Queue {
+                    self.delete_highlighted_queue_item();
+                }
+            }
+            KeyCode::Char('[') => {
+                if self.screen == AppScreen::Queue {
+                    let mut current_decay = self.config.visualizer_decay;
+                    current_decay = (current_decay - 0.05).max(0.10);
+                    self.config.visualizer_decay = current_decay;
+                    if let Ok(mut state) = self.audio.shared_state.lock() {
+                        state.visualizer_decay = current_decay;
+                    }
+                    let _ = self.config.save();
+                }
+            }
+            KeyCode::Char(']') => {
+                if self.screen == AppScreen::Queue {
+                    let mut current_decay = self.config.visualizer_decay;
+                    current_decay = (current_decay + 0.05).min(0.95);
+                    self.config.visualizer_decay = current_decay;
+                    if let Ok(mut state) = self.audio.shared_state.lock() {
+                        state.visualizer_decay = current_decay;
+                    }
+                    let _ = self.config.save();
+                }
+            }
+            KeyCode::F(2) => {
+                if self.screen == AppScreen::Browser {
+                    match self.browser.focused_pane {
+                        PaneType::Directories => {
+                            if !self.browser.directories.is_empty() && self.browser.dir_index < self.browser.directories.len() {
+                                // Prevent renaming "." and ".."
+                                let is_current_or_parent = self.browser.dir_index == 0 || 
+                                    (self.browser.dir_index == 1 && self.browser.directories.len() > 1 && self.browser.directories[1].ends_with(".."));
+                                if !is_current_or_parent {
+                                    let target_path = self.browser.directories[self.browser.dir_index].clone();
+                                    let name = target_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                    self.input_value = name;
+                                    self.rename_target = Some(target_path);
+                                    self.input_mode = InputMode::Rename;
+                                }
+                            }
+                        }
+                        PaneType::Files => {
+                            if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
+                                let target_path = self.browser.files[self.browser.file_index].path.clone();
+                                let name = target_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                self.input_value = name;
+                                self.rename_target = Some(target_path);
+                                self.input_mode = InputMode::Rename;
+                            }
+                        }
+                        PaneType::Preview => {}
+                    }
                 }
             }
             _ => {}
@@ -522,6 +875,56 @@ impl App {
         }
     }
 
+    fn handle_rename_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => {
+                if let Some(target) = self.rename_target.take() {
+                    let new_name = self.input_value.trim();
+                    if !new_name.is_empty() {
+                        let mut new_path = target.clone();
+                        new_path.set_file_name(new_name);
+                        
+                        if let Err(_e) = std::fs::rename(&target, &new_path) {
+                            // Fail silently or handle error
+                        } else {
+                            if self.browser.selected_paths.contains(&target) {
+                                self.browser.selected_paths.remove(&target);
+                                self.browser.selected_paths.insert(new_path.clone());
+                            }
+                            
+                            self.browser.refresh();
+                            
+                            if self.browser.focused_pane == PaneType::Directories {
+                                if let Some(pos) = self.browser.directories.iter().position(|d| d == &new_path) {
+                                    self.browser.dir_index = pos;
+                                    self.browser.refresh();
+                                }
+                            } else {
+                                if let Some(pos) = self.browser.files.iter().position(|f| f.path == new_path) {
+                                    self.browser.file_index = pos;
+                                }
+                            }
+                        }
+                    }
+                }
+                self.input_mode = InputMode::Normal;
+                self.input_value.clear();
+            }
+            KeyCode::Esc => {
+                self.rename_target = None;
+                self.input_mode = InputMode::Normal;
+                self.input_value.clear();
+            }
+            KeyCode::Backspace => {
+                self.input_value.pop();
+            }
+            KeyCode::Char(c) => {
+                self.input_value.push(c);
+            }
+            _ => {}
+        }
+    }
+
     fn handle_add_to_collection_list_key(&mut self, key: KeyEvent) {
         let coll_names: Vec<&String> = self.collections.collections.keys().collect();
         match key.code {
@@ -555,11 +958,17 @@ impl App {
         match key.code {
             KeyCode::Enter => {
                 let resolved = resolve_path(&self.input_value);
+                self.last_operation_dest = self.input_value.clone();
                 self.start_file_operation(resolved, false);
                 self.input_mode = InputMode::Normal;
             }
             KeyCode::Esc => {
                 self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Tab => {
+                if let Some(completed) = Self::autocomplete_path(&self.input_value) {
+                    self.input_value = completed;
+                }
             }
             KeyCode::Backspace => {
                 self.input_value.pop();
@@ -575,11 +984,17 @@ impl App {
         match key.code {
             KeyCode::Enter => {
                 let resolved = resolve_path(&self.input_value);
+                self.last_operation_dest = self.input_value.clone();
                 self.start_file_operation(resolved, true);
                 self.input_mode = InputMode::Normal;
             }
             KeyCode::Esc => {
                 self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Tab => {
+                if let Some(completed) = Self::autocomplete_path(&self.input_value) {
+                    self.input_value = completed;
+                }
             }
             KeyCode::Backspace => {
                 self.input_value.pop();
@@ -661,6 +1076,7 @@ impl App {
                             }
                         }
                     }
+                    _ => {}
                 }
             }
         }
@@ -701,6 +1117,7 @@ impl App {
                             }
                         }
                     }
+                    _ => {}
                 }
             }
         }
@@ -709,7 +1126,9 @@ impl App {
     fn navigate_left(&mut self) {
         match self.screen {
             AppScreen::Browser => {
-                if self.browser.focused_pane == PaneType::Files {
+                if self.browser.focused_pane == PaneType::Preview {
+                    self.browser.focused_pane = PaneType::Files;
+                } else if self.browser.focused_pane == PaneType::Files {
                     self.browser.focused_pane = PaneType::Directories;
                 } else {
                     self.browser.go_to_parent();
@@ -725,7 +1144,16 @@ impl App {
     fn navigate_right(&mut self) {
         match self.screen {
             AppScreen::Browser => {
-                self.browser.focused_pane = PaneType::Files;
+                if self.browser.focused_pane == PaneType::Files {
+                    if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
+                        let path = &self.browser.files[self.browser.file_index].path;
+                        if matches_image_extension(path) || matches_text_extension(path) {
+                            self.browser.focused_pane = PaneType::Preview;
+                        }
+                    }
+                } else if self.browser.focused_pane == PaneType::Directories {
+                    self.browser.focused_pane = PaneType::Files;
+                }
             }
             AppScreen::Collections => {
                 self.collections_focused_pane = PaneType::Files;
@@ -773,6 +1201,8 @@ impl App {
                             self.queue.current_index = Some(0);
                             self.audio.play(path);
                             self.sync_queue_selection();
+                        } else {
+                            Self::open_file_with_default_app(&path);
                         }
                     }
                 } else {
@@ -800,9 +1230,12 @@ impl App {
                                     
                                     self.audio.play(path);
                                     self.sync_queue_selection();
+                                } else {
+                                    Self::open_file_with_default_app(&path);
                                 }
                             }
                         }
+                        PaneType::Preview => {}
                     }
                 }
             }
@@ -881,11 +1314,13 @@ impl App {
                         let title = meta.title.as_deref();
                         let artist = meta.artist.as_deref();
                         let album = meta.album.as_deref();
+                        let cover_url = current_track.as_ref().and_then(|p| Self::find_cover_art(p));
                         let m_meta = souvlaki::MediaMetadata {
                             title,
                             artist,
                             album,
                             duration: Some(std::time::Duration::from_secs(duration)),
+                            cover_url: cover_url.as_deref(),
                             ..Default::default()
                         };
                         let _ = controls.set_metadata(m_meta);
@@ -914,6 +1349,66 @@ impl App {
                 }
             }
         }
+    }
+
+    fn find_cover_art(track_path: &Path) -> Option<String> {
+        // 1. Look for local cover image in the same directory as the track
+        if let Some(parent) = track_path.parent() {
+            let common_names = ["cover.jpg", "cover.png", "folder.jpg", "folder.png", "front.jpg", "front.png", "Cover.jpg", "Cover.png", "Folder.jpg", "Folder.png"];
+            for name in &common_names {
+                let img_path = parent.join(name);
+                if img_path.exists() && img_path.is_file() {
+                    return Some(format!("file://{}", img_path.to_string_lossy()));
+                }
+            }
+            
+            // case-insensitive check
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                            let lower = filename.to_lowercase();
+                            if lower == "cover.jpg" || lower == "cover.png" || lower == "folder.jpg" || lower == "folder.png" || lower == "front.jpg" || lower == "front.png" {
+                                return Some(format!("file://{}", path.to_string_lossy()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Try to extract embedded cover art from the audio file itself using lofty
+        if let Ok(tagged_file) = Probe::open(track_path).and_then(|p| p.read()) {
+            if let Some(tag) = tagged_file.primary_tag() {
+                if let Some(picture) = tag.pictures().first() {
+                    let data = picture.data();
+                    if let Some(cache_dir) = dirs::cache_dir() {
+                        let art_cache_dir = cache_dir.join("stash").join("album_art");
+                        if std::fs::create_dir_all(&art_cache_dir).is_ok() {
+                            use std::collections::hash_map::DefaultHasher;
+                            use std::hash::{Hash, Hasher};
+                            
+                            let mut hasher = DefaultHasher::new();
+                            track_path.hash(&mut hasher);
+                            let hash = hasher.finish();
+                            
+                            let mime_str = picture.mime_type().map(|m| m.as_str()).unwrap_or("image/jpeg");
+                            let ext = if mime_str.contains("png") { "png" } else { "jpg" };
+                            
+                            let cached_path = art_cache_dir.join(format!("{}.{}", hash, ext));
+                            
+                            // Only write if it doesn't exist
+                            if cached_path.exists() || std::fs::write(&cached_path, data).is_ok() {
+                                return Some(format!("file://{}", cached_path.to_string_lossy()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     pub fn get_filtered_queue_indices(&self) -> Vec<(usize, usize)> {
@@ -964,11 +1459,7 @@ impl App {
             return;
         }
 
-        let total_files = paths.iter().filter(|p| p.is_file()).count();
-        if total_files == 0 {
-            return;
-        }
-
+        let total_items = paths.len();
         let progress = Arc::clone(&self.file_progress);
         let op_type = if is_move { "Moving".to_string() } else { "Copying".to_string() };
 
@@ -978,9 +1469,10 @@ impl App {
                 op_type: op_type.clone(),
                 current_file: String::new(),
                 completed_files: 0,
-                total_files,
+                total_files: total_items,
                 finished: false,
                 error: None,
+                canceled: false,
             });
         }
 
@@ -998,41 +1490,60 @@ impl App {
 
             let mut completed = 0;
             for path in paths {
-                if path.is_file() {
-                    if let Some(filename) = path.file_name() {
-                        let filename_str = filename.to_string_lossy().into_owned();
-                        {
-                            let mut p = progress.lock().unwrap();
-                            if let Some(ref mut state) = *p {
-                                state.current_file = filename_str;
-                            }
+                // Check if operation was canceled by the user
+                {
+                    let p = progress.lock().unwrap();
+                    if let Some(ref state) = *p {
+                        if state.canceled {
+                            break;
                         }
+                    }
+                }
 
-                        let dest_path = dest_dir.join(filename);
-                        let res = if is_move {
+                if let Some(name) = path.file_name() {
+                    let name_str = name.to_string_lossy().into_owned();
+                    {
+                        let mut p = progress.lock().unwrap();
+                        if let Some(ref mut state) = *p {
+                            state.current_file = name_str;
+                        }
+                    }
+
+                    let dest_path = dest_dir.join(name);
+                    let res = if path.is_file() {
+                        if is_move {
                             std::fs::rename(&path, &dest_path).or_else(|_| {
-                                // Fallback for cross-device moves: copy then delete original
                                 std::fs::copy(&path, &dest_path).and_then(|_| std::fs::remove_file(&path))
                             })
                         } else {
                             std::fs::copy(&path, &dest_path).map(|_| ())
-                        };
-
-                        if let Err(e) = res {
-                            let mut p = progress.lock().unwrap();
-                            if let Some(ref mut state) = *p {
-                                state.error = Some(format!("Error on {}: {}", path.display(), e));
-                                state.finished = true;
-                            }
-                            return;
                         }
+                    } else if path.is_dir() {
+                        if is_move {
+                            std::fs::rename(&path, &dest_path).or_else(|_| {
+                                Self::copy_dir_recursive(&path, &dest_path, &progress).and_then(|_| std::fs::remove_dir_all(&path))
+                            })
+                        } else {
+                            Self::copy_dir_recursive(&path, &dest_path, &progress)
+                        }
+                    } else {
+                        Ok(())
+                    };
 
-                        completed += 1;
-                        {
-                            let mut p = progress.lock().unwrap();
-                            if let Some(ref mut state) = *p {
-                                state.completed_files = completed;
-                            }
+                    if let Err(e) = res {
+                        let mut p = progress.lock().unwrap();
+                        if let Some(ref mut state) = *p {
+                            state.error = Some(format!("Error on {}: {}", path.display(), e));
+                            state.finished = true;
+                        }
+                        return;
+                    }
+
+                    completed += 1;
+                    {
+                        let mut p = progress.lock().unwrap();
+                        if let Some(ref mut state) = *p {
+                            state.completed_files = completed;
                         }
                     }
                 }
@@ -1045,6 +1556,140 @@ impl App {
                 }
             }
         });
+    }
+
+    pub fn copy_dir_recursive(src: &Path, dst: &Path, progress: &Arc<Mutex<Option<FileOperationProgress>>>) -> std::io::Result<()> {
+        // Check cancellation
+        {
+            if let Some(ref state) = *progress.lock().unwrap() {
+                if state.canceled {
+                    return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "Operation canceled by user"));
+                }
+            }
+        }
+
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let dest_path = dst.join(entry.file_name());
+
+            // Check cancellation before processing next entry
+            {
+                if let Some(ref state) = *progress.lock().unwrap() {
+                    if state.canceled {
+                        return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "Operation canceled by user"));
+                    }
+                }
+            }
+
+            if entry_path.is_dir() {
+                Self::copy_dir_recursive(&entry_path, &dest_path, progress)?;
+            } else {
+                std::fs::copy(&entry_path, &dest_path)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn autocomplete_path(input: &str) -> Option<String> {
+        let path = Path::new(input);
+        
+        let (search_dir, prefix) = if input.ends_with('/') || input.ends_with('\\') || input.is_empty() {
+            let dir = if input.is_empty() {
+                Path::new(".")
+            } else {
+                path
+            };
+            (dir, "")
+        } else {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            (parent, file_name)
+        };
+
+        let search_dir_resolved = if search_dir.to_string_lossy().starts_with('~') {
+            if let Some(home) = dirs::home_dir() {
+                let stripped = search_dir.strip_prefix("~").unwrap_or(Path::new(""));
+                home.join(stripped)
+            } else {
+                search_dir.to_path_buf()
+            }
+        } else {
+            search_dir.to_path_buf()
+        };
+
+        if let Ok(entries) = std::fs::read_dir(&search_dir_resolved) {
+            let mut matches = Vec::new();
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(prefix) {
+                    matches.push((name, entry.path().is_dir()));
+                }
+            }
+
+            matches.sort_by(|a, b| a.0.cmp(&b.0));
+
+            if !matches.is_empty() {
+                let longest_common = Self::longest_common_prefix(&matches.iter().map(|m| m.0.as_str()).collect::<Vec<&str>>());
+                if longest_common.len() > prefix.len() {
+                    let parent_str = search_dir.to_string_lossy();
+                    let parent_str = if parent_str == "." && !input.starts_with('.') {
+                        "".to_string()
+                    } else if parent_str.ends_with('/') || parent_str.ends_with('\\') {
+                        parent_str.into_owned()
+                    } else if parent_str.is_empty() {
+                        "".to_string()
+                    } else {
+                        format!("{}{}", parent_str, std::path::MAIN_SEPARATOR)
+                    };
+                    
+                    let mut completed = format!("{}{}", parent_str, longest_common);
+                    if matches.len() == 1 && matches[0].1 {
+                        completed.push(std::path::MAIN_SEPARATOR);
+                    }
+                    return Some(completed);
+                } else if matches.len() == 1 {
+                    let parent_str = search_dir.to_string_lossy();
+                    let parent_str = if parent_str == "." && !input.starts_with('.') {
+                        "".to_string()
+                    } else if parent_str.ends_with('/') || parent_str.ends_with('\\') {
+                        parent_str.into_owned()
+                    } else if parent_str.is_empty() {
+                        "".to_string()
+                    } else {
+                        format!("{}{}", parent_str, std::path::MAIN_SEPARATOR)
+                    };
+                    
+                    let mut completed = format!("{}{}", parent_str, matches[0].0);
+                    if matches[0].1 {
+                        completed.push(std::path::MAIN_SEPARATOR);
+                    }
+                    return Some(completed);
+                }
+            }
+        }
+        None
+    }
+
+    fn longest_common_prefix(strs: &[&str]) -> String {
+        if strs.is_empty() {
+            return String::new();
+        }
+        let first = strs[0];
+        let mut length = first.len();
+        for &s in &strs[1..] {
+            length = length.min(s.len());
+            let mut i = 0;
+            for (c1, c2) in first.chars().zip(s.chars()) {
+                if c1 != c2 {
+                    break;
+                }
+                i += 1;
+            }
+            length = length.min(i);
+        }
+        first.chars().take(length).collect()
     }
 
     fn navigate_page_up(&mut self) {
@@ -1075,6 +1720,7 @@ impl App {
                             }
                         }
                     }
+                    _ => {}
                 }
             }
         }
@@ -1110,6 +1756,76 @@ impl App {
                             }
                         }
                     }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    pub fn remove_queue_item(&mut self, index: usize) {
+        if index < self.queue.items.len() {
+            self.queue.items.remove(index);
+            
+            // Adjust current_index if necessary
+            if let Some(curr) = self.queue.current_index {
+                if curr == index {
+                    self.audio.stop();
+                    self.queue.current_index = None;
+                } else if curr > index {
+                    self.queue.current_index = Some(curr - 1);
+                }
+            }
+            
+            // Adjust shuffle indices
+            self.queue.shuffle_items();
+            self.sync_queue_selection();
+        }
+    }
+
+    pub fn delete_highlighted_queue_item(&mut self) {
+        let filtered = self.get_filtered_queue_indices();
+        if let Some(&(_, original_idx)) = filtered.get(self.queue_selected_index) {
+            self.remove_queue_item(original_idx);
+            
+            // Bound check queue_selected_index
+            let new_len = self.get_filtered_queue_indices().len();
+            if new_len == 0 {
+                self.queue_selected_index = 0;
+            } else if self.queue_selected_index >= new_len {
+                self.queue_selected_index = new_len - 1;
+            }
+        }
+    }
+
+    pub fn move_highlighted_queue_item(&mut self, up: bool) {
+        let filtered = self.get_filtered_queue_indices();
+        if let Some(&(_, original_idx)) = filtered.get(self.queue_selected_index) {
+            if up {
+                if original_idx > 0 {
+                    self.queue.items.swap(original_idx, original_idx - 1);
+                    // Update current_index
+                    if self.queue.current_index == Some(original_idx) {
+                        self.queue.current_index = Some(original_idx - 1);
+                    } else if self.queue.current_index == Some(original_idx - 1) {
+                        self.queue.current_index = Some(original_idx);
+                    }
+                    // Adjust selected index
+                    self.queue_selected_index = self.queue_selected_index.saturating_sub(1);
+                    self.queue.shuffle_items();
+                }
+            } else {
+                if original_idx + 1 < self.queue.items.len() {
+                    self.queue.items.swap(original_idx, original_idx + 1);
+                    // Update current_index
+                    if self.queue.current_index == Some(original_idx) {
+                        self.queue.current_index = Some(original_idx + 1);
+                    } else if self.queue.current_index == Some(original_idx + 1) {
+                        self.queue.current_index = Some(original_idx);
+                    }
+                    // Adjust selected index
+                    let max_len = self.get_filtered_queue_indices().len();
+                    self.queue_selected_index = (self.queue_selected_index + 1).min(max_len.saturating_sub(1));
+                    self.queue.shuffle_items();
                 }
             }
         }
@@ -1179,4 +1895,308 @@ mod tests {
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0], (1, 0)); // (base_idx 1, orig_idx 0)
     }
+
+    #[test]
+    fn test_rename() {
+        let (tx, _rx) = channel();
+        let test_root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_stash_rename");
+        
+        if test_root.exists() {
+            let _ = std::fs::remove_dir_all(&test_root);
+        }
+        std::fs::create_dir_all(&test_root).unwrap();
+        
+        let file_path = test_root.join("test_file.mp3");
+        std::fs::File::create(&file_path).unwrap();
+
+        let mut app = App::new(tx, Some(test_root.clone()));
+
+        // Focus on files pane
+        app.browser.focused_pane = PaneType::Files;
+        app.browser.file_index = 0;
+
+        // Trigger rename with F2
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        
+        assert_eq!(app.input_mode, InputMode::Rename);
+        assert_eq!(app.input_value, "test_file.mp3");
+        assert_eq!(app.rename_target, Some(file_path.clone()));
+
+        // Simulate typing new name
+        app.input_value = "renamed_file.mp3".to_string();
+
+        // Press Enter to confirm rename
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.input_value.is_empty());
+        assert_eq!(app.rename_target, None);
+
+        // Verify filesystem change
+        assert!(!file_path.exists());
+        let new_file_path = test_root.join("renamed_file.mp3");
+        assert!(new_file_path.exists());
+
+        // Verify browser updated files list
+        assert_eq!(app.browser.files.len(), 1);
+        assert_eq!(app.browser.files[0].name, "renamed_file.mp3");
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_find_cover_art() {
+        let test_root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_stash_find_cover_art");
+        
+        if test_root.exists() {
+            let _ = std::fs::remove_dir_all(&test_root);
+        }
+        std::fs::create_dir_all(&test_root).unwrap();
+
+        let track_path = test_root.join("song.mp3");
+        std::fs::File::create(&track_path).unwrap();
+
+        let cover_path = test_root.join("cover.jpg");
+        std::fs::File::create(&cover_path).unwrap();
+
+        let res = App::find_cover_art(&track_path);
+        assert!(res.is_some());
+        let expected_url = format!("file://{}", cover_path.to_string_lossy());
+        assert_eq!(res.unwrap(), expected_url);
+
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_image_preview_navigation() {
+        let (tx, _rx) = channel();
+        let test_root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_stash_image_preview");
+        
+        if test_root.exists() {
+            let _ = std::fs::remove_dir_all(&test_root);
+        }
+        std::fs::create_dir_all(&test_root).unwrap();
+
+        let image_path = test_root.join("test_image.png");
+        std::fs::File::create(&image_path).unwrap();
+
+        let mut app = App::new(tx, Some(test_root.clone()));
+
+        // Make sure it loads the files list
+        assert_eq!(app.browser.files.len(), 1);
+        assert_eq!(app.browser.files[0].name, "test_image.png");
+
+        // Focus on files pane
+        app.browser.focused_pane = PaneType::Files;
+        app.browser.file_index = 0;
+
+        // Verify matches_image_extension is true
+        assert!(matches_image_extension(&image_path));
+
+        // Test navigate_right when highlighted file is an image -> focus should move to Preview pane
+        app.navigate_right();
+        assert_eq!(app.browser.focused_pane, PaneType::Preview);
+
+        // Under Preview focus, simulate panning up / down / left / right
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.image_offset_y, -10);
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.image_offset_y, 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.image_offset_x, -10);
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.image_offset_x, 0);
+
+        // Simulate zoom in / out
+        app.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        assert_eq!(app.image_zoom, 1.25);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
+        assert_eq!(app.image_zoom, 1.0);
+
+        // Navigate left to focus back to Files pane
+        app.navigate_left();
+        assert_eq!(app.browser.focused_pane, PaneType::Files);
+
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_text_preview_navigation() {
+        let (tx, _rx) = channel();
+        let test_root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_stash_text_preview");
+        
+        if test_root.exists() {
+            let _ = std::fs::remove_dir_all(&test_root);
+        }
+        std::fs::create_dir_all(&test_root).unwrap();
+
+        let text_path = test_root.join("test_code.rs");
+        std::fs::write(&text_path, "fn main() {\n    println!(\"Hello\");\n}\n// Line 4\n// Line 5\n// Line 6\n// Line 7\n// Line 8\n// Line 9\n// Line 10\n// Line 11\n// Line 12\n").unwrap();
+
+        let mut app = App::new(tx, Some(test_root.clone()));
+
+        // Make sure it loads the files list
+        assert_eq!(app.browser.files.len(), 1);
+        assert_eq!(app.browser.files[0].name, "test_code.rs");
+
+        // Focus on files pane
+        app.browser.focused_pane = PaneType::Files;
+        app.browser.file_index = 0;
+
+        // Verify matches_text_extension is true
+        assert!(matches_text_extension(&text_path));
+
+        // Test navigate_right when highlighted file is a text file -> focus should move to Preview pane
+        app.navigate_right();
+        assert_eq!(app.browser.focused_pane, PaneType::Preview);
+
+        // Under Preview focus, simulate scrolling down / up / page down / page up
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.text_scroll_offset, 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.text_scroll_offset, 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.text_scroll_offset, 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.text_scroll_offset, 0);
+
+        // PageDown/PageUp scrolling
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.text_scroll_offset, 10);
+
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.text_scroll_offset, 0);
+
+        // Navigate left to focus back to Files pane
+        app.navigate_left();
+        assert_eq!(app.browser.focused_pane, PaneType::Files);
+
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_autocomplete_and_folder_operations() {
+        let (tx, _rx) = channel();
+        let test_root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_stash_autocomplete");
+        
+        if test_root.exists() {
+            let _ = std::fs::remove_dir_all(&test_root);
+        }
+        std::fs::create_dir_all(&test_root).unwrap();
+
+        let src_dir = test_root.join("src_folder");
+        let dest_dir = test_root.join("dest_folder");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("file.txt"), "hello").unwrap();
+
+        // 1. Autocomplete test
+        let completed = App::autocomplete_path(&test_root.join("src_fo").to_string_lossy());
+        assert!(completed.is_some());
+        let val = completed.unwrap();
+        assert!(val.contains("src_folder"));
+
+        // 2. Folder copying test
+        let mut app = App::new(tx, Some(test_root.clone()));
+        app.browser.selected_paths.insert(src_dir.clone());
+
+        app.start_file_operation(dest_dir.clone(), false);
+
+        // Wait a tiny bit for the worker thread to finish
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let copied_folder = dest_dir.join("src_folder");
+        assert!(copied_folder.exists());
+        assert!(copied_folder.join("file.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_copy_move_last_operation_dest() {
+        let (tx, _rx) = channel();
+        let test_root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_stash_last_dest");
+        
+        if test_root.exists() {
+            let _ = std::fs::remove_dir_all(&test_root);
+        }
+        std::fs::create_dir_all(&test_root).unwrap();
+        
+        let file_path = test_root.join("some_file.txt");
+        std::fs::write(&file_path, "hello").unwrap();
+
+        let mut app = App::new(tx, Some(test_root.clone()));
+        app.browser.focused_pane = PaneType::Files;
+        app.browser.file_index = 0;
+        
+        // select files
+        app.browser.selected_paths.insert(file_path.clone());
+        
+        // Assert starts empty
+        assert_eq!(app.last_operation_dest, "");
+        
+        // press 'v' (copy)
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(app.input_mode, InputMode::CopyPath);
+        assert_eq!(app.input_value, "");
+        
+        // simulate typing a destination path (we can use target/test_stash_last_dest/dest_v)
+        let dest_v = test_root.join("dest_v");
+        app.input_value = dest_v.to_string_lossy().into_owned();
+        
+        // press Enter to confirm
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        
+        // should remember last operation dest
+        assert_eq!(app.last_operation_dest, dest_v.to_string_lossy());
+        
+        // Wait a tiny bit for the worker thread to finish
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        
+        // Dismiss progress
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        
+        // now select again and press 'y' (move)
+        app.browser.selected_paths.insert(file_path.clone());
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.input_mode, InputMode::MovePath);
+        
+        // input_value should have pre-populated with last_operation_dest
+        assert_eq!(app.input_value, dest_v.to_string_lossy());
+        
+        // change it to target/test_stash_last_dest/dest_y
+        let dest_y = test_root.join("dest_y");
+        app.input_value = dest_y.to_string_lossy().into_owned();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        
+        assert_eq!(app.last_operation_dest, dest_y.to_string_lossy());
+        
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
 }
+

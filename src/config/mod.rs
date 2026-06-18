@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+use crate::models::{RepeatMode, VisualizerMode};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub music_folders: Vec<String>,
@@ -9,6 +11,18 @@ pub struct AppConfig {
     pub theme: String,
     pub show_hidden: bool,
     pub auto_resume: bool,
+    #[serde(default)]
+    pub shuffle: bool,
+    #[serde(default)]
+    pub repeat: RepeatMode,
+    #[serde(default)]
+    pub visualizer_mode: VisualizerMode,
+    #[serde(default = "default_visualizer_decay")]
+    pub visualizer_decay: f32,
+}
+
+fn default_visualizer_decay() -> f32 {
+    0.70
 }
 
 impl Default for AppConfig {
@@ -19,6 +33,10 @@ impl Default for AppConfig {
             theme: "default".to_string(),
             show_hidden: false,
             auto_resume: true,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            visualizer_mode: VisualizerMode::Spectrum,
+            visualizer_decay: 0.70,
         }
     }
 }

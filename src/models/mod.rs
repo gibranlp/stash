@@ -27,10 +27,19 @@ pub enum PlaybackStatus {
     Stopped,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum RepeatMode {
+    #[default]
     Off,
     All,
     One,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum VisualizerMode {
+    #[default]
+    Spectrum,
+    Waveform,
+    SignalLevels,
 }
 

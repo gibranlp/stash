@@ -1,6 +1,6 @@
 [package]
 name = "stash"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["gibranlp"]
 homepage = "https://gibranlp.dev"
@@ -19,3 +19,4 @@ dirs = "5.0"
 lofty = "0.21"
 rand = "0.8"
 souvlaki = "0.8.3"
+image = "0.24"
