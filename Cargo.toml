@@ -2,6 +2,10 @@
 name = "stash"
 version = "0.1.0"
 edition = "2024"
+authors = ["gibranlp"]
+homepage = "https://gibranlp.dev"
+repository = "https://github.com/gibranlp/stash"
+description = "A fast, keyboard-driven terminal music browser, player, and file organizer."
 
 [dependencies]
 ratatui = "0.26"

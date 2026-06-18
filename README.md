@@ -104,3 +104,12 @@ stash /media/Music/rock
 STASH stores configuration and database files under your user config directory:
 - **Config JSON (`~/.config/stash/config.json`)**: Configures options like starting directories, default volume, and hidden file visibility.
 - **Collections JSON (`~/.config/stash/collections.json`)**: Stores your virtual playlists map containing reference paths.
+
+---
+
+## Author
+
+- **gibranlp**
+- Homepage: [gibranlp.dev](https://gibranlp.dev)
+- Repository: [github.com/gibranlp/stash](https://github.com/gibranlp/stash)
+- Email: thisdoesnotwork@gibranlp.dev
