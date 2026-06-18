@@ -7,7 +7,7 @@ use crate::browser::{BrowserState, PaneType};
 use crate::collections::Collections;
 use crate::config::{AppConfig, resolve_path};
 use crate::events::Event;
-use crate::models::PlaybackStatus;
+use crate::models::{PlaybackStatus, RepeatMode};
 use crate::queue::PlaybackQueue;
 use crate::search::{SearchState, matches_audio_extension};
 use ratatui::widgets::ListState;
@@ -41,7 +41,6 @@ pub struct FileOperationProgress {
 }
 
 pub struct App {
-    pub config: AppConfig,
     pub browser: BrowserState,
     pub audio: AudioEngine,
     pub queue: PlaybackQueue,
@@ -145,7 +144,6 @@ impl App {
         };
 
         Self {
-            config,
             browser,
             audio,
             queue,
@@ -230,20 +228,39 @@ impl App {
             (state.repeat, state.shuffle)
         };
 
-        if repeat {
-            // Play current track again
-            let current = {
-                let state = self.audio.shared_state.lock().unwrap();
-                state.current_track.clone()
-            };
-            if let Some(path) = current {
-                self.audio.play(path);
+        match repeat {
+            RepeatMode::One => {
+                // Play current track again
+                let current = {
+                    let state = self.audio.shared_state.lock().unwrap();
+                    state.current_track.clone()
+                };
+                if let Some(path) = current {
+                    self.audio.play(path);
+                }
             }
-        } else {
-            // Move to next track in queue
-            if let Some(next_path) = self.queue.next(shuffle) {
-                self.audio.play(next_path);
-                self.sync_queue_selection();
+            RepeatMode::All => {
+                // Move to next track, if we reach the end, loop back to the beginning!
+                if let Some(next_path) = self.queue.next(shuffle) {
+                    self.audio.play(next_path);
+                    self.sync_queue_selection();
+                } else {
+                    // Reached the end of the queue, loop back to the beginning of the queue!
+                    if !self.queue.items.is_empty() {
+                        self.queue.current_index = None;
+                        if let Some(next_path) = self.queue.next(shuffle) {
+                            self.audio.play(next_path);
+                            self.sync_queue_selection();
+                        }
+                    }
+                }
+            }
+            RepeatMode::Off => {
+                // Move to next track in queue, stop if we reach the end
+                if let Some(next_path) = self.queue.next(shuffle) {
+                    self.audio.play(next_path);
+                    self.sync_queue_selection();
+                }
             }
         }
     }
@@ -379,7 +396,11 @@ impl App {
             }
             KeyCode::Char('r') => {
                 let mut state = self.audio.shared_state.lock().unwrap();
-                state.repeat = !state.repeat;
+                state.repeat = match state.repeat {
+                    RepeatMode::Off => RepeatMode::All,
+                    RepeatMode::All => RepeatMode::One,
+                    RepeatMode::One => RepeatMode::Off,
+                };
             }
             KeyCode::Char('z') => {
                 let next_shuffle = {

@@ -47,22 +47,10 @@ impl Collections {
         let _ = self.save();
     }
 
-    pub fn remove_from_collection(&mut self, collection_name: &str, path: &PathBuf) {
-        if let Some(paths) = self.collections.get_mut(collection_name) {
-            paths.retain(|p| p != path);
-        }
-        let _ = self.save();
-    }
-
     pub fn create_collection(&mut self, name: &str) {
         if !name.trim().is_empty() {
             self.collections.entry(name.to_string()).or_default();
             let _ = self.save();
         }
-    }
-
-    pub fn delete_collection(&mut self, name: &str) {
-        self.collections.remove(name);
-        let _ = self.save();
     }
 }

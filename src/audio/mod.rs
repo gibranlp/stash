@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use rodio::{Decoder, OutputStream, Sink, Source};
 use lofty::prelude::*;
 use lofty::probe::Probe;
-use crate::models::{AudioMetadata, PlaybackStatus};
+use crate::models::{AudioMetadata, PlaybackStatus, RepeatMode};
 
 #[derive(Debug)]
 pub enum AudioCommand {
@@ -26,7 +26,7 @@ pub struct AudioSharedState {
     pub elapsed_secs: u64,
     pub duration_secs: u64,
     pub volume: u32,
-    pub repeat: bool,
+    pub repeat: RepeatMode,
     pub shuffle: bool,
     pub metadata: Option<AudioMetadata>,
     pub device_error: Option<String>,
@@ -47,7 +47,7 @@ impl AudioEngine {
             elapsed_secs: 0,
             duration_secs: 0,
             volume: default_volume,
-            repeat: false,
+            repeat: RepeatMode::Off,
             shuffle: false,
             metadata: None,
             device_error: None,

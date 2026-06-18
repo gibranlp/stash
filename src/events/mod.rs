@@ -36,4 +36,3 @@ pub fn spawn_event_handler(tx: std::sync::mpsc::Sender<Event>) {
         }
     });
 }
-pub type EventSender = std::sync::mpsc::Sender<Event>;

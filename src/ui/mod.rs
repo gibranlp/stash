@@ -7,7 +7,7 @@ use ratatui::{
 };
 use crate::app::{App, AppScreen, InputMode};
 use crate::browser::PaneType;
-use crate::models::PlaybackStatus;
+use crate::models::{PlaybackStatus, RepeatMode};
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
@@ -402,7 +402,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
         audio_state.volume,
         app.browser.selected_paths.len(),
         app.queue.items.len(),
-        if audio_state.repeat { "on" } else { "off" },
+        match audio_state.repeat {
+            RepeatMode::Off => "off",
+            RepeatMode::All => "all",
+            RepeatMode::One => "1",
+        },
         if audio_state.shuffle { "on" } else { "off" }
     );
 
@@ -780,7 +784,7 @@ fn render_help_popup(f: &mut Frame) {
         Line::from("  b             - Skip back to Previous queue track"),
         Line::from("  s             - Stop active audio playback"),
         Line::from("  + / -         - Volume Up / Down"),
-        Line::from("  r             - Toggle Repeat mode"),
+        Line::from("  r             - Cycle Repeat mode (Off -> All -> 1)"),
         Line::from("  z             - Toggle Shuffle mode"),
         Line::from(""),
         Line::from(Span::styled("Search & General:", Style::default().add_modifier(Modifier::UNDERLINED))),

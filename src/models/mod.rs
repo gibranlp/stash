@@ -27,13 +27,10 @@ pub enum PlaybackStatus {
     Stopped,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct PlaybackState {
-    pub current_track: Option<PathBuf>,
-    pub elapsed_secs: u64,
-    pub duration_secs: u64,
-    pub status: PlaybackStatus,
-    pub volume: u32,
-    pub repeat: bool,
-    pub shuffle: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RepeatMode {
+    Off,
+    All,
+    One,
 }
+
