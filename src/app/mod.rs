@@ -231,11 +231,7 @@ impl App {
         match repeat {
             RepeatMode::One => {
                 // Play current track again
-                let current = {
-                    let state = self.audio.shared_state.lock().unwrap();
-                    state.current_track.clone()
-                };
-                if let Some(path) = current {
+                if let Some(path) = self.queue.current_track() {
                     self.audio.play(path);
                 }
             }
@@ -301,9 +297,14 @@ impl App {
             KeyCode::Char('Q') => {
                 if self.screen == AppScreen::Queue {
                     self.screen = AppScreen::Browser;
+                    self.search.active = false;
+                    self.search.query.clear();
                 } else {
                     self.screen = AppScreen::Queue;
+                    self.search.active = false;
+                    self.search.query.clear();
                     self.queue_selected_index = 0;
+                    self.sync_queue_selection();
                 }
             }
             KeyCode::Char('C') => {
@@ -311,6 +312,8 @@ impl App {
                     self.screen = AppScreen::Browser;
                 } else {
                     self.screen = AppScreen::Collections;
+                    self.search.active = false;
+                    self.search.query.clear();
                     self.selected_collection_index = 0;
                     self.active_collection_file_index = 0;
                     self.collections_focused_pane = PaneType::Directories;
@@ -318,6 +321,8 @@ impl App {
             }
             KeyCode::Esc => {
                 self.screen = AppScreen::Browser;
+                self.search.active = false;
+                self.search.query.clear();
             }
             KeyCode::Up | KeyCode::Char('k') => self.navigate_up(),
             KeyCode::Down | KeyCode::Char('j') => self.navigate_down(),
@@ -476,11 +481,19 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.search.query.pop();
-                self.search.execute(&[self.browser.current_dir.clone()]);
+                if self.screen == AppScreen::Browser {
+                    self.search.execute(&[self.browser.current_dir.clone()]);
+                } else if self.screen == AppScreen::Queue {
+                    self.queue_selected_index = 0;
+                }
             }
             KeyCode::Char(c) => {
                 self.search.query.push(c);
-                self.search.execute(&[self.browser.current_dir.clone()]);
+                if self.screen == AppScreen::Browser {
+                    self.search.execute(&[self.browser.current_dir.clone()]);
+                } else if self.screen == AppScreen::Queue {
+                    self.queue_selected_index = 0;
+                }
             }
             _ => {}
         }
@@ -626,7 +639,7 @@ impl App {
                 }
             }
             AppScreen::Queue => {
-                if !self.queue.items.is_empty() && self.queue_selected_index > 0 {
+                if self.queue_items_len() > 0 && self.queue_selected_index > 0 {
                     self.queue_selected_index -= 1;
                 }
             }
@@ -665,7 +678,8 @@ impl App {
                 }
             }
             AppScreen::Queue => {
-                if !self.queue.items.is_empty() && self.queue_selected_index + 1 < self.queue.items.len() {
+                let len = self.queue_items_len();
+                if len > 0 && self.queue_selected_index + 1 < len {
                     self.queue_selected_index += 1;
                 }
             }
@@ -731,7 +745,16 @@ impl App {
                     self.browser.go_to_parent();
                 }
             }
-            AppScreen::Queue | AppScreen::Collections => {
+            AppScreen::Queue => {
+                if self.search.active {
+                    self.search.active = false;
+                    self.search.query.clear();
+                    self.sync_queue_selection();
+                } else {
+                    self.screen = AppScreen::Browser;
+                }
+            }
+            AppScreen::Collections => {
                 self.screen = AppScreen::Browser;
             }
         }
@@ -784,22 +807,14 @@ impl App {
                 }
             }
             AppScreen::Queue => {
-                if !self.queue.items.is_empty() && self.queue_selected_index < self.queue.items.len() {
-                    let is_shuffle = {
-                        let state = self.audio.shared_state.lock().unwrap();
-                        state.shuffle
-                    };
-                    
-                    let original_idx = if is_shuffle && !self.queue.shuffle_indices.is_empty() {
-                        self.queue.shuffle_indices[self.queue_selected_index]
-                    } else {
-                        self.queue_selected_index
-                    };
-
-                    let path = self.queue.items[original_idx].clone();
-                    self.queue.current_index = Some(original_idx);
-                    self.audio.play(path);
-                    self.sync_queue_selection();
+                let filtered = self.get_filtered_queue_indices();
+                if let Some(&(_, original_idx)) = filtered.get(self.queue_selected_index) {
+                    if original_idx < self.queue.items.len() {
+                        let path = self.queue.items[original_idx].clone();
+                        self.queue.current_index = Some(original_idx);
+                        self.audio.play(path);
+                        self.sync_queue_selection();
+                    }
                 }
             }
             AppScreen::Collections => {
@@ -842,16 +857,9 @@ impl App {
 
     pub fn sync_queue_selection(&mut self) {
         if let Some(idx) = self.queue.current_index {
-            let is_shuffle = {
-                let state = self.audio.shared_state.lock().unwrap();
-                state.shuffle
-            };
-            if is_shuffle && !self.queue.shuffle_indices.is_empty() {
-                if let Some(shuffled_idx) = self.queue.shuffle_indices.iter().position(|&x| x == idx) {
-                    self.queue_selected_index = shuffled_idx;
-                }
-            } else {
-                self.queue_selected_index = idx;
+            let filtered = self.get_filtered_queue_indices();
+            if let Some(pos) = filtered.iter().position(|&(_, orig_idx)| orig_idx == idx) {
+                self.queue_selected_index = pos;
             }
         }
     }
@@ -906,6 +914,44 @@ impl App {
                 }
             }
         }
+    }
+
+    pub fn get_filtered_queue_indices(&self) -> Vec<(usize, usize)> {
+        let is_shuffle = {
+            if let Ok(state) = self.audio.shared_state.lock() {
+                state.shuffle
+            } else {
+                false
+            }
+        };
+
+        let base_indices: Vec<usize> = if is_shuffle && !self.queue.shuffle_indices.is_empty() {
+            self.queue.shuffle_indices.clone()
+        } else {
+            (0..self.queue.items.len()).collect()
+        };
+
+        let query_lower = self.search.query.to_lowercase();
+        base_indices
+            .into_iter()
+            .enumerate()
+            .filter(|(_, orig_idx)| {
+                if self.search.active && !query_lower.is_empty() {
+                    if let Some(path) = self.queue.items.get(*orig_idx) {
+                        let filename = path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+                        filename.contains(&query_lower)
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                }
+            })
+            .collect()
+    }
+
+    pub fn queue_items_len(&self) -> usize {
+        self.get_filtered_queue_indices().len()
     }
 
     pub fn is_file_operation_active(&self) -> bool {
@@ -1007,7 +1053,7 @@ impl App {
                 self.browser.page_up();
             }
             AppScreen::Queue => {
-                if !self.queue.items.is_empty() {
+                if self.queue_items_len() > 0 {
                     self.queue_selected_index = self.queue_selected_index.saturating_sub(10);
                 }
             }
@@ -1040,7 +1086,7 @@ impl App {
                 self.browser.page_down();
             }
             AppScreen::Queue => {
-                let len = self.queue.items.len();
+                let len = self.queue_items_len();
                 if len > 0 {
                     self.queue_selected_index = (self.queue_selected_index + 10).min(len.saturating_sub(1));
                 }
@@ -1067,5 +1113,70 @@ impl App {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+
+    #[test]
+    fn test_queue_search_filtering() {
+        let (tx, _rx) = channel();
+        let mut app = App::new(tx, None);
+
+        // Clear queue and add dummy tracks
+        app.queue.clear();
+        app.queue.add(PathBuf::from("dance_electronic.mp3"));
+        app.queue.add(PathBuf::from("ambient_chill.wav"));
+        app.queue.add(PathBuf::from("rock_classic.flac"));
+
+        // By default, no search active, filtered indices should show all 3 items
+        let indices = app.get_filtered_queue_indices();
+        assert_eq!(indices.len(), 3);
+        assert_eq!(indices[0], (0, 0));
+        assert_eq!(indices[1], (1, 1));
+        assert_eq!(indices[2], (2, 2));
+
+        // Activate search and set query
+        app.search.active = true;
+        app.search.query = "classic".to_string();
+
+        let indices = app.get_filtered_queue_indices();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].0, 2); // base_display_idx is 2
+        assert_eq!(indices[0].1, 2); // original index is 2
+        assert_eq!(app.queue_items_len(), 1);
+
+        // Test lowercase matching
+        app.search.query = "CHILL".to_string();
+        let indices = app.get_filtered_queue_indices();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].0, 1);
+        assert_eq!(indices[0].1, 1);
+        assert_eq!(app.queue_items_len(), 1);
+
+        // Test non-matching query
+        app.search.query = "pop".to_string();
+        assert_eq!(app.queue_items_len(), 0);
+
+        // Test shuffle interaction
+        app.search.query = "electronic".to_string();
+        app.queue.shuffle_indices = vec![2, 0, 1]; // shuffled order
+        {
+            let mut state = app.audio.shared_state.lock().unwrap();
+            state.shuffle = true;
+        }
+
+        // Under shuffle, the visual order is shuffle_indices.
+        // Index 0 in visual order is 2 (rock_classic.flac)
+        // Index 1 in visual order is 0 (dance_electronic.mp3)
+        // Index 2 in visual order is 1 (ambient_chill.wav)
+        // Since query is "electronic", it matches index 0 (dance_electronic.mp3).
+        // Therefore, it should match the 2nd visual item (base_idx = 1) whose original index is 0.
+        let indices = app.get_filtered_queue_indices();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0], (1, 0)); // (base_idx 1, orig_idx 0)
     }
 }
