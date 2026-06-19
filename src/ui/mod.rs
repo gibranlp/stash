@@ -39,7 +39,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     // 1. Render Header
     let current_dir_str = app.browser.current_dir.to_string_lossy();
-    let header_text = format!(" STASH v0.1 | Path: {} ", current_dir_str);
+    let header_text = format!(" STASH v0.3.0 | Path: {} ", current_dir_str);
     let header = Paragraph::new(Line::from(vec![
         Span::styled(&header_text, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
     ]))
@@ -259,9 +259,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 let is_text = matches_text_extension(&file_path);
 
                 let title = if is_text {
-                    " Code Preview (Scroll: j/k / PgUp/PgDn / Arrows) "
+                    " Code Preview (Scroll: j/k / PgUp/PgDn / Arrows) ".to_string()
                 } else {
-                    " Image Preview (Zoom/Pan: +/- / Arrows) "
+                    let proto_str = if let Some(ref picker) = app.picker {
+                        format!("{:?}", picker.protocol_type)
+                    } else {
+                        "None".to_string()
+                    };
+                    format!(" Image Preview [{}] (Zoom/Pan: +/- / Arrows) ", proto_str)
                 };
 
                 let preview_block = Block::default()
@@ -976,20 +981,20 @@ fn render_help_popup(f: &mut Frame) {
     let help_text = vec![
         Line::from(Span::styled("Navigation keys:", Style::default().add_modifier(Modifier::UNDERLINED))),
         Line::from("  Up/Down (j/k) - Move selection inside active pane"),
-        Line::from("  Left (h)      - Focus Directories, or Go to parent folder if focused"),
-        Line::from("  Right (l)     - Focus Files pane"),
+        Line::from("  Tab / Shift+Tab - Cycle focus between active panes"),
+        Line::from("  Left (h)      - Go to parent folder"),
+        Line::from("  Right (l)     - Enter selected directory (left pane)"),
         Line::from("  Enter         - Enter folder (left pane) or Play audio (right pane)"),
         Line::from("  Backspace     - Go to parent folder"),
         Line::from(""),
         Line::from(Span::styled("Selection & File Operations:", Style::default().add_modifier(Modifier::UNDERLINED))),
         Line::from("  Space         - Toggle file selection"),
-        Line::from("  c             - Create new collection"),
-        Line::from("  a             - Add selected files to a collection"),
-        Line::from("  C             - Toggle Collections manager (Clear Queue if on Queue screen)"),
         Line::from("  q             - Add selected files to queue"),
         Line::from("  Q             - Toggle Playback Queue screen"),
         Line::from("  y             - Move selected files (prompts path)"),
         Line::from("  v             - Copy selected files (prompts path)"),
+        Line::from("  Y             - Copy selected/highlighted to system clipboard (export)"),
+        Line::from("  Drag & Drop   - Drop external files/folders into browser (import)"),
         Line::from("  d             - Delete selected files (asks confirm)"),
         Line::from("  F2            - Rename highlighted file or folder"),
         Line::from(""),
@@ -1091,6 +1096,10 @@ fn render_progress_popup(f: &mut Frame, progress: &crate::app::FileOperationProg
 }
 
 fn render_image_preview(f: &mut Frame, app: &mut App, area: Rect, path: &PathBuf) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
     let img = if let Some((ref cached_path, ref cached_img)) = app.current_image_data {
         if cached_path == path {
             Some(cached_img.clone())
@@ -1130,12 +1139,30 @@ fn render_image_preview(f: &mut Frame, app: &mut App, area: Rect, path: &PathBuf
 
     let cropped = img.crop_imm(crop_x, crop_y, crop_w, crop_h);
 
+    if let Some(ref mut picker) = app.picker {
+        let cached_valid = if let Some((ref cached_path, cached_zoom, cached_ox, cached_oy, _)) = app.current_image_protocol {
+            cached_path == path
+                && (cached_zoom - app.image_zoom).abs() < 1e-5
+                && cached_ox == app.image_offset_x
+                && cached_oy == app.image_offset_y
+        } else {
+            false
+        };
+
+        if !cached_valid {
+            let proto = picker.new_resize_protocol(cropped.clone());
+            app.current_image_protocol = Some((path.clone(), app.image_zoom, app.image_offset_x, app.image_offset_y, proto));
+        }
+
+        if let Some((_, _, _, _, ref mut proto)) = app.current_image_protocol {
+            let image_widget = ratatui_image::ResizeImage::new(None);
+            f.render_stateful_widget(image_widget, area, proto);
+            return;
+        }
+    }
+
     let area_w = area.width as u32;
     let area_h = (area.height as u32).saturating_mul(2);
-
-    if area_w == 0 || area_h == 0 {
-        return;
-    }
 
     let resized = cropped.resize(area_w, area_h, image::imageops::FilterType::CatmullRom);
     let res_w = resized.width() as u16;
@@ -1162,6 +1189,132 @@ fn render_image_preview(f: &mut Frame, app: &mut App, area: Rect, path: &PathBuf
         let line = Line::from(spans);
         f.render_widget(Paragraph::new(line), Rect::new(dx, dy + y, res_w, 1));
     }
+}
+
+fn render_desktop_preview(f: &mut Frame, _app: &mut App, area: Rect, lines: &[String]) {
+    let mut name = None;
+    let mut generic_name = None;
+    let mut comment = None;
+    let mut exec = None;
+    let mut icon = None;
+    let mut terminal = None;
+    let mut entry_type = None;
+    let mut categories = None;
+    let mut mime_type = None;
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if let Some(pos) = trimmed.find('=') {
+            let key = trimmed[..pos].trim();
+            let val = trimmed[pos + 1..].trim().to_string();
+            match key {
+                "Name" => name = Some(val),
+                "GenericName" => generic_name = Some(val),
+                "Comment" => comment = Some(val),
+                "Exec" => exec = Some(val),
+                "Icon" => icon = Some(val),
+                "Terminal" => terminal = Some(val),
+                "Type" => entry_type = Some(val),
+                "Categories" => categories = Some(val),
+                "MimeType" => mime_type = Some(val),
+                _ => {}
+            }
+        }
+    }
+
+    let mut list_items = Vec::new();
+    
+    // Header
+    list_items.push(Line::from(vec![
+        Span::styled("Desktop Entry Configuration", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+    ]));
+    list_items.push(Line::from(vec![
+        Span::styled("─".repeat(area.width.saturating_sub(2) as usize), Style::default().fg(Color::DarkGray)),
+    ]));
+    list_items.push(Line::from(vec![]));
+
+    let label_style = Style::default().fg(Color::DarkGray);
+    let value_style = Style::default().fg(Color::White);
+    let highlight_value_style = Style::default().fg(Color::Yellow);
+
+    if let Some(n) = name {
+        list_items.push(Line::from(vec![
+            Span::styled("  Name:         ", label_style),
+            Span::styled(n, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        ]));
+    }
+    if let Some(gn) = generic_name {
+        list_items.push(Line::from(vec![
+            Span::styled("  Generic Name: ", label_style),
+            Span::styled(gn, value_style),
+        ]));
+    }
+    if let Some(t) = entry_type {
+        list_items.push(Line::from(vec![
+            Span::styled("  Type:         ", label_style),
+            Span::styled(t, value_style),
+        ]));
+    }
+    if let Some(e) = exec {
+        list_items.push(Line::from(vec![
+            Span::styled("  Exec Command: ", label_style),
+            Span::styled(e, highlight_value_style),
+        ]));
+    }
+    if let Some(term) = terminal {
+        list_items.push(Line::from(vec![
+            Span::styled("  Terminal:     ", label_style),
+            Span::styled(term, value_style),
+        ]));
+    }
+    if let Some(i) = icon {
+        list_items.push(Line::from(vec![
+            Span::styled("  Icon Name:    ", label_style),
+            Span::styled(i, value_style),
+        ]));
+    }
+    if let Some(c) = categories {
+        list_items.push(Line::from(vec![
+            Span::styled("  Categories:   ", label_style),
+            Span::styled(c, value_style),
+        ]));
+    }
+    if let Some(m) = mime_type {
+        list_items.push(Line::from(vec![
+            Span::styled("  Mime Types:   ", label_style),
+            Span::styled(m, value_style),
+        ]));
+    }
+    if let Some(comm) = comment {
+        list_items.push(Line::from(vec![]));
+        list_items.push(Line::from(vec![
+            Span::styled("  Comment:", label_style),
+        ]));
+        list_items.push(Line::from(vec![
+            Span::styled(format!("    {}", comm), Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)),
+        ]));
+    }
+
+    list_items.push(Line::from(vec![]));
+    list_items.push(Line::from(vec![
+        Span::styled("─".repeat(area.width.saturating_sub(2) as usize), Style::default().fg(Color::DarkGray)),
+    ]));
+    list_items.push(Line::from(vec![
+        Span::styled("  Raw File Contents (First 5 lines):", label_style),
+    ]));
+
+    let raw_preview_lines = lines.iter().take(5);
+    for raw_line in raw_preview_lines {
+        list_items.push(Line::from(vec![
+            Span::styled(format!("    {}", raw_line), Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    let paragraph = Paragraph::new(list_items).wrap(ratatui::widgets::Wrap { trim: false });
+    f.render_widget(paragraph, area);
 }
 
 fn render_text_preview(f: &mut Frame, app: &mut App, area: Rect, path: &PathBuf) {
@@ -1197,6 +1350,11 @@ fn render_text_preview(f: &mut Frame, app: &mut App, area: Rect, path: &PathBuf)
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_lowercase();
+
+    if ext == "desktop" {
+        render_desktop_preview(f, app, area, &lines);
+        return;
+    }
 
     let total_lines = lines.len();
     let viewport_height = area.height as usize;

@@ -104,6 +104,7 @@ pub fn matches_text_extension(path: &Path) -> bool {
         matches!(
             ext.to_lowercase().as_str(),
             "txt"
+                | "desktop"
                 | "rs"
                 | "py"
                 | "js"

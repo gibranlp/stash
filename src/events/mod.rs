@@ -5,6 +5,7 @@ use crossterm::event::{self, Event as CrossEvent, KeyEvent};
 #[derive(Debug, Clone)]
 pub enum Event {
     Key(KeyEvent),
+    Paste(String),
     Tick,
     AudioFinished,
     MediaPlayPause,
@@ -21,8 +22,14 @@ pub fn spawn_event_handler(tx: std::sync::mpsc::Sender<Event>) {
         loop {
             if let Ok(has_event) = event::poll(Duration::from_millis(50)) {
                 if has_event {
-                    if let Ok(CrossEvent::Key(key_event)) = event::read() {
-                        let _ = input_tx.send(Event::Key(key_event));
+                    match event::read() {
+                        Ok(CrossEvent::Key(key_event)) => {
+                            let _ = input_tx.send(Event::Key(key_event));
+                        }
+                        Ok(CrossEvent::Paste(content)) => {
+                            let _ = input_tx.send(Event::Paste(content));
+                        }
+                        _ => {}
                     }
                 }
             }

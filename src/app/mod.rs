@@ -18,6 +18,7 @@ use lofty::probe::Probe;
 pub enum AppScreen {
     Browser,
     Queue,
+    #[allow(dead_code)]
     Collections,
 }
 
@@ -85,10 +86,12 @@ pub struct App {
     pub image_offset_y: i32,
     pub last_previewed_file: Option<PathBuf>,
     pub current_image_data: Option<(PathBuf, image::DynamicImage)>,
+    pub current_image_protocol: Option<(PathBuf, f64, i32, i32, Box<dyn ratatui_image::protocol::ResizeProtocol>)>,
     pub text_scroll_offset: usize,
     pub current_text_data: Option<(PathBuf, Vec<String>)>,
     pub config: AppConfig,
     pub last_operation_dest: String,
+    pub picker: Option<ratatui_image::picker::Picker>,
 }
 
 impl App {
@@ -121,24 +124,14 @@ impl App {
             .spawn();
     }
 
-    pub fn new(event_tx: std::sync::mpsc::Sender<Event>, initial_path: Option<PathBuf>) -> Self {
+    pub fn new(event_tx: std::sync::mpsc::Sender<Event>, initial_path: Option<PathBuf>, picker: Option<ratatui_image::picker::Picker>) -> Self {
         let config = AppConfig::load();
         
-        // Resolve initial directory: command-line argument, config music_folders, or current dir
+        // Resolve initial directory: command-line argument or current dir
         let starting_dir = if let Some(ref path) = initial_path {
             let resolved = resolve_path(&path.to_string_lossy());
             if resolved.exists() {
                 resolved
-            } else if !config.music_folders.is_empty() {
-                let p = resolve_path(&config.music_folders[0]);
-                if p.exists() { p } else { std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")) }
-            } else {
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-            }
-        } else if !config.music_folders.is_empty() {
-            let path = resolve_path(&config.music_folders[0]);
-            if path.exists() {
-                path
             } else {
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
             }
@@ -228,16 +221,19 @@ impl App {
             image_offset_y: 0,
             last_previewed_file: None,
             current_image_data: None,
+            current_image_protocol: None,
             text_scroll_offset: 0,
             current_text_data: None,
             config,
             last_operation_dest: String::new(),
+            picker,
         }
     }
 
     pub fn handle_event(&mut self, event: Event) {
         match event {
             Event::Key(key) => self.handle_key(key),
+            Event::Paste(content) => self.handle_paste(content),
             Event::Tick => {
                 let mut should_refresh = false;
                 {
@@ -487,6 +483,38 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Tab => {
+                if self.screen == AppScreen::Browser {
+                    let has_prev = self.has_preview();
+                    self.browser.focused_pane = match self.browser.focused_pane {
+                        PaneType::Directories => PaneType::Files,
+                        PaneType::Files => {
+                            if has_prev {
+                                PaneType::Preview
+                            } else {
+                                PaneType::Directories
+                            }
+                        }
+                        PaneType::Preview => PaneType::Directories,
+                    };
+                }
+            }
+            KeyCode::BackTab => {
+                if self.screen == AppScreen::Browser {
+                    let has_prev = self.has_preview();
+                    self.browser.focused_pane = match self.browser.focused_pane {
+                        PaneType::Directories => {
+                            if has_prev {
+                                PaneType::Preview
+                            } else {
+                                PaneType::Files
+                            }
+                        }
+                        PaneType::Files => PaneType::Directories,
+                        PaneType::Preview => PaneType::Files,
+                    };
+                }
+            }
             KeyCode::Char('?') => {
                 self.show_help = true;
             }
@@ -508,15 +536,6 @@ impl App {
                     self.queue.clear();
                     self.audio.stop();
                     self.queue_selected_index = 0;
-                } else if self.screen == AppScreen::Collections {
-                    self.screen = AppScreen::Browser;
-                } else {
-                    self.screen = AppScreen::Collections;
-                    self.search.active = false;
-                    self.search.query.clear();
-                    self.selected_collection_index = 0;
-                    self.active_collection_file_index = 0;
-                    self.collections_focused_pane = PaneType::Directories;
                 }
             }
             KeyCode::Esc => {
@@ -717,16 +736,7 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('c') => {
-                self.input_mode = InputMode::CreateCollection;
-                self.input_value.clear();
-            }
-            KeyCode::Char('a') => {
-                if !self.browser.selected_paths.is_empty() {
-                    self.input_mode = InputMode::AddToCollectionList;
-                    self.selected_add_collection_index = 0;
-                }
-            }
+
             KeyCode::Char('/') => {
                 self.input_mode = InputMode::Search;
                 self.search.active = true;
@@ -751,6 +761,14 @@ impl App {
                 if !self.browser.selected_paths.is_empty() {
                     self.input_mode = InputMode::MovePath;
                     self.input_value = self.last_operation_dest.clone();
+                }
+            }
+            KeyCode::Char('Y') => {
+                if self.screen == AppScreen::Browser {
+                    let paths = self.get_active_paths();
+                    if !paths.is_empty() {
+                        let _ = Self::copy_paths_to_clipboard(&paths);
+                    }
                 }
             }
             KeyCode::Char('d') => {
@@ -1126,11 +1144,7 @@ impl App {
     fn navigate_left(&mut self) {
         match self.screen {
             AppScreen::Browser => {
-                if self.browser.focused_pane == PaneType::Preview {
-                    self.browser.focused_pane = PaneType::Files;
-                } else if self.browser.focused_pane == PaneType::Files {
-                    self.browser.focused_pane = PaneType::Directories;
-                } else {
+                if self.browser.focused_pane != PaneType::Preview {
                     self.browser.go_to_parent();
                 }
             }
@@ -1144,15 +1158,8 @@ impl App {
     fn navigate_right(&mut self) {
         match self.screen {
             AppScreen::Browser => {
-                if self.browser.focused_pane == PaneType::Files {
-                    if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
-                        let path = &self.browser.files[self.browser.file_index].path;
-                        if matches_image_extension(path) || matches_text_extension(path) {
-                            self.browser.focused_pane = PaneType::Preview;
-                        }
-                    }
-                } else if self.browser.focused_pane == PaneType::Directories {
-                    self.browser.focused_pane = PaneType::Files;
+                if self.browser.focused_pane == PaneType::Directories {
+                    self.browser.open_selected_dir();
                 }
             }
             AppScreen::Collections => {
@@ -1451,6 +1458,342 @@ impl App {
 
     pub fn is_file_operation_active(&self) -> bool {
         self.file_progress.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    pub fn has_preview(&self) -> bool {
+        if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
+            let path = &self.browser.files[self.browser.file_index].path;
+            matches_image_extension(path) || matches_text_extension(path)
+        } else {
+            false
+        }
+    }
+
+    fn get_active_paths(&self) -> Vec<PathBuf> {
+        if !self.browser.selected_paths.is_empty() {
+            self.browser.selected_paths.iter().cloned().collect()
+        } else {
+            match self.browser.focused_pane {
+                PaneType::Directories => {
+                    if !self.browser.directories.is_empty() && self.browser.dir_index < self.browser.directories.len() {
+                        let path = self.browser.directories[self.browser.dir_index].clone();
+                        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                            if name != "." && name != ".." {
+                                vec![path]
+                            } else {
+                                vec![]
+                            }
+                        } else {
+                            vec![]
+                        }
+                    } else {
+                        vec![]
+                    }
+                }
+                PaneType::Files => {
+                    if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
+                        vec![self.browser.files[self.browser.file_index].path.clone()]
+                    } else {
+                        vec![]
+                    }
+                }
+                PaneType::Preview => vec![],
+            }
+        }
+    }
+
+    fn url_decode(s: &str) -> Result<String, std::string::FromUtf8Error> {
+        let mut bytes = Vec::new();
+        let mut chars = s.as_bytes().iter().peekable();
+        while let Some(&b) = chars.next() {
+            if b == b'%' {
+                if let (Some(&h), Some(&l)) = (chars.next(), chars.next()) {
+                    if let Ok(hex_str) = std::str::from_utf8(&[h, l]) {
+                        if let Ok(val) = u8::from_str_radix(hex_str, 16) {
+                            bytes.push(val);
+                            continue;
+                        }
+                    }
+                }
+            }
+            bytes.push(b);
+        }
+        String::from_utf8(bytes)
+    }
+
+    fn parse_dropped_paths(text: &str) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        
+        // Split by lines first
+        for line in text.lines() {
+            let cleaned = line.trim().to_string();
+            if cleaned.is_empty() {
+                continue;
+            }
+
+            // A line could be a single path, e.g., "file:///home/user/Music/some file.mp3"
+            // or it could be quoted multiple paths, e.g., "'file:///home/user/Music/file 1.mp3' 'file:///home/user/Music/file 2.mp3'"
+            // Or it could be a raw path with spaces, e.g. "/home/user/Music/some file.mp3"
+            
+            // Let's first check if the entire trimmed line (after stripping file:// and url-decoding) exists.
+            let mut candidate = cleaned.clone();
+            
+            // Strip single/double quotes around the candidate if they enclose the whole line
+            if (candidate.starts_with('\'') && candidate.ends_with('\'')) || 
+               (candidate.starts_with('"') && candidate.ends_with('"')) {
+                candidate = candidate[1..candidate.len()-1].to_string();
+            }
+
+            if candidate.starts_with("file://") {
+                if let Some(stripped) = candidate.strip_prefix("file://") {
+                    candidate = stripped.to_string();
+                }
+            }
+            if candidate.contains('%') {
+                if let Ok(decoded) = Self::url_decode(&candidate) {
+                    candidate = decoded;
+                }
+            }
+            
+            let candidate_path = PathBuf::from(&candidate);
+            if candidate_path.exists() {
+                // The entire line is a single existing path!
+                paths.push(candidate_path);
+                continue;
+            }
+            
+            // If the entire line doesn't exist, it might contain multiple paths separated by spaces/quotes/escapes.
+            // We run the classic tokenization parser on this line.
+            let mut current = String::new();
+            let mut in_single_quote = false;
+            let mut in_double_quote = false;
+            let mut escaped = false;
+            let mut chars = line.chars().peekable();
+            
+            while let Some(c) = chars.next() {
+                if escaped {
+                    current.push(c);
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '\'' && !in_double_quote {
+                    in_single_quote = !in_single_quote;
+                } else if c == '"' && !in_single_quote {
+                    in_double_quote = !in_double_quote;
+                } else if (c == ' ' || c == '\t') && !in_single_quote && !in_double_quote {
+                    if !current.is_empty() {
+                        let mut p_val = current.clone();
+                        if p_val.starts_with("file://") {
+                            if let Some(stripped) = p_val.strip_prefix("file://") {
+                                p_val = stripped.to_string();
+                            }
+                        }
+                        if p_val.contains('%') {
+                            if let Ok(decoded) = Self::url_decode(&p_val) {
+                                p_val = decoded;
+                            }
+                        }
+                        let pb = PathBuf::from(p_val);
+                        if pb.exists() {
+                            paths.push(pb);
+                        }
+                        current.clear();
+                    }
+                } else {
+                    current.push(c);
+                }
+            }
+            if !current.is_empty() {
+                let mut p_val = current;
+                if p_val.starts_with("file://") {
+                    if let Some(stripped) = p_val.strip_prefix("file://") {
+                        p_val = stripped.to_string();
+                    }
+                }
+                if p_val.contains('%') {
+                    if let Ok(decoded) = Self::url_decode(&p_val) {
+                        p_val = decoded;
+                    }
+                }
+                let pb = PathBuf::from(p_val);
+                if pb.exists() {
+                    paths.push(pb);
+                }
+            }
+        }
+        
+        paths
+    }
+
+    fn copy_paths_to_clipboard(paths: &[PathBuf]) -> Result<(), String> {
+        if paths.is_empty() {
+            return Err("No paths selected".to_string());
+        }
+
+        let mut plain_text = String::new();
+        let mut uri_list = String::new();
+        for path in paths {
+            if let Ok(abs_path) = std::fs::canonicalize(path) {
+                let path_str = abs_path.to_string_lossy().to_string();
+                if !plain_text.is_empty() {
+                    plain_text.push(' ');
+                }
+                plain_text.push_str(&path_str);
+                
+                uri_list.push_str("file://");
+                uri_list.push_str(&path_str);
+                uri_list.push('\n');
+            }
+        }
+
+        // 1. Copy via OSC 52 (highly reliable terminal clipboard bypass)
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(plain_text.as_bytes());
+        let osc52 = format!("\x1b]52;c;{}\x07", b64);
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(osc52.as_bytes());
+        let _ = stdout.flush();
+
+        // 2. Try Wayland wl-copy (enables file manager pasting)
+        let use_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+        if use_wayland {
+            let child = std::process::Command::new("wl-copy")
+                .args(["-t", "text/uri-list"])
+                .stdin(std::process::Stdio::piped())
+                .spawn();
+            
+            if let Ok(mut c) = child {
+                if c.stdin.as_mut().unwrap().write_all(uri_list.as_bytes()).is_ok() {
+                    let _ = c.wait();
+                }
+            }
+        } else {
+            // 3. Try X11 xclip
+            let child = std::process::Command::new("xclip")
+                .args(["-selection", "clipboard", "-t", "text/uri-list"])
+                .stdin(std::process::Stdio::piped())
+                .spawn();
+            if let Ok(mut c) = child {
+                if c.stdin.as_mut().unwrap().write_all(uri_list.as_bytes()).is_ok() {
+                    let _ = c.wait();
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn start_drop_operation(&mut self, source_paths: Vec<PathBuf>, dest_dir: PathBuf) {
+        if source_paths.is_empty() {
+            return;
+        }
+
+        let total_items = source_paths.len();
+        let progress = Arc::clone(&self.file_progress);
+        let op_type = "Dropping".to_string();
+
+        {
+            let mut p = progress.lock().unwrap();
+            *p = Some(FileOperationProgress {
+                op_type: op_type.clone(),
+                current_file: String::new(),
+                completed_files: 0,
+                total_files: total_items,
+                finished: false,
+                error: None,
+                canceled: false,
+            });
+        }
+
+        thread::spawn(move || {
+            if !dest_dir.exists() {
+                if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+                    let mut p = progress.lock().unwrap();
+                    if let Some(ref mut state) = *p {
+                        state.error = Some(e.to_string());
+                        state.finished = true;
+                    }
+                    return;
+                }
+            }
+
+            let mut completed = 0;
+            for path in source_paths {
+                {
+                    let p = progress.lock().unwrap();
+                    if let Some(ref state) = *p {
+                        if state.canceled {
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(name) = path.file_name() {
+                    let name_str = name.to_string_lossy().into_owned();
+                    {
+                        let mut p = progress.lock().unwrap();
+                        if let Some(ref mut state) = *p {
+                            state.current_file = name_str;
+                        }
+                    }
+
+                    let dest_path = dest_dir.join(name);
+                    let res = if path.is_file() {
+                        std::fs::copy(&path, &dest_path).map(|_| ())
+                    } else if path.is_dir() {
+                        Self::copy_dir_recursive(&path, &dest_path, &progress)
+                    } else {
+                        Ok(())
+                    };
+
+                    if let Err(e) = res {
+                        let mut p = progress.lock().unwrap();
+                        if let Some(ref mut state) = *p {
+                            state.error = Some(format!("Error on {}: {}", path.display(), e));
+                            state.finished = true;
+                        }
+                        return;
+                    }
+                }
+
+                completed += 1;
+                {
+                    let mut p = progress.lock().unwrap();
+                    if let Some(ref mut state) = *p {
+                        state.completed_files = completed;
+                    }
+                }
+            }
+
+            {
+                let mut p = progress.lock().unwrap();
+                if let Some(ref mut state) = *p {
+                    state.finished = true;
+                }
+            }
+        });
+    }
+
+    fn handle_paste(&mut self, content: String) {
+        match self.input_mode {
+            InputMode::CreateCollection
+            | InputMode::AddToCollectionList
+            | InputMode::Search
+            | InputMode::Rename
+            | InputMode::CopyPath
+            | InputMode::MovePath => {
+                self.input_value.push_str(&content);
+            }
+            InputMode::Normal
+            | InputMode::ConfirmDelete => {
+                let paths = Self::parse_dropped_paths(&content);
+                if !paths.is_empty() {
+                    let dest_dir = self.browser.current_dir.clone();
+                    self.start_drop_operation(paths, dest_dir);
+                }
+            }
+        }
     }
 
     fn start_file_operation(&mut self, dest_dir: PathBuf, is_move: bool) {
@@ -1840,7 +2183,7 @@ mod tests {
     #[test]
     fn test_queue_search_filtering() {
         let (tx, _rx) = channel();
-        let mut app = App::new(tx, None);
+        let mut app = App::new(tx, None, None);
 
         // Clear queue and add dummy tracks
         app.queue.clear();
@@ -1912,7 +2255,7 @@ mod tests {
         let file_path = test_root.join("test_file.mp3");
         std::fs::File::create(&file_path).unwrap();
 
-        let mut app = App::new(tx, Some(test_root.clone()));
+        let mut app = App::new(tx, Some(test_root.clone()), None);
 
         // Focus on files pane
         app.browser.focused_pane = PaneType::Files;
@@ -1990,7 +2333,7 @@ mod tests {
         let image_path = test_root.join("test_image.png");
         std::fs::File::create(&image_path).unwrap();
 
-        let mut app = App::new(tx, Some(test_root.clone()));
+        let mut app = App::new(tx, Some(test_root.clone()), None);
 
         // Make sure it loads the files list
         assert_eq!(app.browser.files.len(), 1);
@@ -2003,8 +2346,8 @@ mod tests {
         // Verify matches_image_extension is true
         assert!(matches_image_extension(&image_path));
 
-        // Test navigate_right when highlighted file is an image -> focus should move to Preview pane
-        app.navigate_right();
+        // Simulating Tab press to move focus to Preview pane
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.browser.focused_pane, PaneType::Preview);
 
         // Under Preview focus, simulate panning up / down / left / right
@@ -2027,8 +2370,8 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
         assert_eq!(app.image_zoom, 1.0);
 
-        // Navigate left to focus back to Files pane
-        app.navigate_left();
+        // Simulate BackTab (Shift+Tab) to focus back to Files pane
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
         assert_eq!(app.browser.focused_pane, PaneType::Files);
 
         let _ = std::fs::remove_dir_all(&test_root);
@@ -2050,7 +2393,7 @@ mod tests {
         let text_path = test_root.join("test_code.rs");
         std::fs::write(&text_path, "fn main() {\n    println!(\"Hello\");\n}\n// Line 4\n// Line 5\n// Line 6\n// Line 7\n// Line 8\n// Line 9\n// Line 10\n// Line 11\n// Line 12\n").unwrap();
 
-        let mut app = App::new(tx, Some(test_root.clone()));
+        let mut app = App::new(tx, Some(test_root.clone()), None);
 
         // Make sure it loads the files list
         assert_eq!(app.browser.files.len(), 1);
@@ -2062,9 +2405,10 @@ mod tests {
 
         // Verify matches_text_extension is true
         assert!(matches_text_extension(&text_path));
+        assert!(matches_text_extension(std::path::Path::new("app.desktop")));
 
-        // Test navigate_right when highlighted file is a text file -> focus should move to Preview pane
-        app.navigate_right();
+        // Simulating Tab press to move focus to Preview pane
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.browser.focused_pane, PaneType::Preview);
 
         // Under Preview focus, simulate scrolling down / up / page down / page up
@@ -2087,8 +2431,8 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
         assert_eq!(app.text_scroll_offset, 0);
 
-        // Navigate left to focus back to Files pane
-        app.navigate_left();
+        // Simulate BackTab (Shift+Tab) to focus back to Files pane
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
         assert_eq!(app.browser.focused_pane, PaneType::Files);
 
         let _ = std::fs::remove_dir_all(&test_root);
@@ -2119,7 +2463,7 @@ mod tests {
         assert!(val.contains("src_folder"));
 
         // 2. Folder copying test
-        let mut app = App::new(tx, Some(test_root.clone()));
+        let mut app = App::new(tx, Some(test_root.clone()), None);
         app.browser.selected_paths.insert(src_dir.clone());
 
         app.start_file_operation(dest_dir.clone(), false);
@@ -2150,7 +2494,7 @@ mod tests {
         let file_path = test_root.join("some_file.txt");
         std::fs::write(&file_path, "hello").unwrap();
 
-        let mut app = App::new(tx, Some(test_root.clone()));
+        let mut app = App::new(tx, Some(test_root.clone()), None);
         app.browser.focused_pane = PaneType::Files;
         app.browser.file_index = 0;
         

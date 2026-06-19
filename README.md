@@ -140,7 +140,19 @@ s       Open current folder in STASH
 
 ---
 
-## Recent Version Changelog (v0.2.0)
+## Recent Version Changelog
+
+### v0.3.0
+
+- **High-Resolution Graphics Support (Kitty/Sixel)**: Integrated native graphics protocols in terminal emulators supporting them (like Kitty or Sixel), falling back gracefully to Unicode block characters in others (like Alacritty).
+- **Tabbed Pane Navigation**: Added `Tab` and `Shift+Tab` to cycle focus forward and backward between panels (`Directories` -> `Files` -> `Preview`), skipping `Preview` if no preview is available.
+- **Dedicated Directory Traversal**: Configured `Left arrow` (or `h`) and `Right arrow` (or `l`) to traverse parent and child folders respectively, avoiding accidental pane switching.
+- **Improved Drag-and-Drop Parsing**: Rewrote path parsing for bracketed paste drag-and-drops to correctly support absolute paths containing spaces, unquoted characters, or URL encodings.
+- **Wayland / X11 File Manager Copy-Paste**: Corrected file path clipboard exporting (`Y`) by eliminating redundant plain text overrides, allowing graphical file managers (like Thunar or Dolphin) to receive `text/uri-list` data for direct pasting.
+- **Structured Desktop Previews**: Added native preview rendering cards for `.desktop` configurations (displaying Name, Exec, Icon, categories, comments, and config details).
+- **Streamlined Collections**: Removed collections creation, adding, and menu shortcuts to focus solely on high-speed directory selection, copying, and moving.
+
+### v0.2.0
 
 - **Recursive Directory Operations**: Enabled selecting folders entirely (using `Space` key) to copy, move, or delete them recursively.
 - **Path Autocompletion**: Added `Tab` autocompletion for copy/move target inputs.
