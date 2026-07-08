@@ -42,7 +42,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Jalamos el picker para imágenes — tiene que ser antes de spawnear el hilo de eventos
     // porque from_termios() necsita interactuar directo con la terminal
+    #[cfg(unix)]
     let picker_res = ratatui_image::picker::Picker::from_termios();
+    #[cfg(not(unix))]
+    let picker_res: Result<ratatui_image::picker::Picker, &str> = Err("Querying terminal is not supported on this platform");
     if let Ok(ref p) = picker_res {
         let _ = std::fs::write("debug_picker.log", format!("Picker successfully initialized. Protocol: {:?}", p.protocol_type));
     } else if let Err(ref e) = picker_res {
