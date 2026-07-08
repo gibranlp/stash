@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 use crate::models::FileItem;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,92 +13,44 @@ pub enum PaneType {
 
 pub struct BrowserState {
     pub current_dir: PathBuf,
-    pub directories: Vec<PathBuf>,
-    pub directories_has_subdirs: Vec<bool>,
     pub files: Vec<FileItem>,
-    pub dir_index: usize,
     pub file_index: usize,
     pub focused_pane: PaneType,
     pub selected_paths: HashSet<PathBuf>,
     pub show_hidden: bool,
+    pub expanded_paths: HashSet<PathBuf>,
+    pub shift_start: Option<usize>,
 }
 
 impl BrowserState {
     pub fn new(initial_dir: PathBuf, show_hidden: bool) -> Self {
         let mut state = Self {
             current_dir: initial_dir,
-            directories: Vec::new(),
-            directories_has_subdirs: Vec::new(),
             files: Vec::new(),
-            dir_index: 0,
             file_index: 0,
-            focused_pane: PaneType::Directories,
+            focused_pane: PaneType::Files,
             selected_paths: HashSet::new(),
             show_hidden,
+            expanded_paths: HashSet::new(),
+            shift_start: None,
         };
         state.refresh();
         state
     }
 
-    pub fn get_highlighted_dir(&self) -> PathBuf {
-        if self.directories.is_empty() || self.dir_index >= self.directories.len() {
-            return self.current_dir.clone();
-        }
-        let dir = &self.directories[self.dir_index];
-        // The first directory in self.directories is always the current directory (".")
-        if self.dir_index == 0 {
-            self.current_dir.clone()
-        } else if dir.ends_with("..") {
-            self.current_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| self.current_dir.clone())
-        } else {
-            dir.clone()
-        }
-    }
-
+    // Le pegamos un refresh al árbol: reconstruye la lista de archivos
+    // y ajusta el índice pa que no se salga de rango
     pub fn refresh(&mut self) {
-        let (dirs, _) = load_directory(&self.current_dir, self.show_hidden);
-        self.directories = dirs;
-
-        // Compute if each directory has subdirectories
-        self.directories_has_subdirs = self.directories
-            .iter()
-            .map(|dir| {
-                if dir.ends_with(".") || dir.ends_with("..") {
-                    return false;
-                }
-                if let Ok(entries) = fs::read_dir(dir) {
-                    for entry in entries.flatten() {
-                        let entry_path = entry.path();
-                        if entry_path.is_dir() {
-                            let name = entry.file_name().to_string_lossy().into_owned();
-                            if self.show_hidden || !name.starts_with('.') {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                false
-            })
-            .collect();
-
-        // Ensure indices are within bounds
-        if self.directories.is_empty() {
-            self.dir_index = 0;
-        } else if self.dir_index >= self.directories.len() {
-            self.dir_index = self.directories.len() - 1;
-        }
-
-        let preview_dir = self.get_highlighted_dir();
-        let (_, mut fls) = load_directory(&preview_dir, self.show_hidden);
-
-        // Sync selections
-        for file in &mut fls {
-            if self.selected_paths.contains(&file.path) {
-                file.is_selected = true;
-            }
-        }
-
-        self.files = fls;
+        let mut new_files = Vec::new();
+        build_tree(
+            &self.current_dir,
+            0,
+            self.show_hidden,
+            &self.expanded_paths,
+            &self.selected_paths,
+            &mut new_files,
+        );
+        self.files = new_files;
 
         if self.files.is_empty() {
             self.file_index = 0;
@@ -107,88 +60,141 @@ impl BrowserState {
     }
 
     pub fn move_up(&mut self) {
-        match self.focused_pane {
-            PaneType::Directories => {
-                if !self.directories.is_empty() && self.dir_index > 0 {
-                    self.dir_index -= 1;
-                    self.refresh();
-                }
-            }
-            PaneType::Files => {
-                if !self.files.is_empty() && self.file_index > 0 {
-                    self.file_index -= 1;
-                }
-            }
-            PaneType::Preview => {}
+        if !self.files.is_empty() && self.file_index > 0 {
+            self.file_index -= 1;
         }
     }
 
     pub fn move_down(&mut self) {
-        match self.focused_pane {
-            PaneType::Directories => {
-                if !self.directories.is_empty() && self.dir_index + 1 < self.directories.len() {
-                    self.dir_index += 1;
-                    self.refresh();
-                }
-            }
-            PaneType::Files => {
-                if !self.files.is_empty() && self.file_index + 1 < self.files.len() {
-                    self.file_index += 1;
-                }
-            }
-            PaneType::Preview => {}
+        if !self.files.is_empty() && self.file_index + 1 < self.files.len() {
+            self.file_index += 1;
         }
     }
 
-    pub fn open_selected_dir(&mut self) {
-        if self.focused_pane == PaneType::Directories && !self.directories.is_empty() {
-            let resolved = self.get_highlighted_dir();
-            self.current_dir = resolved;
-            self.dir_index = 0;
-            self.file_index = 0;
-            self.refresh();
-        }
-    }
-
+    // Subimos al directorio padre; expandimos el que dejamos
+    // pa que el usuario lo siga viendo en el árbol y no se pierda
     pub fn go_to_parent(&mut self) {
         if let Some(parent) = self.current_dir.parent() {
             let old_dir = self.current_dir.clone();
             self.current_dir = parent.to_path_buf();
-            
-            // First load directories of the parent so we can locate old_dir
-            let (dirs, _) = load_directory(&self.current_dir, self.show_hidden);
-            self.directories = dirs;
-
-            // Try to set directory index to the folder we just exited
-            if let Some(pos) = self.directories.iter().position(|d| d == &old_dir) {
-                self.dir_index = pos;
-            } else {
-                self.dir_index = 0;
-            }
-            self.file_index = 0;
-            self.focused_pane = PaneType::Directories;
-
+            self.expanded_paths.insert(old_dir.clone());
             self.refresh();
+
+            // Dejamos el cursor apuntando al folder del que salimos
+            if let Some(pos) = self.files.iter().position(|f| f.path == old_dir) {
+                self.file_index = pos;
+            } else {
+                self.file_index = 0;
+            }
         }
     }
 
     pub fn toggle_select_highlighted(&mut self) {
-        if self.focused_pane == PaneType::Files && !self.files.is_empty() {
+        if !self.files.is_empty() && self.file_index < self.files.len() {
             let file = &mut self.files[self.file_index];
             file.is_selected = !file.is_selected;
             if file.is_selected {
                 self.selected_paths.insert(file.path.clone());
             } else {
-                self.selected_paths.remove(&file.path);
+                self.selected_paths.remove(&file.path.clone());
             }
-        } else if self.focused_pane == PaneType::Directories && !self.directories.is_empty() {
-            let path = self.directories[self.dir_index].clone();
-            // Don't allow selecting current (".") or parent ("..") directories
-            if !path.ends_with(".") && !path.ends_with("..") {
-                if self.selected_paths.contains(&path) {
-                    self.selected_paths.remove(&path);
+        }
+    }
+
+
+    // Selección por rango tipo shift+click: el estado (seleccionar/deseleccionar)
+    // se decide según cómo esté el item donde está parado el cursor ahorita
+    pub fn toggle_range_selection(&mut self, start: usize, end: usize) {
+        let min_idx = start.min(end);
+        let max_idx = start.max(end).min(self.files.len().saturating_sub(1));
+
+        if min_idx >= self.files.len() {
+            return;
+        }
+
+        let target_state = if self.file_index < self.files.len() {
+            !self.files[self.file_index].is_selected
+        } else {
+            true
+        };
+
+        for idx in min_idx..=max_idx {
+            let file = &self.files[idx];
+            let path = file.path.clone();
+            if file.is_dir {
+                // Si es carpeta, jalamos todos los archivos de adentro con WalkDir
+                if target_state {
+                    self.selected_paths.insert(path.clone());
+                    for entry in WalkDir::new(&path)
+                        .into_iter()
+                        .filter_entry(|e| {
+                            self.show_hidden || !e.file_name().to_string_lossy().starts_with('.')
+                        })
+                        .flatten()
+                    {
+                        let p = entry.path().to_path_buf();
+                        if p.is_file() {
+                            self.selected_paths.insert(p);
+                        }
+                    }
                 } else {
+                    self.selected_paths.remove(&path);
+                    self.selected_paths.retain(|p| !p.starts_with(&path));
+                }
+            } else {
+                if target_state {
                     self.selected_paths.insert(path);
+                } else {
+                    self.selected_paths.remove(&path);
+                }
+            }
+        }
+        self.refresh();
+    }
+
+    // Toggle de tres estados para carpetas:
+    //   [ ] → [*]  selecciona la carpeta + todos los archivos de adentro
+    //   [*] → [-]  quita la carpeta del selected pero deja los archivos
+    //   [-] → [ ]  limpia todo lo que esté seleccionado adentro
+    pub fn toggle_folder_select(&mut self, idx: usize) {
+        if idx >= self.files.len() || !self.files[idx].is_dir {
+            return;
+        }
+        let folder_path = self.files[idx].path.clone();
+        let folder_selected = self.selected_paths.contains(&folder_path);
+        let files_selected = self.selected_paths
+            .iter()
+            .any(|p| p != &folder_path && p.starts_with(&folder_path));
+
+        if !folder_selected && !files_selected {
+            self.selected_paths.insert(folder_path.clone());
+            self.files[idx].is_selected = true;
+            for entry in WalkDir::new(&folder_path)
+                .into_iter()
+                .filter_entry(|e| {
+                    self.show_hidden || !e.file_name().to_string_lossy().starts_with('.')
+                })
+                .flatten()
+            {
+                let p = entry.path().to_path_buf();
+                if p.is_file() {
+                    self.selected_paths.insert(p);
+                }
+            }
+            for file in &mut self.files {
+                if !file.is_dir && file.path.starts_with(&folder_path) {
+                    file.is_selected = true;
+                }
+            }
+        } else if folder_selected {
+            self.selected_paths.remove(&folder_path);
+            self.files[idx].is_selected = false;
+        } else {
+            // Los archivos están seleccionados pero la carpeta no — limpiamos todo
+            self.selected_paths.retain(|p| !p.starts_with(&folder_path));
+            for file in &mut self.files {
+                if file.path.starts_with(&folder_path) {
+                    file.is_selected = false;
                 }
             }
         }
@@ -200,7 +206,6 @@ impl BrowserState {
             file.is_selected = false;
         }
     }
-
 
     pub fn delete_selected(&mut self) -> anyhow::Result<()> {
         for path in &self.selected_paths {
@@ -217,42 +222,28 @@ impl BrowserState {
 
     pub fn page_up(&mut self) {
         let step = 10;
-        match self.focused_pane {
-            PaneType::Directories => {
-                if !self.directories.is_empty() {
-                    self.dir_index = self.dir_index.saturating_sub(step);
-                    self.refresh();
-                }
-            }
-            PaneType::Files => {
-                if !self.files.is_empty() {
-                    self.file_index = self.file_index.saturating_sub(step);
-                }
-            }
-            PaneType::Preview => {}
-        }
+        self.file_index = self.file_index.saturating_sub(step);
     }
 
     pub fn page_down(&mut self) {
         let step = 10;
-        match self.focused_pane {
-            PaneType::Directories => {
-                if !self.directories.is_empty() {
-                    self.dir_index = (self.dir_index + step).min(self.directories.len().saturating_sub(1));
-                    self.refresh();
-                }
-            }
-            PaneType::Files => {
-                if !self.files.is_empty() {
-                    self.file_index = (self.file_index + step).min(self.files.len().saturating_sub(1));
-                }
-            }
-            PaneType::Preview => {}
+        if !self.files.is_empty() {
+            self.file_index = (self.file_index + step).min(self.files.len().saturating_sub(1));
         }
     }
 }
 
-pub fn load_directory(path: &Path, show_hidden: bool) -> (Vec<PathBuf>, Vec<FileItem>) {
+// Construye el árbol de archivos de forma recursiva. Los directorios van primero,
+// luego los archivos, todo ordenado sin importar mayúsculas. Si una carpeta está
+// en expanded_paths, se mete a construir su contenido también (recursión).
+pub fn build_tree(
+    path: &Path,
+    depth: usize,
+    show_hidden: bool,
+    expanded_paths: &HashSet<PathBuf>,
+    selected_paths: &HashSet<PathBuf>,
+    out_files: &mut Vec<FileItem>,
+) {
     let mut directories = Vec::new();
     let mut files = Vec::new();
 
@@ -266,7 +257,7 @@ pub fn load_directory(path: &Path, show_hidden: bool) -> (Vec<PathBuf>, Vec<File
             }
 
             if entry_path.is_dir() {
-                directories.push(entry_path);
+                directories.push((name, entry_path));
             } else {
                 let metadata = entry.metadata().ok();
                 let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
@@ -280,29 +271,50 @@ pub fn load_directory(path: &Path, show_hidden: bool) -> (Vec<PathBuf>, Vec<File
                     modified,
                     is_selected: false,
                     metadata: None,
+                    depth,
+                    is_expanded: false,
                 });
             }
         }
     }
 
-    directories.sort_by(|a, b| {
-        a.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_lowercase()
-            .cmp(&b.file_name().unwrap_or_default().to_string_lossy().to_lowercase())
-    });
+    directories.sort_by_key(|a| a.0.to_lowercase());
+    files.sort_by_key(|a| a.name.to_lowercase());
 
-    // Prepend . and .. at the very top of the sorted directory list
-    let mut sorted_dirs = vec![path.join(".")];
-    if path.parent().is_some() {
-        sorted_dirs.push(path.join(".."));
+    for (name, entry_path) in directories {
+        let is_expanded = expanded_paths.contains(&entry_path);
+        let is_selected = selected_paths.contains(&entry_path);
+
+        out_files.push(FileItem {
+            name,
+            path: entry_path.clone(),
+            size: 0,
+            is_dir: true,
+            modified: None,
+            is_selected,
+            metadata: None,
+            depth,
+            is_expanded,
+        });
+
+        if is_expanded {
+            build_tree(
+                &entry_path,
+                depth + 1,
+                show_hidden,
+                expanded_paths,
+                selected_paths,
+                out_files,
+            );
+        }
     }
-    sorted_dirs.extend(directories);
 
-    files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-
-    (sorted_dirs, files)
+    for mut file in files {
+        if selected_paths.contains(&file.path) {
+            file.is_selected = true;
+        }
+        out_files.push(file);
+    }
 }
 
 #[cfg(test)]
@@ -315,77 +327,72 @@ mod tests {
         let test_root = std::env::current_dir()
             .unwrap()
             .join("target")
-            .join("test_stash_dir_preview");
-        
-        // Clean up any old test files first
+            .join("test_stash_dir_preview_clean");
+
         if test_root.exists() {
             let _ = fs::remove_dir_all(&test_root);
         }
-        
-        // Create directory structure
+
         let subdir_a = test_root.join("subdir_a");
         let subdir_b = test_root.join("subdir_b");
         create_dir_all(&subdir_a).unwrap();
         create_dir_all(&subdir_b).unwrap();
-        
-        // Create files
+
         File::create(subdir_a.join("file1.mp3")).unwrap();
         File::create(subdir_b.join("file2.wav")).unwrap();
         File::create(test_root.join("root_file.mp3")).unwrap();
 
-        // Initialize BrowserState
         let mut browser = BrowserState::new(test_root.clone(), false);
 
-        println!("browser.directories = {:?}", browser.directories);
-
-        // Under normal view (highlighting `.`), files should be those in test_root (i.e. root_file.mp3)
         assert_eq!(browser.current_dir, test_root);
-        assert!(!browser.directories.is_empty());
-        
-        // Let's check which index corresponds to `.`, `subdir_a`, `subdir_b`
-        let idx_dot = 0;
-        let idx_a = browser.directories.iter().position(|d| d == &subdir_a).unwrap();
-        let idx_b = browser.directories.iter().position(|d| d == &subdir_b).unwrap();
+        assert_eq!(browser.files.len(), 3);
+        assert_eq!(browser.files[0].name, "subdir_a");
+        assert!(browser.files[0].is_dir);
+        assert_eq!(browser.files[0].depth, 0);
 
-        // Highlighting `.` (idx_dot)
-        browser.dir_index = idx_dot;
-        browser.refresh();
-        assert_eq!(browser.files.len(), 1);
-        assert_eq!(browser.files[0].name, "root_file.mp3");
+        browser.file_index = 0;
+        browser.toggle_expand_highlighted();
 
-        // Highlighting `subdir_a` should show `file1.mp3`
-        browser.dir_index = idx_a;
-        browser.refresh();
-        assert_eq!(browser.files.len(), 1);
-        assert_eq!(browser.files[0].name, "file1.mp3");
+        assert_eq!(browser.files.len(), 4);
+        assert_eq!(browser.files[1].name, "file1.mp3");
+        assert_eq!(browser.files[1].depth, 1);
 
-        // Highlighting `subdir_b` should show `file2.wav`
-        browser.dir_index = idx_b;
-        browser.refresh();
-        assert_eq!(browser.files.len(), 1);
-        assert_eq!(browser.files[0].name, "file2.wav");
+        let _ = fs::remove_dir_all(&test_root);
+    }
 
-        // Move selection to subdir_a and enter it
-        browser.dir_index = idx_a;
-        browser.open_selected_dir();
-        assert_eq!(browser.current_dir, subdir_a);
-        
-        // Inside subdir_a, the default selection is `.` which shows `file1.mp3`
-        assert_eq!(browser.files.len(), 1);
-        assert_eq!(browser.files[0].name, "file1.mp3");
+    #[test]
+    fn test_range_selection() {
+        let test_root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_stash_range_selection");
 
-        // Go back up to parent
-        browser.go_to_parent();
-        assert_eq!(browser.current_dir, test_root);
-        
-        // Should have returned to highlighting `subdir_a`
-        assert_eq!(browser.dir_index, idx_a);
-        
-        // And the files pane should show `file1.mp3` since `subdir_a` is highlighted
-        assert_eq!(browser.files.len(), 1);
-        assert_eq!(browser.files[0].name, "file1.mp3");
+        if test_root.exists() {
+            let _ = fs::remove_dir_all(&test_root);
+        }
+        create_dir_all(&test_root).unwrap();
 
-        // Clean up
+        File::create(test_root.join("a.txt")).unwrap();
+        File::create(test_root.join("b.txt")).unwrap();
+        File::create(test_root.join("c.txt")).unwrap();
+
+        let mut browser = BrowserState::new(test_root.clone(), false);
+        assert_eq!(browser.files.len(), 3);
+
+        browser.shift_start = Some(0);
+        browser.file_index = 2;
+
+        browser.toggle_range_selection(0, 2);
+
+        assert!(browser.files[0].is_selected);
+        assert!(browser.files[1].is_selected);
+        assert!(browser.files[2].is_selected);
+
+        browser.toggle_range_selection(0, 2);
+        assert!(!browser.files[0].is_selected);
+        assert!(!browser.files[1].is_selected);
+        assert!(!browser.files[2].is_selected);
+
         let _ = fs::remove_dir_all(&test_root);
     }
 }

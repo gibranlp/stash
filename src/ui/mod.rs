@@ -5,7 +5,8 @@ use ratatui::{
     widgets::{Block, Borders, BorderType, Clear, List, ListItem, Paragraph},
     Frame,
 };
-use crate::app::{App, AppScreen, InputMode};
+use unicode_width::UnicodeWidthStr;
+use crate::app::{App, AppScreen, DestBrowserFocus, InputMode};
 use crate::browser::PaneType;
 use crate::models::{PlaybackStatus, RepeatMode, VisualizerMode};
 use crate::search::{matches_image_extension, matches_text_extension};
@@ -15,19 +16,21 @@ use std::path::PathBuf;
 pub fn render(f: &mut Frame, app: &mut App) {
     let show_player_and_vis = app.screen == AppScreen::Queue;
 
+    // El layout cambia dependiendo de si estamos en la pantalla del queue o no
     let constraints = if show_player_and_vis {
         vec![
-            Constraint::Length(3), // Header
-            Constraint::Min(5),    // Main Pane
-            Constraint::Length(6), // Live visualizer spectrum pane (height 6)
-            Constraint::Length(5), // Footer/Audio Player
-            Constraint::Length(1), // Shortcuts bar
+            Constraint::Length(0),
+            Constraint::Min(5),
+            Constraint::Length(6),
+            Constraint::Length(5),
+            Constraint::Length(1),
         ]
     } else {
         vec![
-            Constraint::Length(3), // Header
-            Constraint::Min(5),    // Main Pane
-            Constraint::Length(1), // Shortcuts bar
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(1),
+            Constraint::Length(1),
         ]
     };
 
@@ -37,24 +40,59 @@ pub fn render(f: &mut Frame, app: &mut App) {
         .constraints(constraints)
         .split(f.size());
 
-    // 1. Render Header
-    let current_dir_str = app.browser.current_dir.to_string_lossy();
-    let header_text = format!(" STASH v0.3.0 | Path: {} ", current_dir_str);
-    let header = Paragraph::new(Line::from(vec![
-        Span::styled(&header_text, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::DarkGray)),
-    );
-    f.render_widget(header, chunks[0]);
+    if !show_player_and_vis {
+        let current_dir_str = app.browser.current_dir.to_string_lossy();
+        let header_text = format!(" Stash v0.4.0 | Path: {} ", current_dir_str);
+        let header = Paragraph::new(Line::from(vec![
+            Span::styled(&header_text, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+        f.render_widget(header, chunks[0]);
+    }
 
-    // 2. Render Main Screen
     f.render_widget(Clear, chunks[1]);
     match app.screen {
         AppScreen::Browser => {
+            // Jalamos todo el estado de audio en un solo lock para no bloquearnos dos veces
+            let (browser_progress, current_playing_path) = {
+                let state = app.audio.shared_state.lock().unwrap();
+                let active = matches!(state.status, PlaybackStatus::Playing | PlaybackStatus::Paused);
+                let progress = if active && state.duration_secs > 0 {
+                    let status_icon = if matches!(state.status, PlaybackStatus::Playing) { "▶" } else { "⏸" };
+                    let track_name = if let Some(ref meta) = state.metadata {
+                        let title = meta.title.as_deref().unwrap_or("Unknown");
+                        let artist = meta.artist.as_deref().unwrap_or("Unknown");
+                        format!("{} - {}", artist, title)
+                    } else if let Some(ref path) = state.current_track {
+                        path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| "Unknown".to_string())
+                    } else {
+                        "Unknown".to_string()
+                    };
+                    Some((status_icon, track_name, state.elapsed_secs, state.duration_secs))
+                } else {
+                    None
+                };
+                let playing = if active { state.current_track.clone() } else { None };
+                (progress, playing)
+            };
+            let browser_progress = browser_progress;
+
+            // Si hay algo reproduciéndose, le robamos una línea abajo para la barra de progreso
+            let (browser_content_area, browser_progress_area) = if browser_progress.is_some() {
+                let v = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(3), Constraint::Length(1)])
+                    .split(chunks[1]);
+                (v[0], Some(v[1]))
+            } else {
+                (chunks[1], None)
+            };
+
             let has_preview = if !app.browser.files.is_empty() && app.browser.file_index < app.browser.files.len() {
                 let path = &app.browser.files[app.browser.file_index].path;
                 matches_image_extension(path) || matches_text_extension(path)
@@ -66,106 +104,38 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([
-                        Constraint::Percentage(25), // Directories pane
-                        Constraint::Percentage(25), // Files pane
-                        Constraint::Percentage(50)  // Preview pane
+                        Constraint::Percentage(40),
+                        Constraint::Percentage(60)
                     ].as_ref())
-                    .split(chunks[1])
+                    .split(browser_content_area)
             } else {
                 Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([
-                        Constraint::Percentage(30), // Directories pane
-                        Constraint::Percentage(70)  // Files pane
+                        Constraint::Percentage(100)
                     ].as_ref())
-                    .split(chunks[1])
+                    .split(browser_content_area)
             };
 
-            let (dir_area, file_area, preview_area) = if has_preview {
-                (browser_chunks[0], browser_chunks[1], Some(browser_chunks[2]))
+            let (tree_area, preview_area) = if has_preview {
+                (browser_chunks[0], Some(browser_chunks[1]))
             } else {
-                (browser_chunks[0], browser_chunks[1], None)
+                (browser_chunks[0], None)
             };
 
-            // Left Pane - Directories
-            let is_dirs_focused = app.browser.focused_pane == PaneType::Directories
-                && app.input_mode == InputMode::Normal;
-            let dir_border_style = if is_dirs_focused {
-                Style::default().fg(Color::Cyan)
+            // Si hay unidades externas conectadas, les damos un panel abajo del árbol
+            let drives = &app.external_drives;
+            let (tree_area, devices_panel_area) = if !drives.is_empty() {
+                let panel_height = (drives.len() as u16 + 2).min(6);
+                let v = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(3), Constraint::Length(panel_height)])
+                    .split(tree_area);
+                (v[0], Some(v[1]))
             } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let dir_border_type = if is_dirs_focused {
-                BorderType::Double
-            } else {
-                BorderType::Plain
+                (tree_area, None)
             };
 
-            let dir_list_items: Vec<ListItem> = app
-                .browser
-                .directories
-                .iter()
-                .enumerate()
-                .map(|(idx, path)| {
-                    let dir_name = if path.ends_with(".") {
-                        ".".to_string()
-                    } else if path.ends_with("..") {
-                        "..".to_string()
-                    } else {
-                        path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "/".to_string())
-                    };
-                    let has_subdirs = app.browser.directories_has_subdirs.get(idx).copied().unwrap_or(false);
-                    let display_name = if has_subdirs {
-                        format!("{} ▸", dir_name)
-                    } else {
-                        dir_name
-                    };
-                    let prefix = if is_dirs_focused && idx == app.browser.dir_index {
-                        "> "
-                    } else {
-                        "  "
-                    };
-                    let is_selected = app.browser.selected_paths.contains(path);
-                    let is_special_dir = path.ends_with(".") || path.ends_with("..");
-                    let select_marker = if is_special_dir {
-                        ""
-                    } else if is_selected {
-                        "[*] "
-                    } else {
-                        "[ ] "
-                    };
-                    let select_style = if is_selected {
-                        Style::default().fg(Color::Green)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    };
-                    let style = if is_dirs_focused && idx == app.browser.dir_index {
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                    } else if is_selected {
-                        Style::default().fg(Color::Green)
-                    } else {
-                        Style::default().fg(Color::White)
-                    };
-                    ListItem::new(Line::from(vec![
-                        Span::styled(prefix, Style::default().fg(Color::Cyan)),
-                        Span::styled(select_marker, select_style),
-                        Span::styled(display_name, style),
-                    ]))
-                })
-                .collect();
-
-            let dirs_list = List::new(dir_list_items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(dir_border_type)
-                        .border_style(dir_border_style)
-                        .title(" Directories "),
-                );
-            app.dirs_list_state.select(Some(app.browser.dir_index));
-            f.render_stateful_widget(dirs_list, dir_area, &mut app.dirs_list_state);
-
-            // Right Pane - Files (or Search Results if search is active)
             let is_files_focused = app.browser.focused_pane == PaneType::Files
                 && app.input_mode == InputMode::Normal;
             let file_border_style = if is_files_focused {
@@ -179,6 +149,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 BorderType::Plain
             };
 
+            // Ojo: si el search está activo, pintamos los resultados del search en lugar de los archivos normales
             let files_to_render = if app.search.active {
                 &app.search.results
             } else {
@@ -190,35 +161,88 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 app.browser.file_index
             };
 
+            // Sacamos selected_paths antes del closure para evitar conflicto de borrows con files_to_render
+            let selected_paths = &app.browser.selected_paths;
+
             let file_list_items: Vec<ListItem> = files_to_render
                 .iter()
                 .enumerate()
                 .map(|(idx, file)| {
                     let is_highlighted = idx == file_index_to_use;
-                    let prefix = if is_highlighted { "> " } else { "  " };
-                    let select_marker = if file.is_selected { "[*] " } else { "[ ] " };
-                    
-                    let filename_style = if is_highlighted {
+                    let is_now_playing = current_playing_path.as_ref().map(|p| p == &file.path).unwrap_or(false);
+                    let is_in_range = if let Some(start) = app.browser.shift_start {
+                        let min = start.min(file_index_to_use);
+                        let max = start.max(file_index_to_use);
+                        idx >= min && idx <= max
+                    } else {
+                        false
+                    };
+
+                    let prefix = if is_highlighted {
+                        "> "
+                    } else if is_in_range {
+                        "» "
+                    } else {
+                        "  "
+                    };
+
+                    // Los marcadores de selección tienen lógica especial para carpetas:
+                    // [*] = la carpeta entera está seleccionada
+                    // [-] = no está seleccionada pero tiene archivos adentro seleccionados
+                    let (select_marker, select_style) = if is_now_playing {
+                        ("[♪] ", Style::default().fg(Color::LightGreen))
+                    } else if file.is_dir {
+                        if file.is_selected {
+                            ("[*] ", Style::default().fg(Color::Cyan))
+                        } else {
+                            let has_any = selected_paths
+                                .iter()
+                                .any(|p| p != &file.path && p.starts_with(&file.path));
+                            if has_any {
+                                ("[-] ", Style::default().fg(Color::Yellow))
+                            } else {
+                                ("[ ] ", Style::default().fg(Color::DarkGray))
+                            }
+                        }
+                    } else if file.is_selected {
+                        ("[*] ", Style::default().fg(Color::Green))
+                    } else {
+                        ("[ ] ", Style::default().fg(Color::DarkGray))
+                    };
+
+                    let indent = "  ".repeat(file.depth);
+                    let expand_icon = if file.is_dir {
+                        if file.is_expanded { "▼ " } else { "▶ " }
+                    } else {
+                        "  "
+                    };
+                    let display_name = format!("{}{}{}", indent, expand_icon, file.name);
+
+                    let filename_style = if is_now_playing {
+                        Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)
+                    } else if is_highlighted {
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    } else if is_in_range {
+                        Style::default().fg(Color::Cyan)
+                    } else if file.is_dir {
+                        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
                     } else if file.is_selected {
                         Style::default().fg(Color::Green)
                     } else {
                         Style::default().fg(Color::White)
                     };
 
-                    let select_style = if file.is_selected {
-                        Style::default().fg(Color::Green)
+                    let size_str = if file.is_dir {
+                        "DIR".to_string()
                     } else {
-                        Style::default().fg(Color::DarkGray)
+                        format_size(file.size)
                     };
 
-                    let size_str = format_size(file.size);
-                    
                     ListItem::new(Line::from(vec![
-                        Span::styled(prefix, Style::default().fg(Color::Cyan)),
+                        Span::styled(prefix, if is_highlighted || is_in_range { Style::default().fg(Color::Cyan) } else { Style::default() }),
                         Span::styled(select_marker, select_style),
-                        Span::styled(&file.name, filename_style),
-                        Span::raw(" ".repeat(file_area.width.saturating_sub(8 + file.name.len() as u16 + size_str.len() as u16) as usize)),
+                        Span::styled(display_name.clone(), filename_style),
+                        Span::raw(" ".repeat(tree_area.width.saturating_sub(8 + display_name.width() as u16 + size_str.width() as u16) as usize)),
                         Span::styled(size_str, Style::default().fg(Color::DarkGray)),
                     ]))
                 })
@@ -227,7 +251,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             let pane_title = if app.search.active {
                 format!(" Search Results (query: {}) ", app.search.query)
             } else {
-                " Files ".to_string()
+                format!(" Explorer: {} ", app.browser.current_dir.to_string_lossy())
             };
 
             let files_list = List::new(file_list_items)
@@ -238,8 +262,45 @@ pub fn render(f: &mut Frame, app: &mut App) {
                         .border_style(file_border_style)
                         .title(pane_title),
                 );
+
+            // Centramos el scroll para que el elemento seleccionado siempre quede a la mitad de la vista
+            let h = tree_area.height.saturating_sub(2) as usize;
+            let total = files_to_render.len();
+            let target_offset = if total <= h {
+                0
+            } else {
+                let half = h / 2;
+                if file_index_to_use < half {
+                    0
+                } else if file_index_to_use >= total.saturating_sub(half) {
+                    total.saturating_sub(h)
+                } else {
+                    file_index_to_use.saturating_sub(half)
+                }
+            };
+            *app.files_list_state.offset_mut() = target_offset;
             app.files_list_state.select(Some(file_index_to_use));
-            f.render_stateful_widget(files_list, file_area, &mut app.files_list_state);
+            f.render_stateful_widget(files_list, tree_area, &mut app.files_list_state);
+
+            if let Some(panel_area) = devices_panel_area {
+                let drive_items: Vec<ratatui::widgets::ListItem> = app.external_drives.iter().map(|path| {
+                    let name = path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                    ratatui::widgets::ListItem::new(Line::from(vec![
+                        Span::styled("  \u{f0a0} ", Style::default().fg(Color::Yellow)),
+                        Span::styled(name, Style::default().fg(Color::White)),
+                    ]))
+                }).collect();
+                let drives_list = List::new(drive_items).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .border_style(Style::default().fg(Color::DarkGray))
+                        .title(Span::styled(" Drives [E] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                );
+                f.render_widget(drives_list, panel_area);
+            }
 
             if let Some(area) = preview_area {
                 let is_preview_focused = app.browser.focused_pane == PaneType::Preview
@@ -266,7 +327,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     } else {
                         "None".to_string()
                     };
-                    format!(" Image Preview [{}] (Zoom/Pan: +/- / Arrows) ", proto_str)
+                    format!(" Image Preview [{}] ", proto_str)
                 };
 
                 let preview_block = Block::default()
@@ -274,7 +335,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     .border_type(preview_border_type)
                     .border_style(preview_border_style)
                     .title(title);
-                
+
                 let inner_area = preview_block.inner(area);
                 f.render_widget(preview_block, area);
 
@@ -284,11 +345,47 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     render_image_preview(f, app, inner_area, &file_path);
                 }
             }
+
+            if let (Some(pb_area), Some((status_icon, track_name, elapsed, duration))) =
+                (browser_progress_area, browser_progress)
+            {
+                let progress = (elapsed as f32 / duration as f32).min(1.0);
+                let elapsed_str = format_time(elapsed);
+                let duration_str = format_time(duration);
+                let time_str = format!(" {} {}/{} ", status_icon, elapsed_str, duration_str);
+                let time_width = time_str.chars().count() as u16;
+                let bar_width = pb_area.width.saturating_sub(time_width + 2) as usize;
+                let filled = (progress * bar_width as f32) as usize;
+                let bar_str = format!(
+                    "{}{}",
+                    "█".repeat(filled),
+                    "░".repeat(bar_width.saturating_sub(filled))
+                );
+                let max_name_width = pb_area.width.saturating_sub(time_width + bar_width as u16 + 4) as usize;
+                let truncated_name: String = track_name.chars().take(max_name_width).collect();
+                let pb_line = Line::from(vec![
+                    Span::styled(time_str, Style::default().fg(Color::DarkGray)),
+                    Span::styled(bar_str, Style::default().fg(Color::Cyan)),
+                    Span::styled(format!("  {}", truncated_name), Style::default().fg(Color::DarkGray)),
+                ]);
+                f.render_widget(Paragraph::new(pb_line), pb_area);
+            }
         }
         AppScreen::Queue => {
-            // Render Playlist Queue view
+            let active_track = {
+                let state = app.audio.shared_state.lock().unwrap();
+                state.current_track.clone()
+            };
+
+            let queue_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(70),
+                    Constraint::Percentage(30),
+                ])
+                .split(chunks[1]);
+
             let queue_border_style = Style::default().fg(Color::Cyan);
-            
             let filtered_indices = app.get_filtered_queue_indices();
 
             let queue_list_items: Vec<ListItem> = filtered_indices
@@ -298,17 +395,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     let path = &app.queue.items[orig_idx];
                     let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Unknown".to_string());
                     let is_highlighted = idx == app.queue_selected_index;
-                    
-                    let active_track = {
-                        let state = app.audio.shared_state.lock().unwrap();
-                        state.current_track.clone()
-                    };
-                    
                     let is_playing_track = Some(path) == active_track.as_ref();
-                    
+
                     let prefix = if is_highlighted { "> " } else { "  " };
                     let playing_marker = if is_playing_track { "=> " } else { "   " };
-                    
+
                     let text_style = if is_playing_track {
                         Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
                     } else if is_highlighted {
@@ -340,101 +431,207 @@ pub fn render(f: &mut Frame, app: &mut App) {
                         .border_style(queue_border_style)
                         .title(pane_title),
                 );
-            app.queue_list_state.select(Some(app.queue_selected_index));
-            f.render_stateful_widget(queue_list, chunks[1], &mut app.queue_list_state);
-        }
-        AppScreen::Collections => {
-            let coll_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
-                .split(chunks[1]);
 
-            // Left Pane - Collections
-            let collections_list_items: Vec<ListItem> = app
-                .collections
-                .collections
-                .keys()
-                .enumerate()
-                .map(|(idx, name)| {
-                    let count = app.collections.collections.get(name).map(|v| v.len()).unwrap_or(0);
-                    let is_highlighted = idx == app.selected_collection_index;
-                    let prefix = if is_highlighted { "> " } else { "  " };
-                    let style = if is_highlighted {
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::White)
-                    };
-                    ListItem::new(Line::from(vec![
-                        Span::styled(prefix, Style::default().fg(Color::Cyan)),
-                        Span::styled(name, style),
-                        Span::styled(format!(" ({})", count), Style::default().fg(Color::DarkGray)),
-                    ]))
-                })
-                .collect();
-
-            let colls_list = List::new(collections_list_items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Double)
-                        .border_style(Style::default().fg(Color::Cyan))
-                        .title(" Collections [C] "),
-                );
-            app.colls_list_state.select(Some(app.selected_collection_index));
-            f.render_stateful_widget(colls_list, coll_chunks[0], &mut app.colls_list_state);
-
-            // Right Pane - Selected Collection contents
-            let coll_names: Vec<&String> = app.collections.collections.keys().collect();
-            let selected_coll_files_items: Vec<ListItem> = if let Some(&name) = coll_names.get(app.selected_collection_index) {
-                if let Some(files) = app.collections.collections.get(name) {
-                    files
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, path)| {
-                            let filename = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Unknown".to_string());
-                            let is_highlighted = idx == app.active_collection_file_index;
-                            let prefix = if is_highlighted { "> " } else { "  " };
-                            let style = if is_highlighted {
-                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(Color::White)
-                            };
-                            ListItem::new(Line::from(vec![
-                                Span::styled(prefix, Style::default().fg(Color::Cyan)),
-                                Span::styled(filename, style),
-                            ]))
-                        })
-                        .collect()
+            // Mismo truco del scroll centrado que en el browser
+            let h = queue_chunks[0].height.saturating_sub(2) as usize;
+            let total = filtered_indices.len();
+            let target_offset = if total <= h {
+                0
+            } else {
+                let half = h / 2;
+                if app.queue_selected_index < half {
+                    0
+                } else if app.queue_selected_index >= total.saturating_sub(half) {
+                    total.saturating_sub(h)
                 } else {
-                    Vec::new()
+                    app.queue_selected_index.saturating_sub(half)
+                }
+            };
+            *app.queue_list_state.offset_mut() = target_offset;
+            app.queue_list_state.select(Some(app.queue_selected_index));
+            f.render_stateful_widget(queue_list, queue_chunks[0], &mut app.queue_list_state);
+
+            let info_block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title(" Track Information ");
+
+            let info_inner = info_block.inner(queue_chunks[1]);
+            f.render_widget(info_block, queue_chunks[1]);
+
+            if active_track.is_some() {
+                let info_subchunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(12),
+                        Constraint::Min(5),
+                    ])
+                    .split(info_inner);
+
+                let cover_path = app.current_cover_path.clone();
+                if let Some(ref c_path) = cover_path {
+                    render_cover_preview(f, app, info_subchunks[0], c_path);
+                } else {
+                    let placeholder = Paragraph::new(vec![
+                        Line::from(""),
+                        Line::from(Span::styled("  [ No Album Art ]", Style::default().fg(Color::DarkGray))),
+                    ]);
+                    f.render_widget(placeholder, info_subchunks[0]);
+                }
+
+                let (metadata, lyrics_state) = {
+                    let state = app.audio.shared_state.lock().unwrap();
+                    (state.metadata.clone(), state.lyrics_state.clone())
+                };
+
+                let mut meta_lines = Vec::new();
+                if let Some(ref meta) = metadata {
+                    let title = meta.title.clone().unwrap_or_else(|| "Unknown".to_string());
+                    let artist = meta.artist.clone().unwrap_or_else(|| "Unknown".to_string());
+                    let album = meta.album.clone().unwrap_or_else(|| "Unknown".to_string());
+                    let track = meta.track.map(|t| t.to_string()).unwrap_or_else(|| "Unknown".to_string());
+                    let genre = meta.genre.clone().unwrap_or_else(|| "Unknown".to_string());
+                    let year = meta.year.map(|y| y.to_string()).unwrap_or_else(|| "Unknown".to_string());
+
+                    let bitrate = meta.bitrate.map(|b| format!("{} kbps", b)).unwrap_or_else(|| "Unknown".to_string());
+                    let sample_rate = meta.sample_rate.map(|s| format!("{} Hz", s)).unwrap_or_else(|| "Unknown".to_string());
+                    let length = meta.duration_secs.map(|d| format!("{}:{:02}", d / 60, d % 60)).unwrap_or_else(|| "Unknown".to_string());
+                    let codec = meta.codec.clone().unwrap_or_else(|| "Unknown".to_string());
+
+                    meta_lines.push(Line::from(vec![
+                        Span::styled(" Title:       ", Style::default().fg(Color::Cyan)),
+                        Span::styled(title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    ]));
+                    meta_lines.push(Line::from(vec![
+                        Span::styled(" Artist:      ", Style::default().fg(Color::Cyan)),
+                        Span::styled(artist, Style::default().fg(Color::Yellow)),
+                    ]));
+                    meta_lines.push(Line::from(vec![
+                        Span::styled(" Album:       ", Style::default().fg(Color::Cyan)),
+                        Span::styled(album, Style::default().fg(Color::White)),
+                    ]));
+                    meta_lines.push(Line::from(vec![
+                        Span::styled(" Track:       ", Style::default().fg(Color::Cyan)),
+                        Span::styled(track, Style::default().fg(Color::LightGreen)),
+                    ]));
+                    meta_lines.push(Line::from(vec![
+                        Span::styled(" Genre:       ", Style::default().fg(Color::Cyan)),
+                        Span::styled(genre, Style::default().fg(Color::LightBlue)),
+                    ]));
+                    meta_lines.push(Line::from(vec![
+                        Span::styled(" Year:        ", Style::default().fg(Color::Cyan)),
+                        Span::styled(year, Style::default().fg(Color::LightYellow)),
+                    ]));
+                    meta_lines.push(Line::from(vec![
+                        Span::styled(" Length:      ", Style::default().fg(Color::Cyan)),
+                        Span::styled(length, Style::default().fg(Color::White)),
+                    ]));
+                    meta_lines.push(Line::from(vec![
+                        Span::styled(" Bitrate:     ", Style::default().fg(Color::Cyan)),
+                        Span::styled(bitrate, Style::default().fg(Color::LightRed)),
+                    ]));
+                    meta_lines.push(Line::from(vec![
+                        Span::styled(" Sample Rate: ", Style::default().fg(Color::Cyan)),
+                        Span::styled(sample_rate, Style::default().fg(Color::LightMagenta)),
+                    ]));
+                    meta_lines.push(Line::from(vec![
+                        Span::styled(" Codec:       ", Style::default().fg(Color::Cyan)),
+                        Span::styled(codec, Style::default().fg(Color::White)),
+                    ]));
+                } else {
+                    meta_lines.push(Line::from(""));
+                    meta_lines.push(Line::from(Span::styled("  Reading metadata...", Style::default().fg(Color::Yellow))));
+                }
+
+                let meta_and_lyrics = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(11),
+                        Constraint::Min(5),
+                    ])
+                    .split(info_subchunks[1]);
+
+                let meta_para = Paragraph::new(meta_lines)
+                    .wrap(ratatui::widgets::Wrap { trim: false });
+                f.render_widget(meta_para, meta_and_lyrics[0]);
+
+                let lyrics_border_style = if app.lyrics_focused {
+                    Style::default().fg(Color::Magenta)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let lyrics_title = if app.lyrics_focused {
+                    " Lyrics [Tab to exit] "
+                } else {
+                    " Lyrics [Tab to scroll] "
+                };
+                let lyrics_block = Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(lyrics_border_style)
+                    .title(lyrics_title);
+
+                use crate::models::LyricsState;
+                match &lyrics_state {
+                    LyricsState::Found(text) => {
+                        let lyrics_lines: Vec<Line> = text
+                            .lines()
+                            .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::Gray))))
+                            .collect();
+                        let lyrics_para = Paragraph::new(lyrics_lines)
+                            .block(lyrics_block)
+                            .scroll((app.lyrics_scroll_offset as u16, 0))
+                            .wrap(ratatui::widgets::Wrap { trim: false });
+                        f.render_widget(lyrics_para, meta_and_lyrics[1]);
+                    }
+                    LyricsState::Loading => {
+                        let lyrics_para = Paragraph::new(vec![
+                            Line::from(""),
+                            Line::from(Span::styled("  Loading metadata...", Style::default().fg(Color::Yellow))),
+                        ])
+                        .block(lyrics_block);
+                        f.render_widget(lyrics_para, meta_and_lyrics[1]);
+                    }
+                    LyricsState::Fetching => {
+                        let lyrics_para = Paragraph::new(vec![
+                            Line::from(""),
+                            Line::from(Span::styled("  Fetching lyrics online...", Style::default().fg(Color::Cyan))),
+                        ])
+                        .block(lyrics_block);
+                        f.render_widget(lyrics_para, meta_and_lyrics[1]);
+                    }
+                    LyricsState::NotFound => {
+                        let lyrics_para = Paragraph::new(vec![
+                            Line::from(""),
+                            Line::from(Span::styled("  No lyrics found", Style::default().fg(Color::DarkGray))),
+                        ])
+                        .block(lyrics_block);
+                        f.render_widget(lyrics_para, meta_and_lyrics[1]);
+                    }
+                    LyricsState::Error(msg) => {
+                        let lyrics_para = Paragraph::new(vec![
+                            Line::from(""),
+                            Line::from(Span::styled(format!("  Error fetching lyrics: {}", msg), Style::default().fg(Color::Red))),
+                        ])
+                        .block(lyrics_block)
+                        .wrap(ratatui::widgets::Wrap { trim: false });
+                        f.render_widget(lyrics_para, meta_and_lyrics[1]);
+                    }
                 }
             } else {
-                Vec::new()
-            };
-
-            let right_pane_title = if let Some(&name) = coll_names.get(app.selected_collection_index) {
-                format!(" Files in Collection: {} ", name)
-            } else {
-                " Collection Files ".to_string()
-            };
-
-            let coll_files_list = List::new(selected_coll_files_items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Plain)
-                        .border_style(Style::default().fg(Color::DarkGray))
-                        .title(right_pane_title),
-                );
-            app.coll_files_list_state.select(Some(app.active_collection_file_index));
-            f.render_stateful_widget(coll_files_list, coll_chunks[1], &mut app.coll_files_list_state);
+                let placeholder = Paragraph::new(vec![
+                    Line::from(""),
+                    Line::from(Span::styled("  No track loaded", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))),
+                    Line::from(Span::styled("  Select an audio file from the Browser to play.", Style::default().fg(Color::DarkGray))),
+                ]);
+                f.render_widget(placeholder, info_inner);
+            }
         }
     }
 
-    // 3. Render Footer / Now Playing Audio status & Visualizer (only when in Queue screen)
     if show_player_and_vis {
         let audio_state = app.audio.shared_state.lock().unwrap();
-        
+
         let now_playing_title = if let Some(ref meta) = audio_state.metadata {
             let title = meta.title.as_deref().unwrap_or("Unknown Track");
             let artist = meta.artist.as_deref().unwrap_or("Unknown Artist");
@@ -453,8 +650,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
         let elapsed = format_time(audio_state.elapsed_secs);
         let duration = format_time(audio_state.duration_secs);
-        
-        // Custom progress bar
+
         let progress_percentage = if audio_state.duration_secs > 0 {
             (audio_state.elapsed_secs as f32 / audio_state.duration_secs as f32).min(1.0)
         } else {
@@ -505,7 +701,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         let bars = audio_state.visualizer_data.clone();
         let visualizer_height = 4;
 
-        // Compute target number of bars to fill width left-to-right (each takes 2 characters: "█ ")
+        // Interpolamos las barras del visualizador para que llenen el ancho disponible de la terminal
         let available_width = chunks[2].width.saturating_sub(2);
         let target_bars = (available_width / 2) as usize;
 
@@ -554,6 +750,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 };
 
                 if num_bars > 0 {
+                    // Construimos el espectro fila por fila de abajo para arriba usando bloques Unicode graduales
                     let chars = [" ", " ", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
                     for row in (0..visualizer_height).rev() {
                         let mut line = String::new();
@@ -576,10 +773,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 }
 
                 let row_colors = [
-                    Color::Red,     // Top row
-                    Color::Magenta, // Middle-high row
-                    Color::Yellow,  // Middle-low row
-                    Color::Green,   // Bottom row
+                    Color::Red,
+                    Color::Magenta,
+                    Color::Yellow,
+                    Color::Green,
                 ];
 
                 Paragraph::new(
@@ -607,7 +804,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 };
 
                 if num_bars > 0 {
-                    for row in 0..visualizer_height {
+                    // La onda simétrica: calculamos qué tan lejos está cada fila del centro (1.5)
+                    for (row, line_str) in lines.iter_mut().enumerate() {
                         let mut line = String::new();
                         for &val in &interpolated_bars {
                             let dist = (row as f32 - 1.5).abs();
@@ -618,15 +816,15 @@ pub fn render(f: &mut Frame, app: &mut App) {
                                 line.push_str("  ");
                             }
                         }
-                        lines[row] = line;
+                        *line_str = line;
                     }
                 }
 
                 let row_colors = [
-                    Color::Red,     // Top row
-                    Color::Magenta, // Middle-high row
-                    Color::Magenta, // Middle-low row
-                    Color::Red,     // Bottom row
+                    Color::Red,
+                    Color::Magenta,
+                    Color::Magenta,
+                    Color::Red,
                 ];
 
                 Paragraph::new(
@@ -645,19 +843,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
             }
             VisualizerMode::SignalLevels => {
                 let meter_width = (available_width as usize).saturating_sub(8);
-                
-                let (left_val, right_val) = if num_bars > 2 {
-                    let mid = num_bars / 2;
-                    let left_avg: f32 = interpolated_bars[0..mid].iter().sum::<f32>() / mid as f32;
-                    let right_avg: f32 = interpolated_bars[mid..].iter().sum::<f32>() / (num_bars - mid) as f32;
-                    ((left_avg * 3.5).min(1.0), (right_avg * 3.5).min(1.0))
-                } else {
-                    (0.0, 0.0)
-                };
+
+                let left_val = (audio_state.left_level * 1.3).min(1.0);
+                let right_val = (audio_state.right_level * 1.3).min(1.0);
 
                 let left_filled = (left_val * meter_width as f32) as usize;
                 let right_filled = (right_val * meter_width as f32) as usize;
 
+                // Closure que arma una línea de VU meter con colores verde/amarillo/rojo según nivel
                 let build_vu_line = |prefix: &'static str, filled: usize| {
                     let mut spans = vec![
                         Span::styled(prefix, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
@@ -686,10 +879,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 };
 
                 Paragraph::new(vec![
-                    Line::from(""), // spacing
+                    Line::from(""),
                     build_vu_line("L ", left_filled),
                     build_vu_line("R ", right_filled),
-                    Line::from(""), // spacing
+                    Line::from(""),
                 ])
             }
         }
@@ -702,7 +895,6 @@ pub fn render(f: &mut Frame, app: &mut App) {
         );
         f.render_widget(vis_para, chunks[2]);
 
-        // 4. Render Audio System Pane (chunks[3])
         let player_widget = Paragraph::new(player_text).block(
             Block::default()
                 .borders(Borders::ALL)
@@ -713,11 +905,28 @@ pub fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(player_widget, chunks[3]);
     }
 
-    // Render Key Bindings Help Bar
     let help_bar_spans = match app.screen {
         AppScreen::Browser => vec![
             Span::styled(" ? ", Style::default().fg(Color::Black).bg(Color::Cyan)),
             Span::styled(" Help ", Style::default().fg(Color::White)),
+            Span::styled(" v ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::styled(" Copy ", Style::default().fg(Color::White)),
+            Span::styled(" y ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::styled(" Move ", Style::default().fg(Color::White)),
+            Span::styled(" d ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::styled(" Delete ", Style::default().fg(Color::White)),
+            Span::styled(" F2 ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::styled(" Rename ", Style::default().fg(Color::White)),
+            Span::styled(" n ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::styled(" Create Folder ", Style::default().fg(Color::White)),
+            Span::styled(" h ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::styled(" Toggle Hidden ", Style::default().fg(Color::White)),
+            Span::styled(" M ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::styled(" MTP ", Style::default().fg(Color::White)),
+            Span::styled(" E ", Style::default().fg(Color::Black).bg(Color::Yellow)),
+            Span::styled(" Ext.Drives ", Style::default().fg(Color::White)),
+            Span::styled(" / ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::styled(" Search ", Style::default().fg(Color::White)),
         ],
         AppScreen::Queue => vec![
             Span::styled(" ? ", Style::default().fg(Color::Black).bg(Color::Cyan)),
@@ -734,24 +943,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
             Span::styled(" Clear ", Style::default().fg(Color::White)),
             Span::styled(" v ", Style::default().fg(Color::Black).bg(Color::Cyan)),
             Span::styled(" Visuals ", Style::default().fg(Color::White)),
-            Span::styled(" [/] ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::styled(" < / > ", Style::default().fg(Color::Black).bg(Color::Cyan)),
             Span::styled(" Decay ", Style::default().fg(Color::White)),
             Span::styled(" / ", Style::default().fg(Color::Black).bg(Color::Cyan)),
             Span::styled(" Search ", Style::default().fg(Color::White)),
             Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Cyan)),
             Span::styled(" Browser ", Style::default().fg(Color::White)),
-        ],
-        AppScreen::Collections => vec![
-            Span::styled(" ? ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-            Span::styled(" Help  ", Style::default().fg(Color::White)),
-            Span::styled(" Space ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-            Span::styled(" Play/Pause  ", Style::default().fg(Color::White)),
-            Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-            Span::styled(" Play track  ", Style::default().fg(Color::White)),
-            Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-            Span::styled(" Browser  ", Style::default().fg(Color::White)),
-            Span::styled(" Left/Right ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-            Span::styled(" Switch Pane  ", Style::default().fg(Color::White)),
         ],
     };
 
@@ -759,27 +956,37 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let help_chunk = if show_player_and_vis {
         chunks[4]
     } else {
-        chunks[2]
+        chunks[3]
     };
     f.render_widget(help_bar, help_chunk);
 
-    // 5. Overlays / Dialogs
+    if !show_player_and_vis {
+        let sep = "─".repeat(chunks[2].width as usize);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(sep, Style::default().fg(Color::DarkGray)))),
+            chunks[2],
+        );
+    }
+
+    // Los overlays/diálogos van siempre al último para que queden encima de todo
     if app.input_mode == InputMode::CreateCollection {
-        render_input_popup(f, " Create Collection ", "Enter collection name:", &app.input_value);
-    } else if app.input_mode == InputMode::CopyPath {
-        render_input_popup(f, " Copy Selected Files ", "Enter target directory:", &app.input_value);
-    } else if app.input_mode == InputMode::MovePath {
-        render_input_popup(f, " Move Selected Files ", "Enter target directory:", &app.input_value);
+        render_input_popup(f, " Create Collection ", "Enter collection name:", &app.input_value, app.input_cursor);
+    } else if app.input_mode == InputMode::CopyPath || app.input_mode == InputMode::MovePath {
+        if app.dest_browser.is_some() {
+            render_dest_browser_popup(f, app);
+        }
     } else if app.input_mode == InputMode::ConfirmDelete {
         render_confirm_popup(f, " Delete Selections ", "Are you sure you want to delete selected files? (y/n)");
     } else if app.input_mode == InputMode::Rename {
-        render_input_popup(f, " Rename Item ", "Enter new name:", &app.input_value);
+        render_input_popup(f, " Rename Item ", "Enter new name:", &app.input_value, app.input_cursor);
+    } else if app.input_mode == InputMode::CreateFolder {
+        render_input_popup(f, " Create Folder ", "Enter folder name:", &app.input_value, app.input_cursor);
     } else if app.input_mode == InputMode::AddToCollectionList {
         render_add_to_collection_popup(f, app);
     } else if app.show_help {
         render_help_popup(f);
     } else if app.input_mode == InputMode::Search {
-        // Draw small overlay search input bar at the bottom
+        // La barra de búsqueda es un overlay flotante en la parte de abajo del pane principal
         let search_y = if show_player_and_vis {
             chunks[3].y + chunks[3].height - 2
         } else {
@@ -796,14 +1003,18 @@ pub fn render(f: &mut Frame, app: &mut App) {
             Span::styled(&app.search.query, Style::default().fg(Color::White)),
         ]));
         f.render_widget(search_para, search_rect);
-        
-        let cursor_x = (search_rect.x + 9 + app.search.query.chars().count() as u16)
+
+        // Posicionamos el cursor del terminal justo después del texto del query
+        let cursor_x = (search_rect.x + 9 + app.search.query.width() as u16)
             .min(search_rect.x + search_rect.width.saturating_sub(1));
         f.set_cursor(cursor_x, search_y);
     }
 
     if let Some(ref progress) = *app.file_progress.lock().unwrap() {
         render_progress_popup(f, progress);
+        if progress.conflict_file.is_some() {
+            render_conflict_popup(f, progress);
+        }
     }
 }
 
@@ -832,6 +1043,7 @@ fn format_time(secs: u64) -> String {
     }
 }
 
+// Calcula un Rect centrado en porcentaje tanto en X como en Y dentro de r
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -858,6 +1070,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+// Igual que centered_rect pero el alto es fijo en filas en lugar de porcentaje
 fn centered_rect_fixed(percent_x: u16, height_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -884,7 +1097,207 @@ fn centered_rect_fixed(percent_x: u16, height_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn render_input_popup(f: &mut Frame, title: &str, label: &str, value: &str) {
+fn render_dest_browser_popup(f: &mut Frame, app: &App) {
+    let db = match &app.dest_browser {
+        Some(s) => s,
+        None => return,
+    };
+
+    let title = if db.is_move { " Move — Select Destination " } else { " Copy — Select Destination " };
+    let area = centered_rect_fixed(90, 24, f.size());
+    f.render_widget(Clear, area);
+
+    let popup_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(title);
+
+    let inner = popup_block.inner(area);
+    f.render_widget(popup_block, area);
+
+    let vchunks = ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            ratatui::layout::Constraint::Min(1),
+            ratatui::layout::Constraint::Length(3),
+        ])
+        .split(inner);
+
+    let hchunks = ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Horizontal)
+        .constraints([
+            ratatui::layout::Constraint::Percentage(30),
+            ratatui::layout::Constraint::Percentage(70),
+        ])
+        .split(vchunks[0]);
+
+    let left_focused = matches!(db.focus, DestBrowserFocus::Quick);
+    let left_border_style = if left_focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let left_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(left_border_style)
+        .title(" Drives / MTP ");
+    let left_inner = left_block.inner(hchunks[0]);
+    f.render_widget(left_block, hchunks[0]);
+
+    let quick_items: Vec<Line> = db.quick_paths.iter().enumerate().map(|(i, (label, _path))| {
+        if i == db.quick_index && left_focused {
+            Line::from(Span::styled(
+                format!(" > {}", label),
+                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ))
+        } else if i == db.quick_index {
+            Line::from(Span::styled(
+                format!(" > {}", label),
+                Style::default().fg(Color::Yellow),
+            ))
+        } else {
+            Line::from(Span::styled(
+                format!("   {}", label),
+                Style::default().fg(Color::White),
+            ))
+        }
+    }).collect();
+
+    // Scroll para que el item seleccionado nunca se vaya fuera del panel
+    let scroll = db.quick_index.saturating_sub(left_inner.height.saturating_sub(1) as usize);
+    f.render_widget(
+        Paragraph::new(quick_items).scroll((scroll as u16, 0)),
+        left_inner,
+    );
+
+    let right_focused = matches!(db.focus, DestBrowserFocus::Dirs);
+    let right_border_style = if right_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let dir_title = format!(" {} ", db.current_dir.to_string_lossy());
+    let right_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(right_border_style)
+        .title(dir_title.as_str());
+    let right_inner = right_block.inner(hchunks[1]);
+    f.render_widget(right_block, hchunks[1]);
+
+    if db.loading {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " Loading...",
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            ))),
+            right_inner,
+        );
+    } else if db.dirs.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " (no subdirectories — press Enter or c to copy here)",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            right_inner,
+        );
+    } else {
+        let dir_items: Vec<Line> = db.dirs.iter().enumerate().map(|(i, path)| {
+            let name = path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            if i == db.dir_index && right_focused {
+                Line::from(Span::styled(
+                    format!(" > {}/", name),
+                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ))
+            } else if i == db.dir_index {
+                Line::from(Span::styled(
+                    format!(" > {}/", name),
+                    Style::default().fg(Color::Cyan),
+                ))
+            } else {
+                Line::from(Span::styled(
+                    format!("   {}/", name),
+                    Style::default().fg(Color::White),
+                ))
+            }
+        }).collect();
+        let dir_scroll = db.dir_scroll;
+        f.render_widget(
+            Paragraph::new(dir_items).scroll((dir_scroll as u16, 0)),
+            right_inner,
+        );
+    }
+
+    let dest_str = db.current_dir.to_string_lossy().into_owned();
+    let bottom_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let bottom_inner = bottom_block.inner(vchunks[1]);
+    f.render_widget(bottom_block, vchunks[1]);
+
+    let hint_line = Line::from(vec![
+        Span::styled(" Dest: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(dest_str, Style::default().fg(Color::White)),
+    ]);
+    let key_line = Line::from(vec![
+        Span::styled(" Tab", Style::default().fg(Color::Black).bg(Color::DarkGray)),
+        Span::styled(":switch  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("j/k", Style::default().fg(Color::Black).bg(Color::DarkGray)),
+        Span::styled(":nav  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("l", Style::default().fg(Color::Black).bg(Color::DarkGray)),
+        Span::styled(":open  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("h/Bsp", Style::default().fg(Color::Black).bg(Color::DarkGray)),
+        Span::styled(":up  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Enter/c", Style::default().fg(Color::Black).bg(Color::DarkGray)),
+        Span::styled(":confirm  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Esc", Style::default().fg(Color::Black).bg(Color::DarkGray)),
+        Span::styled(":cancel", Style::default().fg(Color::DarkGray)),
+    ]);
+    f.render_widget(Paragraph::new(vec![hint_line, key_line]), bottom_inner);
+}
+
+fn render_conflict_popup(f: &mut Frame, progress: &crate::app::FileOperationProgress) {
+    let filename = progress.conflict_file.as_deref().unwrap_or("");
+    let area = centered_rect_fixed(62, 9, f.size());
+    f.render_widget(Clear, area);
+
+    let popup_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(" File Already Exists ");
+
+    let src_size = format_size(progress.conflict_src_size);
+    let dest_size = format_size(progress.conflict_dest_size);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  File: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(filename, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Incoming: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(src_size, Style::default().fg(Color::Cyan)),
+            Span::styled("   Existing: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(dest_size, Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [r] Replace  ", Style::default().fg(Color::Green)),
+            Span::styled("[R] Replace All  ", Style::default().fg(Color::LightGreen)),
+            Span::styled("[s] Skip  ", Style::default().fg(Color::Red)),
+            Span::styled("[S] Skip All", Style::default().fg(Color::LightRed)),
+        ]),
+    ];
+
+    let para = Paragraph::new(lines).block(popup_block);
+    f.render_widget(para, area);
+}
+
+fn render_input_popup(f: &mut Frame, title: &str, label: &str, value: &str, cursor_pos: usize) {
     let area = centered_rect_fixed(60, 5, f.size());
     f.render_widget(Clear, area);
 
@@ -906,7 +1319,9 @@ fn render_input_popup(f: &mut Frame, title: &str, label: &str, value: &str) {
 
     f.render_widget(input_para, area);
 
-    let cursor_x = (area.x + 3 + value.chars().count() as u16)
+    // Calculamos la posición X del cursor contando el ancho real en pantalla del substring antes del cursor
+    let substring: String = value.chars().take(cursor_pos).collect();
+    let cursor_x = (area.x + 3 + substring.width() as u16)
         .min(area.x + area.width.saturating_sub(2));
     let cursor_y = area.y + 3;
     f.set_cursor(cursor_x, cursor_y);
@@ -982,14 +1397,16 @@ fn render_help_popup(f: &mut Frame) {
         Line::from(Span::styled("Navigation keys:", Style::default().add_modifier(Modifier::UNDERLINED))),
         Line::from("  Up/Down (j/k) - Move selection inside active pane"),
         Line::from("  Tab / Shift+Tab - Cycle focus between active panes"),
-        Line::from("  Left (h)      - Go to parent folder"),
-        Line::from("  Right (l)     - Enter selected directory (left pane)"),
-        Line::from("  Enter         - Enter folder (left pane) or Play audio (right pane)"),
+        Line::from("  Left (arrow)  - Collapse folder / go to parent"),
+        Line::from("  Right (l)     - Expand folder"),
+        Line::from("  Enter         - Expand/collapse folder or Play audio file"),
         Line::from("  Backspace     - Go to parent folder"),
         Line::from(""),
         Line::from(Span::styled("Selection & File Operations:", Style::default().add_modifier(Modifier::UNDERLINED))),
         Line::from("  Space         - Toggle file selection"),
         Line::from("  q             - Add selected files to queue"),
+        Line::from("  1             - Switch to File Explorer screen"),
+        Line::from("  2             - Switch to Music Player screen"),
         Line::from("  Q             - Toggle Playback Queue screen"),
         Line::from("  y             - Move selected files (prompts path)"),
         Line::from("  v             - Copy selected files (prompts path)"),
@@ -997,6 +1414,8 @@ fn render_help_popup(f: &mut Frame) {
         Line::from("  Drag & Drop   - Drop external files/folders into browser (import)"),
         Line::from("  d             - Delete selected files (asks confirm)"),
         Line::from("  F2            - Rename highlighted file or folder"),
+        Line::from("  M             - Jump to MTP device mounts (Android/USB)"),
+        Line::from("  E             - Jump to external hard drive mounts (/media, /mnt)"),
         Line::from(""),
         Line::from(Span::styled("Playback control keys:", Style::default().add_modifier(Modifier::UNDERLINED))),
         Line::from("  Space (player)- Pause / Resume active audio playback"),
@@ -1018,6 +1437,7 @@ fn render_help_popup(f: &mut Frame) {
         Line::from("  [ / ]         - Decrease / Increase visualizer decay (Queue screen)"),
         Line::from("  ?             - Toggle this Help overlay screen"),
         Line::from("  Esc           - Close dialogue / Exit screens"),
+        Line::from("  q             - Quit STASH"),
         Line::from("  Ctrl + C      - Quit STASH"),
     ];
 
@@ -1043,8 +1463,10 @@ fn render_progress_popup(f: &mut Frame, progress: &crate::app::FileOperationProg
         .border_style(Style::default().fg(border_color))
         .title(format!(" {} Files ", progress.op_type));
 
-    // Construct a progress bar string
-    let percent = if progress.total_files > 0 {
+    // Si tenemos info de bytes jalamos porcentaje por bytes; si no, por archivos completados
+    let percent = if progress.total_bytes > 0 {
+        (progress.bytes_copied as f64 / progress.total_bytes as f64 * 100.0).min(100.0) as u16
+    } else if progress.total_files > 0 {
         (progress.completed_files as f32 / progress.total_files as f32 * 100.0) as u16
     } else {
         100
@@ -1059,9 +1481,28 @@ fn render_progress_popup(f: &mut Frame, progress: &crate::app::FileOperationProg
         "░".repeat(empty_width)
     );
 
+    let progress_details_str = if progress.total_bytes > 0 {
+        format!(
+            " {} {} of {} files ({} / {}) - {}%",
+            progress.op_type,
+            progress.completed_files,
+            progress.total_files,
+            format_size(progress.bytes_copied),
+            format_size(progress.total_bytes),
+            percent
+        )
+    } else {
+        format!(
+            " {} {} of {} files...",
+            progress.op_type,
+            progress.completed_files,
+            progress.total_files
+        )
+    };
+
     let mut details = vec![
         Line::from(""),
-        Line::from(format!(" {} {} of {} files...", progress.op_type, progress.completed_files, progress.total_files)),
+        Line::from(progress_details_str),
         Line::from(""),
         Line::from(Span::styled(progress_bar_str, Style::default().fg(Color::Cyan))),
         Line::from(""),
@@ -1100,97 +1541,188 @@ fn render_image_preview(f: &mut Frame, app: &mut App, area: Rect, path: &PathBuf
         return;
     }
 
-    let img = if let Some((ref cached_path, ref cached_img)) = app.current_image_data {
-        if cached_path == path {
-            Some(cached_img.clone())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // Si el hilo de carga todavía está trabajando en este path, mostramos el indicador y nos vamos
+    let is_loading = app.loading_image.try_lock()
+        .map(|lock| matches!(&*lock, Some((p, None)) if p == path))
+        .unwrap_or(false);
+    if is_loading || app.current_image_data.as_ref().map(|(p, _)| p != path).unwrap_or(true) {
+        f.render_widget(
+            Paragraph::new("Loading preview...").style(Style::default().fg(Color::Yellow)),
+            area,
+        );
+        return;
+    }
 
-    let img = match img {
-        Some(i) => i,
-        None => {
-            if let Ok(i) = image::open(path) {
-                app.current_image_data = Some((path.clone(), i.clone()));
-                i
-            } else {
-                return;
+    if let Some(picker_fs) = app.picker.as_ref().map(|p| p.font_size) {
+        let cached = app.current_image_protocol.as_ref()
+            .map(|(p, w, h, _)| p == path && *w == area.width && *h == area.height)
+            .unwrap_or(false);
+
+        if !cached
+            && let Some((_, ref img)) = app.current_image_data {
+                // ratatui-image con Resize::Fit solo achica, nunca agranda. Por eso
+                // pre-escalamos al tamaño del pane en píxeles antes de pasárselo al picker,
+                // así imágenes chicas (thumbnails) llenan el área igual que las grandes.
+                let px_w = area.width as u32 * picker_fs.0 as u32;
+                let px_h = area.height as u32 * picker_fs.1 as u32;
+                let sized = img.resize(px_w, px_h, image::imageops::FilterType::CatmullRom);
+                if let Some(picker) = app.picker.as_mut() {
+                    let proto = picker.new_resize_protocol(sized);
+                    app.current_image_protocol = Some((path.clone(), area.width, area.height, proto));
+                }
             }
-        }
-    };
 
-    let img_w = img.width();
-    let img_h = img.height();
-
-    let crop_w = (img_w as f64 / app.image_zoom) as u32;
-    let crop_h = (img_h as f64 / app.image_zoom) as u32;
-
-    let crop_w = crop_w.clamp(1, img_w);
-    let crop_h = crop_h.clamp(1, img_h);
-
-    let center_x = (img_w / 2) as i32 + app.image_offset_x;
-    let center_y = (img_h / 2) as i32 + app.image_offset_y;
-
-    let crop_x = (center_x - (crop_w / 2) as i32).clamp(0, (img_w - crop_w) as i32) as u32;
-    let crop_y = (center_y - (crop_h / 2) as i32).clamp(0, (img_h - crop_h) as i32) as u32;
-
-    let cropped = img.crop_imm(crop_x, crop_y, crop_w, crop_h);
-
-    if let Some(ref mut picker) = app.picker {
-        let cached_valid = if let Some((ref cached_path, cached_zoom, cached_ox, cached_oy, _)) = app.current_image_protocol {
-            cached_path == path
-                && (cached_zoom - app.image_zoom).abs() < 1e-5
-                && cached_ox == app.image_offset_x
-                && cached_oy == app.image_offset_y
-        } else {
-            false
-        };
-
-        if !cached_valid {
-            let proto = picker.new_resize_protocol(cropped.clone());
-            app.current_image_protocol = Some((path.clone(), app.image_zoom, app.image_offset_x, app.image_offset_y, proto));
-        }
-
-        if let Some((_, _, _, _, ref mut proto)) = app.current_image_protocol {
-            let image_widget = ratatui_image::ResizeImage::new(None);
-            f.render_stateful_widget(image_widget, area, proto);
+        if let Some((_, _, _, ref mut proto)) = app.current_image_protocol {
+            f.render_stateful_widget(ratatui_image::ResizeImage::new(None), area, proto);
             return;
         }
     }
 
-    let area_w = area.width as u32;
-    let area_h = (area.height as u32).saturating_mul(2);
+    // Fallback halfblock: si no hay picker (terminal sin soporte gráfico), pintamos con ▄ RGB
+    let cached = app.current_image_lines.as_ref()
+        .map(|(p, w, h, _)| p == path && *w == area.width && *h == area.height)
+        .unwrap_or(false);
 
-    let resized = cropped.resize(area_w, area_h, image::imageops::FilterType::CatmullRom);
-    let res_w = resized.width() as u16;
-    let res_h = resized.height() as u16;
-
-    let dx = area.x + (area.width.saturating_sub(res_w)) / 2;
-    let dy = area.y + (area.height.saturating_sub(res_h / 2)) / 2;
-
-    for y in 0..(res_h / 2) {
-        let mut spans = Vec::with_capacity(res_w as usize);
-        for x in 0..res_w {
-            let p_top = resized.get_pixel(x as u32, y as u32 * 2);
-            let p_bot = if y as u32 * 2 + 1 < res_h as u32 {
-                resized.get_pixel(x as u32, y as u32 * 2 + 1)
-            } else {
-                p_top
-            };
-
-            let color_top = Color::Rgb(p_top[0], p_top[1], p_top[2]);
-            let color_bot = Color::Rgb(p_bot[0], p_bot[1], p_bot[2]);
-
-            spans.push(Span::styled("▄", Style::default().fg(color_bot).bg(color_top)));
+    if cached {
+        if let Some((_, _, _, ref lines)) = app.current_image_lines {
+            let res_w = lines.first().map(|l| l.width() as u16).unwrap_or(0);
+            let res_h = lines.len() as u16;
+            let dx = area.x + (area.width.saturating_sub(res_w)) / 2;
+            let dy = area.y + (area.height.saturating_sub(res_h)) / 2;
+            for (y, line) in lines.iter().enumerate() {
+                f.render_widget(Paragraph::new(line.clone()), Rect::new(dx, dy + y as u16, res_w, 1));
+            }
         }
-        let line = Line::from(spans);
-        f.render_widget(Paragraph::new(line), Rect::new(dx, dy + y, res_w, 1));
+        return;
+    }
+
+    if let Some((_, ref img)) = app.current_image_data {
+        // Cada carácter ▄ representa dos filas de píxeles: fg = pixel de abajo, bg = pixel de arriba
+        let area_w = area.width as u32;
+        let area_h = (area.height as u32).saturating_mul(2);
+        let resized = img.resize(area_w, area_h, image::imageops::FilterType::Triangle);
+        let res_w = resized.width() as u16;
+        let res_h = resized.height() as u16;
+        let dx = area.x + (area.width.saturating_sub(res_w)) / 2;
+        let dy = area.y + (area.height.saturating_sub(res_h / 2)) / 2;
+        let mut lines = Vec::new();
+        for y in 0..(res_h / 2) {
+            let mut spans = Vec::with_capacity(res_w as usize);
+            for x in 0..res_w {
+                let p_top = resized.get_pixel(x as u32, y as u32 * 2);
+                let p_bot = if y as u32 * 2 + 1 < res_h as u32 {
+                    resized.get_pixel(x as u32, y as u32 * 2 + 1)
+                } else {
+                    p_top
+                };
+                spans.push(Span::styled(
+                    "▄",
+                    Style::default()
+                        .fg(Color::Rgb(p_bot[0], p_bot[1], p_bot[2]))
+                        .bg(Color::Rgb(p_top[0], p_top[1], p_top[2])),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+        app.current_image_lines = Some((path.clone(), area.width, area.height, lines.clone()));
+        for (y, line) in lines.iter().enumerate() {
+            f.render_widget(Paragraph::new(line.clone()), Rect::new(dx, dy + y as u16, res_w, 1));
+        }
     }
 }
 
+fn render_cover_preview(f: &mut Frame, app: &mut App, area: Rect, path: &PathBuf) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let is_loading = app.loading_cover.try_lock()
+        .map(|lock| matches!(&*lock, Some((p, None)) if p == path))
+        .unwrap_or(false);
+    if is_loading || app.current_cover_data.as_ref().map(|(p, _)| p != path).unwrap_or(true) {
+        f.render_widget(
+            Paragraph::new("Loading preview...").style(Style::default().fg(Color::Yellow)),
+            area,
+        );
+        return;
+    }
+
+    if let Some(picker_fs) = app.picker.as_ref().map(|p| p.font_size) {
+        let cached = app.current_cover_protocol.as_ref()
+            .map(|(p, w, h, _)| p == path && *w == area.width && *h == area.height)
+            .unwrap_or(false);
+
+        if !cached
+            && let Some((_, ref img)) = app.current_cover_data {
+                let px_w = area.width as u32 * picker_fs.0 as u32;
+                let px_h = area.height as u32 * picker_fs.1 as u32;
+                let sized = img.resize(px_w, px_h, image::imageops::FilterType::CatmullRom);
+                if let Some(picker) = app.picker.as_mut() {
+                    let proto = picker.new_resize_protocol(sized);
+                    app.current_cover_protocol = Some((path.clone(), area.width, area.height, proto));
+                }
+            }
+
+        if let Some((_, _, _, ref mut proto)) = app.current_cover_protocol {
+            f.render_stateful_widget(ratatui_image::ResizeImage::new(None), area, proto);
+            return;
+        }
+    }
+
+    // Mismo fallback halfblock que render_image_preview
+    let cached = app.current_cover_lines.as_ref()
+        .map(|(p, w, h, _)| p == path && *w == area.width && *h == area.height)
+        .unwrap_or(false);
+
+    if cached {
+        if let Some((_, _, _, ref lines)) = app.current_cover_lines {
+            let res_w = lines.first().map(|l| l.width() as u16).unwrap_or(0);
+            let res_h = lines.len() as u16;
+            let dx = area.x + (area.width.saturating_sub(res_w)) / 2;
+            let dy = area.y + (area.height.saturating_sub(res_h)) / 2;
+            for (y, line) in lines.iter().enumerate() {
+                f.render_widget(Paragraph::new(line.clone()), Rect::new(dx, dy + y as u16, res_w, 1));
+            }
+        }
+        return;
+    }
+
+    if let Some((_, ref img)) = app.current_cover_data {
+        use image::GenericImageView;
+        let area_w = area.width as u32;
+        let area_h = (area.height as u32).saturating_mul(2);
+        let resized = img.resize(area_w, area_h, image::imageops::FilterType::Triangle);
+        let res_w = resized.width() as u16;
+        let res_h = resized.height() as u16;
+        let dx = area.x + (area.width.saturating_sub(res_w)) / 2;
+        let dy = area.y + (area.height.saturating_sub(res_h / 2)) / 2;
+        let mut lines = Vec::new();
+        for y in 0..(res_h / 2) {
+            let mut spans = Vec::with_capacity(res_w as usize);
+            for x in 0..res_w {
+                let p_top = resized.get_pixel(x as u32, y as u32 * 2);
+                let p_bot = if y as u32 * 2 + 1 < res_h as u32 {
+                    resized.get_pixel(x as u32, y as u32 * 2 + 1)
+                } else {
+                    p_top
+                };
+                spans.push(Span::styled(
+                    "▄",
+                    Style::default()
+                        .fg(Color::Rgb(p_bot[0], p_bot[1], p_bot[2]))
+                        .bg(Color::Rgb(p_top[0], p_top[1], p_top[2])),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+        app.current_cover_lines = Some((path.clone(), area.width, area.height, lines.clone()));
+        for (y, line) in lines.iter().enumerate() {
+            f.render_widget(Paragraph::new(line.clone()), Rect::new(dx, dy + y as u16, res_w, 1));
+        }
+    }
+}
+
+// Parsea un archivo .desktop y muestra sus campos clave de forma legible en lugar del texto crudo
 fn render_desktop_preview(f: &mut Frame, _app: &mut App, area: Rect, lines: &[String]) {
     let mut name = None;
     let mut generic_name = None;
@@ -1226,8 +1758,7 @@ fn render_desktop_preview(f: &mut Frame, _app: &mut App, area: Rect, lines: &[St
     }
 
     let mut list_items = Vec::new();
-    
-    // Header
+
     list_items.push(Line::from(vec![
         Span::styled("Desktop Entry Configuration", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
     ]));
@@ -1318,30 +1849,22 @@ fn render_desktop_preview(f: &mut Frame, _app: &mut App, area: Rect, lines: &[St
 }
 
 fn render_text_preview(f: &mut Frame, app: &mut App, area: Rect, path: &PathBuf) {
-    let lines = if let Some((ref cached_path, ref cached_lines)) = app.current_text_data {
-        if cached_path == path {
-            Some(cached_lines.clone())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let lines = match lines {
-        Some(l) => l,
-        None => {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                let parsed_lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-                app.current_text_data = Some((path.clone(), parsed_lines.clone()));
-                parsed_lines
-            } else {
-                vec!["Error reading file contents or file is not valid UTF-8".to_string()]
-            }
-        }
-    };
-
     if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let cached = app.current_text_data.as_ref()
+        .map(|(p, _)| p == path)
+        .unwrap_or(false);
+
+    if !cached {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled("  Loading preview...", Style::default().fg(Color::Yellow))),
+            ]),
+            area,
+        );
         return;
     }
 
@@ -1351,40 +1874,46 @@ fn render_text_preview(f: &mut Frame, app: &mut App, area: Rect, path: &PathBuf)
         .unwrap_or("")
         .to_lowercase();
 
+    // Los .desktop los manejamos aparte con su propio render especializado
     if ext == "desktop" {
-        render_desktop_preview(f, app, area, &lines);
+        if let Some((_, ref lines)) = app.current_text_data {
+            let lines = lines.clone();
+            render_desktop_preview(f, app, area, &lines);
+        }
         return;
     }
 
-    let total_lines = lines.len();
+    let total_lines = app.current_text_data.as_ref().map(|(_, l)| l.len()).unwrap_or(0);
     let viewport_height = area.height as usize;
-    let start_idx = if total_lines > 0 {
-        app.text_scroll_offset.min(total_lines.saturating_sub(1))
+    let start_idx = app.text_scroll_offset.min(total_lines.saturating_sub(1));
+    // Solo pintamos las líneas visibles, no hay buffer extra
+    let end_idx = (start_idx + viewport_height).min(total_lines);
+
+    let list_items: Vec<Line> = if let Some((_, ref lines)) = app.current_text_data {
+        lines[start_idx..end_idx]
+            .iter()
+            .enumerate()
+            .map(|(i, line_content)| {
+                let line_num = start_idx + i + 1;
+                let num_span = Span::styled(
+                    format!("{:>4} │ ", line_num),
+                    Style::default().fg(Color::DarkGray),
+                );
+                let mut spans = vec![num_span];
+                spans.extend(highlight_line(line_content, &ext));
+                Line::from(spans)
+            })
+            .collect()
     } else {
-        0
+        vec![]
     };
-    let end_idx = (start_idx + viewport_height * 2).min(total_lines);
 
-    let mut list_items = Vec::new();
-    for idx in start_idx..end_idx {
-        let line_num = idx + 1;
-        let line_content = &lines[idx];
-
-        let num_span = Span::styled(
-            format!("{:>4} │ ", line_num),
-            Style::default().fg(Color::DarkGray),
-        );
-
-        let mut spans = vec![num_span];
-        spans.extend(highlight_line(line_content, &ext));
-
-        list_items.push(Line::from(spans));
-    }
-
-    let paragraph = Paragraph::new(list_items).wrap(ratatui::widgets::Wrap { trim: false });
-    f.render_widget(paragraph, area);
+    f.render_widget(Paragraph::new(list_items), area);
 }
 
+// Tokenizador minimalista para syntax highlighting en el preview de código.
+// No es un parser completo, pero cubre keywords, strings, números y comentarios
+// para los lenguajes más comunes.
 fn highlight_line(line: &str, ext: &str) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let chars: Vec<char> = line.chars().collect();
@@ -1552,4 +2081,3 @@ fn is_type_or_builtin(word: &str) -> bool {
             | "int" | "float" | "double" | "boolean" | "void" | "string" | "number" | "any" | "unknown"
     )
 }
-

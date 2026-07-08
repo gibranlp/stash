@@ -45,12 +45,14 @@ impl PlaybackQueue {
         }
 
         if shuffle {
+            // Si los índices no cuadran con el tamaño actual, los regeneramos
             if self.shuffle_indices.is_empty() || self.shuffle_indices.len() != self.items.len() {
                 self.regenerate_shuffle_indices();
             }
 
-            if let Some(curr) = self.current_index {
-                if let Some(pos) = self.shuffle_indices.iter().position(|&x| x == curr) {
+            // Buscamos la posición actual dentro del orden shuffleado y avanzamos uno
+            if let Some(curr) = self.current_index
+                && let Some(pos) = self.shuffle_indices.iter().position(|&x| x == curr) {
                     let next_pos = pos + 1;
                     if next_pos < self.shuffle_indices.len() {
                         let idx = self.shuffle_indices[next_pos];
@@ -58,9 +60,8 @@ impl PlaybackQueue {
                         return Some(self.items[idx].clone());
                     }
                 }
-            }
 
-            // Default to first shuffled
+            // Si ya no hay siguiente en el shuffle, arrancamos desde el primero del orden shuffleado
             if !self.shuffle_indices.is_empty() {
                 let idx = self.shuffle_indices[0];
                 self.current_index = Some(idx);
@@ -91,16 +92,15 @@ impl PlaybackQueue {
                 self.regenerate_shuffle_indices();
             }
 
-            if let Some(curr) = self.current_index {
-                if let Some(pos) = self.shuffle_indices.iter().position(|&x| x == curr) {
-                    if pos > 0 {
+            // Ojo: si pos == 0 no entramos al if, entonces caemos al último del shuffle
+            if let Some(curr) = self.current_index
+                && let Some(pos) = self.shuffle_indices.iter().position(|&x| x == curr)
+                    && pos > 0 {
                         let prev_pos = pos - 1;
                         let idx = self.shuffle_indices[prev_pos];
                         self.current_index = Some(idx);
                         return Some(self.items[idx].clone());
                     }
-                }
-            }
             if !self.shuffle_indices.is_empty() {
                 let idx = self.shuffle_indices[self.shuffle_indices.len() - 1];
                 self.current_index = Some(idx);
@@ -125,6 +125,8 @@ impl PlaybackQueue {
         self.regenerate_shuffle_indices();
     }
 
+    // Arma un orden random de índices; si hay canción actual, la ponemos primero
+    // para que no se corte lo que está sonando
     fn regenerate_shuffle_indices(&mut self) {
         let mut indices: Vec<usize> = (0..self.items.len()).collect();
         indices.shuffle(&mut thread_rng());
@@ -147,7 +149,7 @@ mod tests {
         let mut queue = PlaybackQueue::new();
         queue.add(PathBuf::from("song1.mp3"));
         queue.add(PathBuf::from("song2.mp3"));
-        queue.add(PathBuf::from("song1.mp3")); // duplicate
+        queue.add(PathBuf::from("song1.mp3"));
         assert_eq!(queue.items.len(), 2);
 
         queue.clear();
@@ -162,7 +164,6 @@ mod tests {
         queue.add(PathBuf::from("song2.mp3"));
         queue.add(PathBuf::from("song3.mp3"));
 
-        // Normal linear flow
         assert_eq!(queue.next(false), Some(PathBuf::from("song1.mp3")));
         assert_eq!(queue.current_index, Some(0));
 
@@ -172,7 +173,6 @@ mod tests {
         assert_eq!(queue.prev(false), Some(PathBuf::from("song1.mp3")));
         assert_eq!(queue.current_index, Some(0));
 
-        // Skip to end and try next
         queue.current_index = Some(2);
         assert_eq!(queue.next(false), None);
     }

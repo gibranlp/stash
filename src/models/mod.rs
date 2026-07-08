@@ -7,6 +7,13 @@ pub struct AudioMetadata {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub duration_secs: Option<u64>,
+    pub track: Option<u32>,
+    pub genre: Option<String>,
+    pub year: Option<u32>,
+    pub bitrate: Option<u32>,
+    pub sample_rate: Option<u32>,
+    pub codec: Option<String>,
+    pub lyrics: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -18,6 +25,11 @@ pub struct FileItem {
     pub modified: Option<SystemTime>,
     pub is_selected: bool,
     pub metadata: Option<AudioMetadata>,
+    // depth e is_expanded sirven para manejar árboles de directorios anidados en el browser
+    #[serde(default)]
+    pub depth: usize,
+    #[serde(default)]
+    pub is_expanded: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -35,6 +47,16 @@ pub enum RepeatMode {
     One,
 }
 
+// LyricsState maneja el ciclo de vida de las letras: primero carga local, luego jala de red si no hay
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LyricsState {
+    Loading,
+    Fetching,
+    Found(String),
+    NotFound,
+    Error(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum VisualizerMode {
     #[default]
@@ -42,4 +64,3 @@ pub enum VisualizerMode {
     Waveform,
     SignalLevels,
 }
-

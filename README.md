@@ -37,7 +37,7 @@ Designed for terminal power users, it supports smooth, standard list scrolling, 
 - **`d`**: Delete selected files (prompts confirmation).
 - **`a`**: Add selected files to a virtual collection.
 - **`c`**: Create a new virtual collection.
-- **`C`**: Toggle Collections screen dashboard.
+- **`C`**: Clear playback queue (from Queue screen).
 
 ### 3. Playback Controls
 - **`Space`**: Pause / Resume active audio playback (on non-Explorer screens).
@@ -59,37 +59,53 @@ Designed for terminal power users, it supports smooth, standard list scrolling, 
 
 ---
 
-## Installation & Compilation
+## Installation
+
+### One-line install (Linux / macOS)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gibranlp/stash/main/install.sh | sh
+```
+
+Installs to `~/.local/bin/stash`. The script detects your OS and architecture automatically and downloads the latest release binary from GitHub.
+
+### One-line install (Windows — PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/gibranlp/stash/main/install.ps1 | iex
+```
+
+Installs to `%LOCALAPPDATA%\Programs\stash\stash.exe` and adds it to your user PATH.
+
+---
+
+## Build from Source
 
 Ensure you have Rust and Cargo installed.
 
-### Prerequisites by Operating System:
+### Prerequisites by Operating System
 
-- **Linux**: Ensure the `alsa-lib` development packages are installed (e.g. `libasound2-dev` on Debian/Ubuntu, `alsa-lib-devel` on Fedora/RHEL/openSUSE).
-- **macOS (Mac)**: Works natively out of the box using CoreAudio. No additional external libraries or dependencies are required.
+- **Linux**: `libasound2-dev` (ALSA) and `libdbus-1-dev` (MPRIS media keys).
+  ```bash
+  sudo apt-get install libasound2-dev libdbus-1-dev pkg-config   # Debian/Ubuntu
+  sudo dnf install alsa-lib-devel dbus-devel                     # Fedora
+  ```
+- **macOS**: Works natively via CoreAudio. No extra dependencies.
+- **Windows**: Works natively via WASAPI. No extra dependencies.
 
 1. Install Rust (if not already installed):
    ```bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    ```
 
-### 1. Compile and Install globally
-Run the following inside the project directory to install `stash` globally under your cargo binaries path:
+### Compile and install globally
 ```bash
 cargo install --path .
 ```
-Verify it is accessible by running:
-```bash
-stash
-```
 
-### 2. Manual Release Compilation
-To build a standalone release binary:
+### Build a standalone release binary
 ```bash
 cargo build --release
-```
-The compiled binary will be located at `target/release/stash`. You can copy it to your local binary paths:
-```bash
 cp target/release/stash ~/.local/bin/
 ```
 
@@ -141,6 +157,16 @@ s       Open current folder in STASH
 ---
 
 ## Recent Version Changelog
+
+### v0.4.0
+
+- **Lyrics Display**: The Queue screen info pane now shows embedded track lyrics (ID3v2 USLT, Vorbis LYRICS, MP4 ©lyr tags). If no embedded lyrics are found, STASH automatically fetches them from [LRCLIB](https://lrclib.net) as a fallback.
+- **Live Lyrics Status**: A color-coded status message shows the current lyrics state in real time: `Loading…` (reading tags), `Fetching…` (querying LRCLIB), `Not Found` (nothing in the database), or an error description if the network request fails.
+- **Lyrics Scrolling**: Press `Tab` inside the Queue screen to focus the lyrics pane and scroll with `Up` / `Down` / `PageUp` / `PageDown`. Press `Tab` again to return focus to the track list.
+- **Instant Audio Start**: Pressing `Enter` on a track now starts playback immediately. Tag parsing, metadata loading, and lyrics fetching all happen in a background thread so the UI never blocks.
+- **Non-Blocking Text Preview**: Text file previews in the Browser no longer read from disk on the render thread. The file is loaded in a background thread and cached; the pane shows a loading indicator until it is ready.
+- **Faster Event Loop**: The main loop now drains all pending events before each draw, eliminating sluggish navigation when keys are pressed in quick succession.
+- **Code Cleanup**: Removed the unreachable Collections screen (all navigation, rendering, and state for it), removed unused internal methods, and rewrote comments to be concise and in informal Mexican Spanish.
 
 ### v0.3.0
 

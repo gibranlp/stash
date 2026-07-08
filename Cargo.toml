@@ -1,15 +1,19 @@
 [package]
 name = "stash"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["gibranlp"]
 homepage = "https://gibranlp.dev"
 repository = "https://github.com/gibranlp/stash"
 description = "A fast, keyboard-driven terminal music browser, player, and file organizer."
 
+[patch.crates-io]
+rodio = { path = "vendor/rodio" }
+
 [dependencies]
 ratatui = "0.26"
 crossterm = "0.27"
+unicode-width = "0.1"
 rodio = { version = "0.19", features = ["symphonia-all"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -22,4 +26,6 @@ souvlaki = "0.8.3"
 image = "0.24"
 ratatui-image = { version = "0.5.1", features = ["crossterm"] }
 base64 = "0.21"
+ureq = { version = "2", features = ["json"] }
+urlencoding = "2"
 

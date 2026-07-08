@@ -9,3 +9,5 @@
 *.rs.bk
 *.swp
 *~
+debug_mpris.log
+

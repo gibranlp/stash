@@ -7,6 +7,7 @@ pub struct SearchState {
     pub active: bool,
     pub results: Vec<FileItem>,
     pub selected_index: usize,
+    pub search_root: Option<PathBuf>,
 }
 
 impl SearchState {
@@ -16,9 +17,12 @@ impl SearchState {
             active: false,
             results: Vec::new(),
             selected_index: 0,
+            search_root: None,
         }
     }
 
+    // Aquí jalamos el WalkDir por todos los directorios configurados y filtramos por query.
+    // Ojo: le ponemos tope de 100 resultados para que no se tarde un chingo renderizando.
     pub fn execute(&mut self, search_dirs: &[PathBuf]) {
         if self.query.trim().is_empty() {
             self.results.clear();
@@ -36,6 +40,7 @@ impl SearchState {
 
             for entry in WalkDir::new(dir)
                 .into_iter()
+                // Saltamos los archivos/carpetas ocultos (los que empiezan con punto)
                 .filter_entry(|e| {
                     let name = e.file_name().to_string_lossy();
                     !name.starts_with('.')
@@ -43,29 +48,33 @@ impl SearchState {
                 .flatten()
             {
                 let path = entry.path();
-                if path.is_file() {
-                    let filename = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                    let matches_filename = filename.to_lowercase().contains(&query_lower);
+                let filename = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                let matches_filename = filename.to_lowercase().contains(&query_lower);
 
-                    if matches_filename {
-                        let metadata = entry.metadata().ok();
-                        let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-                        let modified = metadata.as_ref().and_then(|m| m.modified().ok());
+                if matches_filename {
+                    // No incluimos las raíces de búsqueda, solo su contenido
+                    if search_dirs.iter().any(|d| d == path) {
+                        continue;
+                    }
+                    let is_dir = path.is_dir();
+                    let metadata = entry.metadata().ok();
+                    let size = if is_dir { 0 } else { metadata.as_ref().map(|m| m.len()).unwrap_or(0) };
+                    let modified = metadata.as_ref().and_then(|m| m.modified().ok());
 
-                        matched.push(FileItem {
-                            name: filename,
-                            path: path.to_path_buf(),
-                            size,
-                            is_dir: false,
-                            modified,
-                            is_selected: false,
-                            metadata: None,
-                        });
+                    matched.push(FileItem {
+                        name: filename,
+                        path: path.to_path_buf(),
+                        size,
+                        is_dir,
+                        modified,
+                        is_selected: false,
+                        metadata: None,
+                        depth: 0,
+                        is_expanded: false,
+                    });
 
-                        // Cap results at 100 to maintain instant rendering responsiveness
-                        if matched.len() >= 100 {
-                            break;
-                        }
+                    if matched.len() >= 100 {
+                        break;
                     }
                 }
             }
@@ -85,7 +94,10 @@ impl SearchState {
 
 pub fn matches_audio_extension(path: &Path) -> bool {
     if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-        matches!(ext.to_lowercase().as_str(), "mp3" | "flac" | "wav" | "ogg" | "m4a" | "aac")
+        matches!(
+            ext.to_lowercase().as_str(),
+            "mp3" | "flac" | "wav" | "ogg" | "m4a" | "aac" | "mp4" | "aiff" | "aif"
+        )
     } else {
         false
     }
@@ -131,4 +143,3 @@ pub fn matches_text_extension(path: &Path) -> bool {
         false
     }
 }
-

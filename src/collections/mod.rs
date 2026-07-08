@@ -9,19 +9,18 @@ pub struct Collections {
 }
 
 impl Collections {
+    // Jalamos las colecciones del archivo JSON; si no existe o está chueco, regresamos default
     pub fn load() -> Self {
-        if let Some(path) = Self::collections_file_path() {
-            if path.exists() {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    if let Ok(collections) = serde_json::from_str::<HashMap<String, Vec<PathBuf>>>(&content) {
+        if let Some(path) = Self::collections_file_path()
+            && path.exists()
+                && let Ok(content) = fs::read_to_string(&path)
+                    && let Ok(collections) = serde_json::from_str::<HashMap<String, Vec<PathBuf>>>(&content) {
                         return Self { collections };
                     }
-                }
-            }
-        }
         Self::default()
     }
 
+    // Guardamos todo al disco; creamos el directorio si no existe para no tronar
     pub fn save(&self) -> anyhow::Result<()> {
         if let Some(path) = Self::collections_file_path() {
             if let Some(parent) = path.parent() {
@@ -37,6 +36,7 @@ impl Collections {
         dirs::config_dir().map(|p| p.join("stash").join("collections.json"))
     }
 
+    // Agrega paths a una colección; si ya están, los ignoramos para no duplicar
     pub fn add_to_collection(&mut self, collection_name: &str, paths: Vec<PathBuf>) {
         let entry = self.collections.entry(collection_name.to_string()).or_default();
         for path in paths {

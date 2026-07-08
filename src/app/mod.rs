@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::audio::AudioEngine;
 use crate::browser::{BrowserState, PaneType};
 use crate::collections::Collections;
 use crate::config::{AppConfig, resolve_path};
+use crate::discord::DiscordPresence;
 use crate::events::Event;
 use crate::models::{PlaybackStatus, RepeatMode, VisualizerMode};
 use crate::queue::PlaybackQueue;
@@ -14,12 +15,146 @@ use ratatui::widgets::ListState;
 use lofty::prelude::*;
 use lofty::probe::Probe;
 
+type LoadingImageSlot = Arc<Mutex<Option<(PathBuf, Option<image::DynamicImage>)>>>;
+type LoadingTextSlot  = Arc<Mutex<Option<(PathBuf, Option<Vec<String>>)>>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppScreen {
     Browser,
     Queue,
-    #[allow(dead_code)]
-    Collections,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictAction {
+    Replace,
+    Skip,
+    ReplaceAll,
+    SkipAll,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestBrowserFocus {
+    Quick,
+    Dirs,
+}
+
+pub struct DestBrowserState {
+    pub current_dir: PathBuf,
+    pub dirs: Vec<PathBuf>,
+    pub dir_index: usize,
+    pub dir_scroll: usize,
+    pub quick_paths: Vec<(String, PathBuf)>,
+    pub quick_index: usize,
+    pub focus: DestBrowserFocus,
+    pub is_move: bool,
+    pub loading: bool,
+    pub pending_dirs: Option<Arc<Mutex<Option<Vec<PathBuf>>>>>,
+}
+
+impl DestBrowserState {
+    pub fn new(start_dir: PathBuf, quick_paths: Vec<(String, PathBuf)>, is_move: bool) -> Self {
+        Self {
+            current_dir: start_dir,
+            dirs: Vec::new(),
+            dir_index: 0,
+            dir_scroll: 0,
+            quick_paths,
+            quick_index: 0,
+            focus: DestBrowserFocus::Quick,
+            is_move,
+            loading: false,
+            pending_dirs: None,
+        }
+    }
+
+    fn list_dirs(path: &Path) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir()
+                    && let Some(name) = p.file_name().and_then(|n| n.to_str())
+                        && !name.starts_with('.') {
+                            dirs.push(p);
+                        }
+            }
+        }
+        dirs.sort_by(|a, b| {
+            let a_name = a.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let b_name = b.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+            a_name.cmp(&b_name)
+        });
+        dirs
+    }
+
+    // Navega a un directorio en background para no trancar el hilo principal
+    pub fn navigate_to(&mut self, dir: PathBuf) {
+        self.current_dir = dir.clone();
+        self.dir_index = 0;
+        self.dir_scroll = 0;
+        self.loading = true;
+        let slot: Arc<Mutex<Option<Vec<PathBuf>>>> = Arc::new(Mutex::new(None));
+        self.pending_dirs = Some(slot.clone());
+        thread::spawn(move || {
+            let result = Self::list_dirs(&dir);
+            *slot.lock().unwrap() = Some(result);
+        });
+    }
+
+    // Jala el resultado del hilo de carga; regresa true si ya llegaron los directorios
+    pub fn poll_pending(&mut self) -> bool {
+        let result = self.pending_dirs.as_ref().and_then(|slot| {
+            slot.lock().unwrap().take()
+        });
+        if let Some(dirs) = result {
+            self.dirs = dirs;
+            self.loading = false;
+            self.pending_dirs = None;
+            if self.dir_index >= self.dirs.len() {
+                self.dir_index = self.dirs.len().saturating_sub(1);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn enter_highlighted(&mut self) {
+        if !self.dirs.is_empty() {
+            let target = self.dirs[self.dir_index].clone();
+            self.navigate_to(target);
+        }
+    }
+
+    pub fn go_up(&mut self) {
+        if let Some(parent) = self.current_dir.parent().map(|p| p.to_path_buf()) {
+            let old_dir = self.current_dir.clone();
+            self.navigate_to(parent.clone());
+            let _ = old_dir;
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        if self.dir_index > 0 {
+            self.dir_index -= 1;
+        }
+        self.clamp_scroll(10);
+    }
+
+    pub fn move_down(&mut self) {
+        if self.dir_index + 1 < self.dirs.len() {
+            self.dir_index += 1;
+        }
+        self.clamp_scroll(10);
+    }
+
+    pub fn clamp_scroll(&mut self, visible: usize) {
+        if self.dir_index < self.dir_scroll {
+            self.dir_scroll = self.dir_index;
+        } else if self.dir_index >= self.dir_scroll + visible {
+            self.dir_scroll = self.dir_index + 1 - visible;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,17 +167,26 @@ pub enum InputMode {
     MovePath,
     ConfirmDelete,
     Rename,
+    CreateFolder,
 }
 
 #[derive(Debug, Clone)]
 pub struct FileOperationProgress {
-    pub op_type: String, // "Copying" or "Moving"
+    pub op_type: String,
     pub current_file: String,
     pub completed_files: usize,
     pub total_files: usize,
+    pub bytes_copied: u64,
+    pub total_bytes: u64,
     pub finished: bool,
     pub error: Option<String>,
     pub canceled: bool,
+    pub conflict_file: Option<String>,
+    pub conflict_src_size: u64,
+    pub conflict_dest_size: u64,
+    pub conflict_action: Option<ConflictAction>,
+    pub replace_all: bool,
+    pub skip_all: bool,
 }
 
 pub struct App {
@@ -54,53 +198,159 @@ pub struct App {
     pub screen: AppScreen,
     pub input_mode: InputMode,
     pub input_value: String,
+    pub input_cursor: usize,
     pub show_help: bool,
     pub should_quit: bool,
-    
-    // UI Navigation indices
-    pub selected_collection_index: usize,
-    pub active_collection_file_index: usize,
     pub selected_add_collection_index: usize,
     pub queue_selected_index: usize,
-    
-    // Pane focus inside collections screen
-    pub collections_focused_pane: PaneType, // Directories = left (colls list), Files = right (coll files list)
     pub file_progress: Arc<Mutex<Option<FileOperationProgress>>>,
-    
-    // Persistent UI scrolling states
-    pub dirs_list_state: ListState,
     pub files_list_state: ListState,
     pub queue_list_state: ListState,
-    pub colls_list_state: ListState,
-    pub coll_files_list_state: ListState,
     pub add_coll_list_state: ListState,
-    
-    // Media Controls Integration (MPRIS / Playerctl)
     pub media_controls: Option<souvlaki::MediaControls>,
     pub last_media_status: Option<PlaybackStatus>,
     pub last_media_track: Option<PathBuf>,
     pub last_media_elapsed: u64,
+    pub discord: DiscordPresence,
+    pub last_discord_track: Option<PathBuf>,
+    pub last_discord_status: Option<PlaybackStatus>,
     pub rename_target: Option<PathBuf>,
-    pub image_zoom: f64,
-    pub image_offset_x: i32,
-    pub image_offset_y: i32,
     pub last_previewed_file: Option<PathBuf>,
     pub current_image_data: Option<(PathBuf, image::DynamicImage)>,
-    pub current_image_protocol: Option<(PathBuf, f64, i32, i32, Box<dyn ratatui_image::protocol::ResizeProtocol>)>,
+    pub loading_image: LoadingImageSlot,
+    pub current_image_protocol: Option<(PathBuf, u16, u16, Box<dyn ratatui_image::protocol::ResizeProtocol>)>,
+    pub current_image_lines: Option<(PathBuf, u16, u16, Vec<ratatui::text::Line<'static>>)>,
+    pub current_cover_path: Option<PathBuf>,
+    pub current_cover_data: Option<(PathBuf, image::DynamicImage)>,
+    pub loading_cover: LoadingImageSlot,
+    pub current_cover_protocol: Option<(PathBuf, u16, u16, Box<dyn ratatui_image::protocol::ResizeProtocol>)>,
+    pub current_cover_lines: Option<(PathBuf, u16, u16, Vec<ratatui::text::Line<'static>>)>,
+    pub last_cover_file: Option<PathBuf>,
     pub text_scroll_offset: usize,
     pub current_text_data: Option<(PathBuf, Vec<String>)>,
+    pub loading_text: LoadingTextSlot,
+    pub lyrics_scroll_offset: usize,
+    pub lyrics_focused: bool,
     pub config: AppConfig,
     pub last_operation_dest: String,
     pub picker: Option<ratatui_image::picker::Picker>,
+    pub external_drives: Vec<PathBuf>,
+    pub dest_browser: Option<DestBrowserState>,
+    pub conflict_condvar: Arc<Condvar>,
+}
+
+// Escanea interfaces USB buscando dispositivos MTP (clase 06 = Still Image / MTP)
+pub fn scan_usb_mtp_devices() -> Vec<(u32, u32, String)> {
+    let mut devices: Vec<(u32, u32, String)> = Vec::new();
+    let sys_usb = std::path::Path::new("/sys/bus/usb/devices");
+    let Ok(entries) = std::fs::read_dir(sys_usb) else {
+        return devices;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.contains(':') {
+            continue;
+        }
+        let iface_path = entry.path();
+        let class = std::fs::read_to_string(iface_path.join("bInterfaceClass"))
+            .unwrap_or_default();
+        if class.trim() != "06" {
+            continue;
+        }
+        let dev_name = name.split(':').next().unwrap_or(&name);
+        let dev_path = sys_usb.join(dev_name);
+        let bus = std::fs::read_to_string(dev_path.join("busnum"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        let dev = std::fs::read_to_string(dev_path.join("devnum"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        let (Some(bus), Some(dev)) = (bus, dev) else {
+            continue;
+        };
+        if devices.iter().any(|(b, d, _)| *b == bus && *d == dev) {
+            continue;
+        }
+        let product = std::fs::read_to_string(dev_path.join("product"))
+            .unwrap_or_else(|_| "Unknown Device".to_string())
+            .trim()
+            .to_string();
+        devices.push((bus, dev, product));
+    }
+    devices
+}
+
+// Decodifica el nombre de display de una ruta MTP tipo gvfs (viene URL-encoded con host=...)
+pub fn mtp_display_name(path: &Path) -> String {
+    let raw = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    let mut decoded = String::new();
+    let mut chars = raw.chars().peekable();
+    loop {
+        match chars.next() {
+            None => break,
+            Some('%') => {
+                let h1 = chars.next();
+                let h2 = chars.next();
+                if let (Some(h1), Some(h2)) = (h1, h2) {
+                    let hex = format!("{}{}", h1, h2);
+                    if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                        decoded.push(byte as char);
+                    } else {
+                        decoded.push('%');
+                        decoded.push(h1);
+                        decoded.push(h2);
+                    }
+                }
+            }
+            Some(c) => decoded.push(c),
+        }
+    }
+    // El nombre legible viene después del ']' en rutas tipo mtp://[usb:001,002]/Nombre
+    if let Some(pos) = decoded.find(']') {
+        let after = decoded[pos + 1..].trim_start_matches(['/', ',']).trim();
+        if !after.is_empty() {
+            return after.to_string();
+        }
+    }
+    decoded
+}
+
+pub fn scan_external_drives() -> Vec<PathBuf> {
+    let mut drives: Vec<PathBuf> = Vec::new();
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        for line in mounts.lines() {
+            let mut parts = line.split_whitespace();
+            let _device = parts.next();
+            let mount_point = match parts.next() {
+                Some(p) => p,
+                None => continue,
+            };
+            let is_external = mount_point.starts_with("/media/")
+                || mount_point.starts_with("/run/media/")
+                || (mount_point.starts_with("/mnt/") && mount_point.len() > 5);
+            if is_external {
+                let path = PathBuf::from(mount_point);
+                if path.is_dir() && !drives.contains(&path) {
+                    drives.push(path);
+                }
+            }
+        }
+    }
+    drives.sort();
+    drives
 }
 
 impl App {
+    // Ojo: si estamos corriendo con sudo, hay que abrir el archivo como el usuario original
+    // para que la app gráfica aparezca en el entorno correcto
     pub fn open_file_with_default_app(path: &Path) {
         let mut cmd = if let Ok(sudo_user) = std::env::var("SUDO_USER") {
             if !sudo_user.is_empty() {
                 let mut c = std::process::Command::new("sudo");
                 c.arg("-u").arg(&sudo_user).arg("xdg-open").arg(path);
-                // Forward GUI and audio environments
                 for var in &["DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
                     if let Ok(val) = std::env::var(var) {
                         c.env(var, val);
@@ -126,8 +376,7 @@ impl App {
 
     pub fn new(event_tx: std::sync::mpsc::Sender<Event>, initial_path: Option<PathBuf>, picker: Option<ratatui_image::picker::Picker>) -> Self {
         let config = AppConfig::load();
-        
-        // Resolve initial directory: command-line argument or current dir
+
         let starting_dir = if let Some(ref path) = initial_path {
             let resolved = resolve_path(&path.to_string_lossy());
             if resolved.exists() {
@@ -145,6 +394,11 @@ impl App {
         let collections = Collections::load();
         let search = SearchState::new();
 
+        let discord = DiscordPresence::new(
+            config.discord_app_id.unwrap_or(crate::discord::DEFAULT_APP_ID),
+        );
+
+        // Inicializa MPRIS para que los controles de media del sistema operativo jalen
         let media_controls = {
             #[cfg(not(target_os = "windows"))]
             let hwnd = None;
@@ -157,34 +411,46 @@ impl App {
                 hwnd,
             };
 
-            if let Ok(mut controls) = souvlaki::MediaControls::new(platform_config) {
-                let tx_clone = event_tx.clone();
-                let _ = controls.attach(move |event| {
-                    match event {
-                        souvlaki::MediaControlEvent::Play | souvlaki::MediaControlEvent::Pause | souvlaki::MediaControlEvent::Toggle => {
-                            let _ = tx_clone.send(Event::MediaPlayPause);
+            match souvlaki::MediaControls::new(platform_config) {
+                Ok(mut controls) => {
+                    let tx_clone = event_tx.clone();
+                    if let Err(e) = controls.attach(move |event| {
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("debug_mpris.log") {
+                            use std::io::Write;
+                            let _ = writeln!(f, "Received MPRIS event: {:?}", event);
                         }
-                        souvlaki::MediaControlEvent::Next => {
-                            let _ = tx_clone.send(Event::MediaNext);
+                        match event {
+                            souvlaki::MediaControlEvent::Play | souvlaki::MediaControlEvent::Pause | souvlaki::MediaControlEvent::Toggle => {
+                                let _ = tx_clone.send(Event::MediaPlayPause);
+                            }
+                            souvlaki::MediaControlEvent::Next => {
+                                let _ = tx_clone.send(Event::MediaNext);
+                            }
+                            souvlaki::MediaControlEvent::Previous => {
+                                let _ = tx_clone.send(Event::MediaPrev);
+                            }
+                            souvlaki::MediaControlEvent::Seek(direction) => {
+                                let _ = tx_clone.send(Event::MediaSeek(direction, std::time::Duration::from_secs(5)));
+                            }
+                            souvlaki::MediaControlEvent::SeekBy(direction, duration) => {
+                                let _ = tx_clone.send(Event::MediaSeek(direction, duration));
+                            }
+                            souvlaki::MediaControlEvent::SetPosition(position) => {
+                                let _ = tx_clone.send(Event::MediaSetPosition(position.0));
+                            }
+                            _ => {}
                         }
-                        souvlaki::MediaControlEvent::Previous => {
-                            let _ = tx_clone.send(Event::MediaPrev);
-                        }
-                        souvlaki::MediaControlEvent::Seek(direction) => {
-                            let _ = tx_clone.send(Event::MediaSeek(direction, std::time::Duration::from_secs(5)));
-                        }
-                        souvlaki::MediaControlEvent::SeekBy(direction, duration) => {
-                            let _ = tx_clone.send(Event::MediaSeek(direction, duration));
-                        }
-                        souvlaki::MediaControlEvent::SetPosition(position) => {
-                            let _ = tx_clone.send(Event::MediaSetPosition(position.0));
-                        }
-                        _ => {}
+                    }) {
+                        let _ = std::fs::write("debug_mpris.log", format!("Attach failed: {:?}", e));
+                    } else {
+                        let _ = std::fs::write("debug_mpris.log", "MPRIS successfully initialized and attached.");
                     }
-                });
-                Some(controls)
-            } else {
-                None
+                    Some(controls)
+                }
+                Err(e) => {
+                    let _ = std::fs::write("debug_mpris.log", format!("MPRIS Initialization failed: {:?}", e));
+                    None
+                }
             }
         };
 
@@ -197,37 +463,153 @@ impl App {
             screen: AppScreen::Browser,
             input_mode: InputMode::Normal,
             input_value: String::new(),
+            input_cursor: 0,
             show_help: false,
             should_quit: false,
-            selected_collection_index: 0,
-            active_collection_file_index: 0,
             selected_add_collection_index: 0,
             queue_selected_index: 0,
-            collections_focused_pane: PaneType::Directories,
             file_progress: Arc::new(Mutex::new(None)),
-            dirs_list_state: ListState::default(),
             files_list_state: ListState::default(),
             queue_list_state: ListState::default(),
-            colls_list_state: ListState::default(),
-            coll_files_list_state: ListState::default(),
             add_coll_list_state: ListState::default(),
             media_controls,
             last_media_status: None,
             last_media_track: None,
             last_media_elapsed: 0,
+            discord,
+            last_discord_track: None,
+            last_discord_status: None,
             rename_target: None,
-            image_zoom: 1.0,
-            image_offset_x: 0,
-            image_offset_y: 0,
             last_previewed_file: None,
             current_image_data: None,
+            loading_image: std::sync::Arc::new(std::sync::Mutex::new(None)),
             current_image_protocol: None,
+            current_image_lines: None,
+            current_cover_path: None,
+            current_cover_data: None,
+            loading_cover: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            current_cover_protocol: None,
+            current_cover_lines: None,
+            last_cover_file: None,
             text_scroll_offset: 0,
             current_text_data: None,
+            loading_text: Arc::new(Mutex::new(None)),
+            lyrics_scroll_offset: 0,
+            lyrics_focused: false,
             config,
             last_operation_dest: String::new(),
             picker,
+            external_drives: scan_external_drives(),
+            dest_browser: None,
+            conflict_condvar: Arc::new(Condvar::new()),
         }
+    }
+
+    fn jump_to_external_drives(&mut self) {
+        self.external_drives = scan_external_drives();
+        if self.external_drives.len() == 1 {
+            self.browser.current_dir = self.external_drives[0].clone();
+            self.browser.refresh();
+            self.browser.file_index = 0;
+        } else if !self.external_drives.is_empty() {
+            let first = &self.external_drives[0];
+            if let Some(parent) = first.parent() {
+                self.browser.current_dir = parent.to_path_buf();
+                self.browser.refresh();
+                self.browser.file_index = 0;
+            }
+        }
+    }
+
+    fn gvfs_mtp_paths_list() -> Vec<PathBuf> {
+        let uid_str = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "1000".to_string());
+        let gvfs_dir = PathBuf::from(format!("/run/user/{}/gvfs", uid_str));
+        let mut result = Vec::new();
+        if gvfs_dir.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&gvfs_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    if name.starts_with("mtp:") || name.starts_with("gphoto2:") {
+                        result.push(p);
+                    }
+                }
+            }
+        result
+    }
+
+    fn build_quick_paths(&self) -> Vec<(String, PathBuf)> {
+        let mut paths: Vec<(String, PathBuf)> = Vec::new();
+        for drive in scan_external_drives() {
+            let name = drive
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| drive.to_string_lossy().into_owned());
+            paths.push((name, drive));
+        }
+        for mtp_path in Self::gvfs_mtp_paths_list() {
+            let name = mtp_display_name(&mtp_path);
+            paths.push((name, mtp_path));
+        }
+        paths
+    }
+
+    pub fn open_dest_browser(&mut self, is_move: bool) {
+        let quick_paths = self.build_quick_paths();
+        let start_dir = if !self.last_operation_dest.is_empty() {
+            let p = PathBuf::from(&self.last_operation_dest);
+            if p.is_dir() { p } else { self.browser.current_dir.clone() }
+        } else {
+            self.browser.current_dir.clone()
+        };
+        let mut db = DestBrowserState::new(start_dir.clone(), quick_paths, is_move);
+        db.navigate_to(start_dir);
+        self.dest_browser = Some(db);
+        self.input_mode = if is_move { InputMode::MovePath } else { InputMode::CopyPath };
+    }
+
+    // Si no hay dispositivos montados, intenta montarlos con gio antes de navegar
+    fn jump_to_mtp(&mut self) {
+        let uid = std::env::var("UID")
+            .unwrap_or_else(|_| {
+                if let Ok(output) = std::process::Command::new("id").arg("-u").output() {
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                } else {
+                    "1000".to_string()
+                }
+            });
+
+        let gvfs_path = std::path::PathBuf::from(format!("/run/user/{}/gvfs", uid));
+        if !gvfs_path.exists() {
+            return;
+        }
+
+        let mut mtp_paths = Self::gvfs_mtp_paths_list();
+
+        if mtp_paths.is_empty() {
+            for (bus, dev, _) in scan_usb_mtp_devices() {
+                let uri = format!("mtp://[usb:{:03},{:03}]/", bus, dev);
+                let _ = std::process::Command::new("gio")
+                    .arg("mount")
+                    .arg(&uri)
+                    .output();
+            }
+            mtp_paths = Self::gvfs_mtp_paths_list();
+        }
+
+        if !mtp_paths.is_empty() {
+            self.browser.current_dir = mtp_paths[0].clone();
+        } else {
+            self.browser.current_dir = gvfs_path;
+        }
+        self.browser.refresh();
+        self.browser.file_index = 0;
     }
 
     pub fn handle_event(&mut self, event: Event) {
@@ -235,14 +617,17 @@ impl App {
             Event::Key(key) => self.handle_key(key),
             Event::Paste(content) => self.handle_paste(content),
             Event::Tick => {
+                if let Some(ref mut db) = self.dest_browser {
+                    db.poll_pending();
+                }
+                // Si la operación terminó limpia sin errores, refresca el browser automáticamente
                 let mut should_refresh = false;
                 {
                     let p = self.file_progress.lock().unwrap();
-                    if let Some(ref state) = *p {
-                        if state.finished && state.error.is_none() && !state.canceled {
+                    if let Some(ref state) = *p
+                        && state.finished && state.error.is_none() && !state.canceled {
                             should_refresh = true;
                         }
-                    }
                 }
                 if should_refresh {
                     *self.file_progress.lock().unwrap() = None;
@@ -260,12 +645,119 @@ impl App {
                     None
                 };
 
+                // Si cambió el archivo seleccionado, limpiamos cache de preview y arrancamos carga nueva
                 if current_preview_path != self.last_previewed_file {
-                    self.last_previewed_file = current_preview_path;
-                    self.image_zoom = 1.0;
-                    self.image_offset_x = 0;
-                    self.image_offset_y = 0;
+                    self.current_image_data = None;
+                    self.current_image_protocol = None;
+                    self.current_image_lines = None;
+                    self.current_text_data = None;
+                    self.last_previewed_file = current_preview_path.clone();
                     self.text_scroll_offset = 0;
+
+                    if let Some(ref new_path) = self.last_previewed_file
+                        && matches_text_extension(new_path) {
+                            let mut lock = self.loading_text.lock().unwrap();
+                            *lock = Some((new_path.clone(), None));
+                            let loading_clone = self.loading_text.clone();
+                            let path_clone = new_path.clone();
+                            thread::spawn(move || {
+                                let lines = std::fs::read_to_string(&path_clone)
+                                    .map(|c| c.lines().map(|l| l.to_string()).collect::<Vec<_>>())
+                                    .unwrap_or_default();
+                                let mut lock = loading_clone.lock().unwrap();
+                                if let Some((ref cur, _)) = *lock
+                                    && *cur == path_clone {
+                                        *lock = Some((path_clone, Some(lines)));
+                                    }
+                            });
+                        }
+
+                    if let Some(ref new_path) = self.last_previewed_file
+                        && matches_image_extension(new_path) {
+                            let mut lock = self.loading_image.lock().unwrap();
+                            *lock = Some((new_path.clone(), None));
+                            let loading_clone = self.loading_image.clone();
+                            let path_clone = new_path.clone();
+                            thread::spawn(move || {
+                                if let Ok(img) = image::open(&path_clone) {
+                                    // Reducimos imágenes enormes para no comernos la RAM
+                                    let img = {
+                                        let max_dim = 1024u32;
+                                        if img.width() > max_dim || img.height() > max_dim {
+                                            img.resize(max_dim, max_dim, image::imageops::FilterType::CatmullRom)
+                                        } else {
+                                            img
+                                        }
+                                    };
+                                    let mut lock = loading_clone.lock().unwrap();
+                                    if let Some((ref cur_path, _)) = *lock
+                                        && cur_path == &path_clone {
+                                            *lock = Some((path_clone, Some(img)));
+                                        }
+                                }
+                            });
+                        }
+                }
+
+                // Promueve imagen cargada en background al estado activo
+                let completed = {
+                    let mut lock = self.loading_image.lock().unwrap();
+                    if matches!(&*lock, Some((_, Some(_)))) { lock.take() } else { None }
+                };
+                if let Some((loaded_path, Some(loaded_img))) = completed {
+                    self.current_image_data = Some((loaded_path, loaded_img));
+                    self.current_image_protocol = None;
+                    self.current_image_lines = None;
+                }
+
+                let completed_text = {
+                    let mut lock = self.loading_text.lock().unwrap();
+                    if matches!(&*lock, Some((_, Some(_)))) { lock.take() } else { None }
+                };
+                if let Some((loaded_path, Some(lines))) = completed_text {
+                    self.current_text_data = Some((loaded_path, lines));
+                }
+
+                // Mismo patrón para la carátula del track en reproducción
+                if self.current_cover_path != self.last_cover_file {
+                    self.current_cover_data = None;
+                    self.current_cover_protocol = None;
+                    self.current_cover_lines = None;
+                    self.last_cover_file = self.current_cover_path.clone();
+
+                    if let Some(ref new_path) = self.last_cover_file {
+                        let mut lock = self.loading_cover.lock().unwrap();
+                        *lock = Some((new_path.clone(), None));
+                        let loading_clone = self.loading_cover.clone();
+                        let path_clone = new_path.clone();
+                        thread::spawn(move || {
+                            if let Ok(img) = image::open(&path_clone) {
+                                let img = {
+                                    let max_dim = 1024u32;
+                                    if img.width() > max_dim || img.height() > max_dim {
+                                        img.resize(max_dim, max_dim, image::imageops::FilterType::CatmullRom)
+                                    } else {
+                                        img
+                                    }
+                                };
+                                let mut lock = loading_clone.lock().unwrap();
+                                if let Some((ref cur_path, _)) = *lock
+                                    && cur_path == &path_clone {
+                                        *lock = Some((path_clone, Some(img)));
+                                    }
+                            }
+                        });
+                    }
+                }
+
+                let completed_cover = {
+                    let mut lock = self.loading_cover.lock().unwrap();
+                    if matches!(&*lock, Some((_, Some(_)))) { lock.take() } else { None }
+                };
+                if let Some((loaded_path, Some(loaded_img))) = completed_cover {
+                    self.current_cover_data = Some((loaded_path, loaded_img));
+                    self.current_cover_protocol = None;
+                    self.current_cover_lines = None;
                 }
 
                 self.update_media_controls();
@@ -318,18 +810,16 @@ impl App {
 
         match repeat {
             RepeatMode::One => {
-                // Play current track again
                 if let Some(path) = self.queue.current_track() {
                     self.audio.play(path);
                 }
             }
             RepeatMode::All => {
-                // Move to next track, if we reach the end, loop back to the beginning!
                 if let Some(next_path) = self.queue.next(shuffle) {
                     self.audio.play(next_path);
                     self.sync_queue_selection();
                 } else {
-                    // Reached the end of the queue, loop back to the beginning of the queue!
+                    // Llegamos al final de la cola — damos vuelta al inicio
                     if !self.queue.items.is_empty() {
                         self.queue.current_index = None;
                         if let Some(next_path) = self.queue.next(shuffle) {
@@ -340,7 +830,6 @@ impl App {
                 }
             }
             RepeatMode::Off => {
-                // Move to next track in queue, stop if we reach the end
                 if let Some(next_path) = self.queue.next(shuffle) {
                     self.audio.play(next_path);
                     self.sync_queue_selection();
@@ -350,19 +839,37 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
-        // Global exit hook
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
             return;
         }
 
-        // Intercept keys if a file operation is active
+        if self.input_mode == InputMode::Normal
+            && key.code == KeyCode::Char('q') {
+                self.should_quit = true;
+                return;
+            }
+
+        // Mientras hay una operación de archivo activa, solo procesamos teclas de conflicto/cancelar
         if self.is_file_operation_active() {
             let mut dismiss = false;
+            let mut notify_conflict = false;
             {
                 let mut p = self.file_progress.lock().unwrap();
                 if let Some(ref mut state) = *p {
-                    if state.finished || state.error.is_some() || state.canceled {
+                    if state.conflict_file.is_some() {
+                        let action = match key.code {
+                            KeyCode::Char('r') => Some(ConflictAction::Replace),
+                            KeyCode::Char('R') => Some(ConflictAction::ReplaceAll),
+                            KeyCode::Char('s') | KeyCode::Esc => Some(ConflictAction::Skip),
+                            KeyCode::Char('S') => Some(ConflictAction::SkipAll),
+                            _ => None,
+                        };
+                        if let Some(action) = action {
+                            state.conflict_action = Some(action);
+                            notify_conflict = true;
+                        }
+                    } else if state.finished || state.error.is_some() || state.canceled {
                         if key.code == KeyCode::Esc || key.code == KeyCode::Enter {
                             dismiss = true;
                         }
@@ -371,6 +878,9 @@ impl App {
                         state.current_file = "Canceling...".to_string();
                     }
                 }
+            }
+            if notify_conflict {
+                self.conflict_condvar.notify_one();
             }
             if dismiss {
                 *self.file_progress.lock().unwrap() = None;
@@ -390,14 +900,16 @@ impl App {
             InputMode::Search => self.handle_search_key(key),
             InputMode::CreateCollection => self.handle_create_collection_key(key),
             InputMode::AddToCollectionList => self.handle_add_to_collection_list_key(key),
-            InputMode::CopyPath => self.handle_copy_path_key(key),
-            InputMode::MovePath => self.handle_move_path_key(key),
+            InputMode::CopyPath => self.handle_dest_browser_key(key),
+            InputMode::MovePath => self.handle_dest_browser_key(key),
             InputMode::ConfirmDelete => self.handle_confirm_delete_key(key),
             InputMode::Rename => self.handle_rename_key(key),
+            InputMode::CreateFolder => self.handle_create_folder_key(key),
         }
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
+        // Cuando el foco está en el panel de preview de texto, las teclas de scroll se quedan aquí
         if self.screen == AppScreen::Browser && self.browser.focused_pane == PaneType::Preview {
             let is_txt = if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
                 matches_text_extension(&self.browser.files[self.browser.file_index].path)
@@ -411,12 +923,11 @@ impl App {
                     Some((path, _)) => *path != file_path,
                     None => true,
                 };
-                if needs_load {
-                    if let Ok(content) = std::fs::read_to_string(&file_path) {
+                if needs_load
+                    && let Ok(content) = std::fs::read_to_string(&file_path) {
                         let parsed_lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
                         self.current_text_data = Some((file_path, parsed_lines));
                     }
-                }
 
                 match key.code {
                     KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') => {
@@ -428,11 +939,10 @@ impl App {
                         return;
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if let Some((_, ref lines)) = self.current_text_data {
-                            if self.text_scroll_offset + 1 < lines.len() {
+                        if let Some((_, ref lines)) = self.current_text_data
+                            && self.text_scroll_offset + 1 < lines.len() {
                                 self.text_scroll_offset += 1;
                             }
-                        }
                         return;
                     }
                     KeyCode::PageUp => {
@@ -451,30 +961,6 @@ impl App {
                 match key.code {
                     KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') => {
                         self.browser.focused_pane = PaneType::Files;
-                        return;
-                    }
-                    KeyCode::Up => {
-                        self.image_offset_y = self.image_offset_y.saturating_sub(10);
-                        return;
-                    }
-                    KeyCode::Down => {
-                        self.image_offset_y = self.image_offset_y.saturating_add(10);
-                        return;
-                    }
-                    KeyCode::Left => {
-                        self.image_offset_x = self.image_offset_x.saturating_sub(10);
-                        return;
-                    }
-                    KeyCode::Right => {
-                        self.image_offset_x = self.image_offset_x.saturating_add(10);
-                        return;
-                    }
-                    KeyCode::Char('+') | KeyCode::Char('=') => {
-                        self.image_zoom = (self.image_zoom + 0.25).min(10.0);
-                        return;
-                    }
-                    KeyCode::Char('-') => {
-                        self.image_zoom = (self.image_zoom - 0.25).max(1.0);
                         return;
                     }
                     _ => {}
@@ -497,6 +983,8 @@ impl App {
                         }
                         PaneType::Preview => PaneType::Directories,
                     };
+                } else if self.screen == AppScreen::Queue {
+                    self.lyrics_focused = !self.lyrics_focused;
                 }
             }
             KeyCode::BackTab => {
@@ -517,6 +1005,18 @@ impl App {
             }
             KeyCode::Char('?') => {
                 self.show_help = true;
+            }
+            KeyCode::Char('1') => {
+                self.screen = AppScreen::Browser;
+                self.search.active = false;
+                self.search.query.clear();
+            }
+            KeyCode::Char('2') => {
+                self.screen = AppScreen::Queue;
+                self.search.active = false;
+                self.search.query.clear();
+                self.queue_selected_index = 0;
+                self.sync_queue_selection();
             }
             KeyCode::Char('Q') => {
                 if self.screen == AppScreen::Queue {
@@ -544,60 +1044,162 @@ impl App {
                 self.search.query.clear();
             }
             KeyCode::Up => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) && self.screen == AppScreen::Queue {
+                if self.screen == AppScreen::Queue && self.lyrics_focused {
+                    self.lyrics_scroll_offset = self.lyrics_scroll_offset.saturating_sub(1);
+                } else if key.modifiers.contains(KeyModifiers::CONTROL) && self.screen == AppScreen::Queue {
                     self.move_highlighted_queue_item(true);
+                } else if key.modifiers.contains(KeyModifiers::SHIFT) && self.screen == AppScreen::Browser {
+                    self.browser_shift_navigate(true);
                 } else {
+                    if self.screen == AppScreen::Browser {
+                        self.browser.shift_start = None;
+                    }
                     self.navigate_up();
                 }
             }
-            KeyCode::Char('k') => self.navigate_up(),
+            KeyCode::Char('k') => {
+                if self.screen == AppScreen::Queue && self.lyrics_focused {
+                    self.lyrics_scroll_offset = self.lyrics_scroll_offset.saturating_sub(1);
+                } else {
+                    if self.screen == AppScreen::Browser {
+                        self.browser.shift_start = None;
+                    }
+                    self.navigate_up();
+                }
+            }
             KeyCode::Char('K') => {
                 if self.screen == AppScreen::Queue {
                     self.move_highlighted_queue_item(true);
+                } else if self.screen == AppScreen::Browser {
+                    self.browser_shift_navigate(true);
                 }
             }
             KeyCode::Down => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) && self.screen == AppScreen::Queue {
+                if self.screen == AppScreen::Queue && self.lyrics_focused {
+                    self.lyrics_scroll_offset += 1;
+                } else if key.modifiers.contains(KeyModifiers::CONTROL) && self.screen == AppScreen::Queue {
                     self.move_highlighted_queue_item(false);
+                } else if key.modifiers.contains(KeyModifiers::SHIFT) && self.screen == AppScreen::Browser {
+                    self.browser_shift_navigate(false);
                 } else {
+                    if self.screen == AppScreen::Browser {
+                        self.browser.shift_start = None;
+                    }
                     self.navigate_down();
                 }
             }
-            KeyCode::Char('j') => self.navigate_down(),
+            KeyCode::Char('j') => {
+                if self.screen == AppScreen::Queue && self.lyrics_focused {
+                    self.lyrics_scroll_offset += 1;
+                } else {
+                    if self.screen == AppScreen::Browser {
+                        self.browser.shift_start = None;
+                    }
+                    self.navigate_down();
+                }
+            }
             KeyCode::Char('J') => {
                 if self.screen == AppScreen::Queue {
                     self.move_highlighted_queue_item(false);
+                } else if self.screen == AppScreen::Browser {
+                    self.browser_shift_navigate(false);
                 }
             }
-            KeyCode::PageUp => self.navigate_page_up(),
-            KeyCode::PageDown => self.navigate_page_down(),
+            KeyCode::PageUp => {
+                if self.screen == AppScreen::Queue && self.lyrics_focused {
+                    self.lyrics_scroll_offset = self.lyrics_scroll_offset.saturating_sub(10);
+                } else {
+                    if self.screen == AppScreen::Browser {
+                        self.browser.shift_start = None;
+                    }
+                    self.navigate_page_up();
+                }
+            }
+            KeyCode::PageDown => {
+                if self.screen == AppScreen::Queue && self.lyrics_focused {
+                    self.lyrics_scroll_offset += 10;
+                } else {
+                    if self.screen == AppScreen::Browser {
+                        self.browser.shift_start = None;
+                    }
+                    self.navigate_page_down();
+                }
+            }
+            KeyCode::Home => {
+                if self.screen == AppScreen::Browser {
+                    self.browser.shift_start = None;
+                }
+                self.navigate_home();
+            }
+            KeyCode::End => {
+                if self.screen == AppScreen::Browser {
+                    self.browser.shift_start = None;
+                }
+                self.navigate_end();
+            }
             KeyCode::Left => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     self.seek_relative(-5);
                 } else {
+                    if self.screen == AppScreen::Browser {
+                        self.browser.shift_start = None;
+                    }
                     self.navigate_left();
                 }
             }
-            KeyCode::Char('h') => self.navigate_left(),
+            KeyCode::Char('h') => {
+                if self.screen == AppScreen::Browser {
+                    self.browser.show_hidden = !self.browser.show_hidden;
+                    self.browser.refresh();
+                }
+            }
             KeyCode::Char('H') => self.seek_relative(-5),
             KeyCode::Right => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     self.seek_relative(5);
                 } else {
+                    if self.screen == AppScreen::Browser {
+                        self.browser.shift_start = None;
+                    }
                     self.navigate_right();
                 }
             }
-            KeyCode::Char('l') => self.navigate_right(),
+            KeyCode::Char('l') => {
+                if self.screen == AppScreen::Browser {
+                    self.browser.shift_start = None;
+                }
+                self.navigate_right();
+            }
             KeyCode::Char('L') => self.seek_relative(5),
-            KeyCode::Enter => self.activate_item(),
-            KeyCode::Backspace => self.navigate_back(),
-            
-            // Selection & Editing
+            KeyCode::Enter => {
+                if self.screen == AppScreen::Browser {
+                    self.browser.shift_start = None;
+                }
+                self.activate_item();
+            }
+            KeyCode::Backspace => {
+                if self.screen == AppScreen::Browser {
+                    self.browser.shift_start = None;
+                }
+                self.navigate_back();
+            }
             KeyCode::Char(' ') => {
                 if self.screen == AppScreen::Browser && (self.browser.focused_pane == PaneType::Files || self.browser.focused_pane == PaneType::Directories) {
-                    self.browser.toggle_select_highlighted();
+                    // Espacio con shift_start activo hace selección de rango
+                    if let Some(start) = self.browser.shift_start {
+                        self.browser.toggle_range_selection(start, self.browser.file_index);
+                        self.browser.shift_start = None;
+                    } else {
+                        let is_dir = !self.browser.files.is_empty()
+                            && self.browser.file_index < self.browser.files.len()
+                            && self.browser.files[self.browser.file_index].is_dir;
+                        if is_dir {
+                            self.browser.toggle_folder_select(self.browser.file_index);
+                        } else {
+                            self.browser.toggle_select_highlighted();
+                        }
+                    }
                 } else {
-                    // Space acts as pause/resume on other screens/panes
                     self.toggle_playback();
                 }
             }
@@ -605,13 +1207,18 @@ impl App {
                 self.toggle_playback();
             }
             KeyCode::Char('n') => {
-                let shuffle = {
-                    let state = self.audio.shared_state.lock().unwrap();
-                    state.shuffle
-                };
-                if let Some(next_path) = self.queue.next(shuffle) {
-                    self.audio.play(next_path);
-                    self.sync_queue_selection();
+                if self.screen == AppScreen::Browser {
+                    self.input_mode = InputMode::CreateFolder;
+                    self.input_clear();
+                } else {
+                    let shuffle = {
+                        let state = self.audio.shared_state.lock().unwrap();
+                        state.shuffle
+                    };
+                    if let Some(next_path) = self.queue.next(shuffle) {
+                        self.audio.play(next_path);
+                        self.sync_queue_selection();
+                    }
                 }
             }
             KeyCode::Char('b') => {
@@ -674,27 +1281,21 @@ impl App {
                 self.config.shuffle = next_shuffle;
                 let _ = self.config.save();
             }
-            
-            // Queue & Collections triggers
             KeyCode::Char('q') => {
-                // Add selected files to queue
                 if !self.browser.selected_paths.is_empty() {
                     let paths: Vec<PathBuf> = self.browser.selected_paths.iter().cloned().collect();
                     self.queue.add_many(paths);
                     self.browser.clear_selections();
                 } else if self.screen == AppScreen::Browser {
                     match self.browser.focused_pane {
-                        PaneType::Directories => {
-                            if !self.browser.directories.is_empty() {
-                                let dir_path = self.browser.directories[self.browser.dir_index].clone();
-                                if !dir_path.ends_with("..") {
-                                    let walk_path = if dir_path.ends_with(".") {
-                                        self.browser.current_dir.clone()
-                                    } else {
-                                        dir_path
-                                    };
+                        PaneType::Directories => {}
+                        PaneType::Files => {
+                            if !self.browser.files.is_empty() {
+                                let item = &self.browser.files[self.browser.file_index];
+                                if item.is_dir {
+                                    // Si es carpeta, metemos todos los audios que encuentre adentro
                                     let mut paths = Vec::new();
-                                    for entry in walkdir::WalkDir::new(&walk_path)
+                                    for entry in walkdir::WalkDir::new(&item.path)
                                         .into_iter()
                                         .filter_entry(|e| {
                                             let name = e.file_name().to_string_lossy();
@@ -710,25 +1311,13 @@ impl App {
                                     if !paths.is_empty() {
                                         paths.sort();
                                         self.queue.add_many(paths);
-                                        
-                                        // Shuffle queue if shuffle is active
-                                        let shuffle = {
-                                            let state = self.audio.shared_state.lock().unwrap();
-                                            state.shuffle
-                                        };
-                                        if shuffle {
-                                            self.queue.shuffle_items();
-                                        }
                                         self.sync_queue_selection();
                                     }
-                                }
-                            }
-                        }
-                        PaneType::Files => {
-                            if !self.browser.files.is_empty() {
-                                let path = self.browser.files[self.browser.file_index].path.clone();
-                                if matches_audio_extension(&path) {
-                                    self.queue.add(path);
+                                } else {
+                                    let path = item.path.clone();
+                                    if matches_audio_extension(&path) {
+                                        self.queue.add(path);
+                                    }
                                 }
                             }
                         }
@@ -741,6 +1330,19 @@ impl App {
                 self.input_mode = InputMode::Search;
                 self.search.active = true;
                 self.search.query.clear();
+                let root = if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
+                    let item = &self.browser.files[self.browser.file_index];
+                    if item.is_dir {
+                        item.path.clone()
+                    } else {
+                        item.path.parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| self.browser.current_dir.clone())
+                    }
+                } else {
+                    self.browser.current_dir.clone()
+                };
+                self.search.search_root = Some(root);
             }
             KeyCode::Char('v') => {
                 if self.screen == AppScreen::Queue {
@@ -752,15 +1354,13 @@ impl App {
                     let _ = self.config.save();
                 } else {
                     if !self.browser.selected_paths.is_empty() {
-                        self.input_mode = InputMode::CopyPath;
-                        self.input_value = self.last_operation_dest.clone();
+                        self.open_dest_browser(false);
                     }
                 }
             }
             KeyCode::Char('y') => {
                 if !self.browser.selected_paths.is_empty() {
-                    self.input_mode = InputMode::MovePath;
-                    self.input_value = self.last_operation_dest.clone();
+                    self.open_dest_browser(true);
                 }
             }
             KeyCode::Char('Y') => {
@@ -785,7 +1385,7 @@ impl App {
                     self.delete_highlighted_queue_item();
                 }
             }
-            KeyCode::Char('[') => {
+            KeyCode::Char('<') | KeyCode::Char(',') => {
                 if self.screen == AppScreen::Queue {
                     let mut current_decay = self.config.visualizer_decay;
                     current_decay = (current_decay - 0.05).max(0.10);
@@ -796,7 +1396,7 @@ impl App {
                     let _ = self.config.save();
                 }
             }
-            KeyCode::Char(']') => {
+            KeyCode::Char('>') | KeyCode::Char('.') => {
                 if self.screen == AppScreen::Queue {
                     let mut current_decay = self.config.visualizer_decay;
                     current_decay = (current_decay + 0.05).min(0.95);
@@ -810,25 +1410,12 @@ impl App {
             KeyCode::F(2) => {
                 if self.screen == AppScreen::Browser {
                     match self.browser.focused_pane {
-                        PaneType::Directories => {
-                            if !self.browser.directories.is_empty() && self.browser.dir_index < self.browser.directories.len() {
-                                // Prevent renaming "." and ".."
-                                let is_current_or_parent = self.browser.dir_index == 0 || 
-                                    (self.browser.dir_index == 1 && self.browser.directories.len() > 1 && self.browser.directories[1].ends_with(".."));
-                                if !is_current_or_parent {
-                                    let target_path = self.browser.directories[self.browser.dir_index].clone();
-                                    let name = target_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                                    self.input_value = name;
-                                    self.rename_target = Some(target_path);
-                                    self.input_mode = InputMode::Rename;
-                                }
-                            }
-                        }
+                        PaneType::Directories => {}
                         PaneType::Files => {
                             if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
                                 let target_path = self.browser.files[self.browser.file_index].path.clone();
                                 let name = target_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                                self.input_value = name;
+                                self.input_set(name);
                                 self.rename_target = Some(target_path);
                                 self.input_mode = InputMode::Rename;
                             }
@@ -837,6 +1424,15 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('M') => {
+                if self.screen == AppScreen::Browser {
+                    self.jump_to_mtp();
+                }
+            }
+            KeyCode::Char('E')
+                if self.screen == AppScreen::Browser => {
+                    self.jump_to_external_drives();
+                }
             _ => {}
         }
     }
@@ -845,7 +1441,6 @@ impl App {
         match key.code {
             KeyCode::Enter | KeyCode::Esc => {
                 self.input_mode = InputMode::Normal;
-                // If query is empty, cancel search state
                 if self.search.query.trim().is_empty() {
                     self.search.active = false;
                 }
@@ -853,7 +1448,8 @@ impl App {
             KeyCode::Backspace => {
                 self.search.query.pop();
                 if self.screen == AppScreen::Browser {
-                    self.search.execute(&[self.browser.current_dir.clone()]);
+                    let root = self.search.search_root.clone().unwrap_or_else(|| self.browser.current_dir.clone());
+                    self.search.execute(&[root]);
                 } else if self.screen == AppScreen::Queue {
                     self.queue_selected_index = 0;
                 }
@@ -861,10 +1457,52 @@ impl App {
             KeyCode::Char(c) => {
                 self.search.query.push(c);
                 if self.screen == AppScreen::Browser {
-                    self.search.execute(&[self.browser.current_dir.clone()]);
+                    let root = self.search.search_root.clone().unwrap_or_else(|| self.browser.current_dir.clone());
+                    self.search.execute(&[root]);
                 } else if self.screen == AppScreen::Queue {
                     self.queue_selected_index = 0;
                 }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_create_folder_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => {
+                let folder_name = self.input_value.trim().to_string();
+                if !folder_name.is_empty() {
+                    let new_dir_path = self.browser.current_dir.join(folder_name);
+                    let _ = std::fs::create_dir_all(new_dir_path);
+                    self.browser.refresh();
+                }
+                self.input_mode = InputMode::Normal;
+                self.input_clear();
+            }
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.input_clear();
+            }
+            KeyCode::Backspace => {
+                self.input_delete_before_cursor();
+            }
+            KeyCode::Delete => {
+                self.input_delete_after_cursor();
+            }
+            KeyCode::Left => {
+                self.input_move_left();
+            }
+            KeyCode::Right => {
+                self.input_move_right();
+            }
+            KeyCode::Home => {
+                self.input_cursor = 0;
+            }
+            KeyCode::End => {
+                self.input_cursor = self.input_value.chars().count();
+            }
+            KeyCode::Char(c) => {
+                self.input_insert_char(c);
             }
             _ => {}
         }
@@ -877,67 +1515,143 @@ impl App {
                     self.collections.create_collection(&self.input_value);
                 }
                 self.input_mode = InputMode::Normal;
-                self.input_value.clear();
+                self.input_clear();
             }
             KeyCode::Esc => {
                 self.input_mode = InputMode::Normal;
-                self.input_value.clear();
+                self.input_clear();
             }
             KeyCode::Backspace => {
-                self.input_value.pop();
+                self.input_delete_before_cursor();
+            }
+            KeyCode::Delete => {
+                self.input_delete_after_cursor();
+            }
+            KeyCode::Left => {
+                self.input_move_left();
+            }
+            KeyCode::Right => {
+                self.input_move_right();
+            }
+            KeyCode::Home => {
+                self.input_cursor = 0;
+            }
+            KeyCode::End => {
+                self.input_cursor = self.input_value.chars().count();
             }
             KeyCode::Char(c) => {
-                self.input_value.push(c);
+                self.input_insert_char(c);
             }
             _ => {}
         }
+    }
+
+    // Inserta un carácter respetando la posición del cursor (trabaja en char-indices, no bytes)
+    fn input_insert_char(&mut self, c: char) {
+        let byte_pos = self.input_value.char_indices()
+            .nth(self.input_cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(self.input_value.len());
+        self.input_value.insert(byte_pos, c);
+        self.input_cursor += 1;
+    }
+
+    fn input_delete_before_cursor(&mut self) {
+        if self.input_cursor > 0 {
+            let byte_pos = self.input_value.char_indices()
+                .nth(self.input_cursor - 1)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.input_value.remove(byte_pos);
+            self.input_cursor -= 1;
+        }
+    }
+
+    fn input_delete_after_cursor(&mut self) {
+        if self.input_cursor < self.input_value.chars().count() {
+            let byte_pos = self.input_value.char_indices()
+                .nth(self.input_cursor)
+                .map(|(i, _)| i)
+                .unwrap_or(self.input_value.len());
+            self.input_value.remove(byte_pos);
+        }
+    }
+
+    fn input_move_left(&mut self) {
+        if self.input_cursor > 0 {
+            self.input_cursor -= 1;
+        }
+    }
+
+    fn input_move_right(&mut self) {
+        if self.input_cursor < self.input_value.chars().count() {
+            self.input_cursor += 1;
+        }
+    }
+
+    fn input_clear(&mut self) {
+        self.input_value.clear();
+        self.input_cursor = 0;
+    }
+
+    fn input_set(&mut self, value: String) {
+        self.input_cursor = value.chars().count();
+        self.input_value = value;
     }
 
     fn handle_rename_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Enter => {
                 if let Some(target) = self.rename_target.take() {
-                    let new_name = self.input_value.trim();
+                    let new_name = self.input_value.trim().to_string();
                     if !new_name.is_empty() {
                         let mut new_path = target.clone();
-                        new_path.set_file_name(new_name);
-                        
+                        new_path.set_file_name(&new_name);
+
                         if let Err(_e) = std::fs::rename(&target, &new_path) {
-                            // Fail silently or handle error
                         } else {
+                            // Si el archivo renombrado estaba seleccionado, actualizamos la selección
                             if self.browser.selected_paths.contains(&target) {
                                 self.browser.selected_paths.remove(&target);
                                 self.browser.selected_paths.insert(new_path.clone());
                             }
-                            
+
                             self.browser.refresh();
-                            
-                            if self.browser.focused_pane == PaneType::Directories {
-                                if let Some(pos) = self.browser.directories.iter().position(|d| d == &new_path) {
-                                    self.browser.dir_index = pos;
-                                    self.browser.refresh();
-                                }
-                            } else {
-                                if let Some(pos) = self.browser.files.iter().position(|f| f.path == new_path) {
-                                    self.browser.file_index = pos;
-                                }
+
+                            if let Some(pos) = self.browser.files.iter().position(|f| f.path == new_path) {
+                                self.browser.file_index = pos;
                             }
                         }
                     }
                 }
                 self.input_mode = InputMode::Normal;
-                self.input_value.clear();
+                self.input_clear();
             }
             KeyCode::Esc => {
                 self.rename_target = None;
                 self.input_mode = InputMode::Normal;
-                self.input_value.clear();
+                self.input_clear();
             }
             KeyCode::Backspace => {
-                self.input_value.pop();
+                self.input_delete_before_cursor();
+            }
+            KeyCode::Delete => {
+                self.input_delete_after_cursor();
+            }
+            KeyCode::Left => {
+                self.input_move_left();
+            }
+            KeyCode::Right => {
+                self.input_move_right();
+            }
+            KeyCode::Home => {
+                self.input_cursor = 0;
+            }
+            KeyCode::End => {
+                self.input_cursor = self.input_value.chars().count();
             }
             KeyCode::Char(c) => {
-                self.input_value.push(c);
+                self.input_insert_char(c);
             }
             _ => {}
         }
@@ -972,53 +1686,104 @@ impl App {
         }
     }
 
-    fn handle_copy_path_key(&mut self, key: KeyEvent) {
+    fn handle_dest_browser_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Enter => {
-                let resolved = resolve_path(&self.input_value);
-                self.last_operation_dest = self.input_value.clone();
-                self.start_file_operation(resolved, false);
-                self.input_mode = InputMode::Normal;
-            }
             KeyCode::Esc => {
+                self.dest_browser = None;
                 self.input_mode = InputMode::Normal;
             }
             KeyCode::Tab => {
-                if let Some(completed) = Self::autocomplete_path(&self.input_value) {
-                    self.input_value = completed;
+                if let Some(ref mut db) = self.dest_browser {
+                    db.focus = match db.focus {
+                        DestBrowserFocus::Quick => DestBrowserFocus::Dirs,
+                        DestBrowserFocus::Dirs => DestBrowserFocus::Quick,
+                    };
                 }
             }
-            KeyCode::Backspace => {
-                self.input_value.pop();
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                if let Some(ref db) = self.dest_browser {
+                    let dest = db.current_dir.clone();
+                    let is_move = db.is_move;
+                    self.dest_browser = None;
+                    self.last_operation_dest = dest.to_string_lossy().into_owned();
+                    self.input_mode = InputMode::Normal;
+                    self.start_file_operation(dest, is_move);
+                }
             }
-            KeyCode::Char(c) => {
-                self.input_value.push(c);
+            _ => {
+                let is_quick = self.dest_browser
+                    .as_ref()
+                    .map(|db| db.focus == DestBrowserFocus::Quick)
+                    .unwrap_or(false);
+                if is_quick {
+                    self.dest_browser_quick_key(key);
+                } else {
+                    self.dest_browser_dirs_key(key);
+                }
+            }
+        }
+    }
+
+    fn dest_browser_quick_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(ref mut db) = self.dest_browser
+                    && db.quick_index > 0 { db.quick_index -= 1; }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(ref mut db) = self.dest_browser {
+                    let n = db.quick_paths.len();
+                    if db.quick_index + 1 < n { db.quick_index += 1; }
+                }
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                let dir = self.dest_browser
+                    .as_ref()
+                    .and_then(|db| db.quick_paths.get(db.quick_index))
+                    .map(|(_, p)| p.clone());
+                if let (Some(dir), Some(ref mut db)) = (dir, self.dest_browser.as_mut()) {
+                    db.navigate_to(dir);
+                    db.focus = DestBrowserFocus::Dirs;
+                }
             }
             _ => {}
         }
     }
 
-    fn handle_move_path_key(&mut self, key: KeyEvent) {
+    fn dest_browser_dirs_key(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(ref mut db) = self.dest_browser { db.move_up(); }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(ref mut db) = self.dest_browser { db.move_down(); }
+            }
             KeyCode::Enter => {
-                let resolved = resolve_path(&self.input_value);
-                self.last_operation_dest = self.input_value.clone();
-                self.start_file_operation(resolved, true);
-                self.input_mode = InputMode::Normal;
-            }
-            KeyCode::Esc => {
-                self.input_mode = InputMode::Normal;
-            }
-            KeyCode::Tab => {
-                if let Some(completed) = Self::autocomplete_path(&self.input_value) {
-                    self.input_value = completed;
+                // Si hay subdirectorios disponibles, entramos; si no, confirmamos el directorio actual
+                let has_dirs = self.dest_browser.as_ref().map(|db| !db.dirs.is_empty() && !db.loading).unwrap_or(false);
+                if has_dirs {
+                    if let Some(ref mut db) = self.dest_browser {
+                        db.enter_highlighted();
+                    }
+                } else {
+                    if let Some(ref db) = self.dest_browser {
+                        let dest = db.current_dir.clone();
+                        let is_move = db.is_move;
+                        self.dest_browser = None;
+                        self.last_operation_dest = dest.to_string_lossy().into_owned();
+                        self.input_mode = InputMode::Normal;
+                        self.start_file_operation(dest, is_move);
+                    }
                 }
             }
-            KeyCode::Backspace => {
-                self.input_value.pop();
+            KeyCode::Right | KeyCode::Char('l') => {
+                if let Some(ref mut db) = self.dest_browser
+                    && !db.dirs.is_empty() && !db.loading {
+                        db.enter_highlighted();
+                    }
             }
-            KeyCode::Char(c) => {
-                self.input_value.push(c);
+            KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
+                if let Some(ref mut db) = self.dest_browser { db.go_up(); }
             }
             _ => {}
         }
@@ -1047,7 +1812,6 @@ impl App {
             PlaybackStatus::Playing => self.audio.pause(),
             PlaybackStatus::Paused => self.audio.resume(),
             PlaybackStatus::Stopped => {
-                // Play currently selected/highlighted track if any in queue
                 if let Some(track) = self.queue.current_track() {
                     self.audio.play(track);
                 } else if self.screen == AppScreen::Browser && self.browser.focused_pane == PaneType::Files && !self.browser.files.is_empty() {
@@ -1057,6 +1821,18 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    // Inicia selección de rango con Shift+flecha; guarda el punto de inicio la primera vez
+    fn browser_shift_navigate(&mut self, up: bool) {
+        if self.browser.shift_start.is_none() {
+            self.browser.shift_start = Some(self.browser.file_index);
+        }
+        if up {
+            self.browser.move_up();
+        } else {
+            self.browser.move_down();
         }
     }
 
@@ -1074,27 +1850,6 @@ impl App {
             AppScreen::Queue => {
                 if self.queue_items_len() > 0 && self.queue_selected_index > 0 {
                     self.queue_selected_index -= 1;
-                }
-            }
-            AppScreen::Collections => {
-                match self.collections_focused_pane {
-                    PaneType::Directories => {
-                        if !self.collections.collections.is_empty() && self.selected_collection_index > 0 {
-                            self.selected_collection_index -= 1;
-                            self.active_collection_file_index = 0;
-                        }
-                    }
-                    PaneType::Files => {
-                        let coll_names: Vec<&String> = self.collections.collections.keys().collect();
-                        if let Some(&name) = coll_names.get(self.selected_collection_index) {
-                            if let Some(files) = self.collections.collections.get(name) {
-                                if !files.is_empty() && self.active_collection_file_index > 0 {
-                                    self.active_collection_file_index -= 1;
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
                 }
             }
         }
@@ -1117,39 +1872,44 @@ impl App {
                     self.queue_selected_index += 1;
                 }
             }
-            AppScreen::Collections => {
-                match self.collections_focused_pane {
-                    PaneType::Directories => {
-                        if !self.collections.collections.is_empty() && self.selected_collection_index + 1 < self.collections.collections.len() {
-                            self.selected_collection_index += 1;
-                            self.active_collection_file_index = 0;
-                        }
-                    }
-                    PaneType::Files => {
-                        let coll_names: Vec<&String> = self.collections.collections.keys().collect();
-                        if let Some(&name) = coll_names.get(self.selected_collection_index) {
-                            if let Some(files) = self.collections.collections.get(name) {
-                                if !files.is_empty() && self.active_collection_file_index + 1 < files.len() {
-                                    self.active_collection_file_index += 1;
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
         }
     }
 
     fn navigate_left(&mut self) {
         match self.screen {
             AppScreen::Browser => {
-                if self.browser.focused_pane != PaneType::Preview {
-                    self.browser.go_to_parent();
+                match self.browser.focused_pane {
+                    PaneType::Preview => {
+                        self.browser.focused_pane = PaneType::Files;
+                    }
+                    PaneType::Files | PaneType::Directories => {
+                        if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
+                            let item = self.browser.files[self.browser.file_index].clone();
+                            if item.is_dir && item.is_expanded {
+                                self.browser.expanded_paths.remove(&item.path);
+                                self.browser.refresh();
+                            } else {
+                                // Si el item tiene profundidad, saltamos al padre visible en la lista
+                                let mut found_parent = false;
+                                if item.depth > 0 {
+                                    for i in (0..self.browser.file_index).rev() {
+                                        if self.browser.files[i].is_dir && self.browser.files[i].depth < item.depth {
+                                            self.browser.file_index = i;
+                                            found_parent = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !found_parent {
+                                    self.browser.go_to_parent();
+                                }
+                            }
+                        } else {
+                            self.browser.go_to_parent();
+                        }
+                    }
                 }
-            }
-            AppScreen::Collections => {
-                self.collections_focused_pane = PaneType::Directories;
+                self.browser.refresh();
             }
             _ => {}
         }
@@ -1158,12 +1918,28 @@ impl App {
     fn navigate_right(&mut self) {
         match self.screen {
             AppScreen::Browser => {
-                if self.browser.focused_pane == PaneType::Directories {
-                    self.browser.open_selected_dir();
+                match self.browser.focused_pane {
+                    PaneType::Directories => {
+                        self.browser.focused_pane = PaneType::Files;
+                    }
+                    PaneType::Files => {
+                        if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
+                            let item = self.browser.files[self.browser.file_index].clone();
+                            if item.is_dir {
+                                if !item.is_expanded {
+                                    self.browser.expanded_paths.insert(item.path.clone());
+                                    self.browser.refresh();
+                                } else if self.browser.file_index + 1 < self.browser.files.len() {
+                                    self.browser.file_index += 1;
+                                }
+                            } else if self.has_preview() {
+                                self.browser.focused_pane = PaneType::Preview;
+                            }
+                        }
+                    }
+                    PaneType::Preview => {}
                 }
-            }
-            AppScreen::Collections => {
-                self.collections_focused_pane = PaneType::Files;
+                self.browser.refresh();
             }
             _ => {}
         }
@@ -1173,7 +1949,6 @@ impl App {
         match self.screen {
             AppScreen::Browser => {
                 if self.search.active {
-                    // Turn off search results view
                     self.search.active = false;
                     self.search.query.clear();
                 } else {
@@ -1189,9 +1964,6 @@ impl App {
                     self.screen = AppScreen::Browser;
                 }
             }
-            AppScreen::Collections => {
-                self.screen = AppScreen::Browser;
-            }
         }
     }
 
@@ -1202,7 +1974,6 @@ impl App {
                     if !self.search.results.is_empty() {
                         let path = self.search.results[self.search.selected_index].path.clone();
                         if matches_audio_extension(&path) {
-                            // Stop current, clear queue, add this track, play
                             self.queue.clear();
                             self.queue.add(path.clone());
                             self.queue.current_index = Some(0);
@@ -1213,69 +1984,50 @@ impl App {
                         }
                     }
                 } else {
-                    match self.browser.focused_pane {
-                        PaneType::Directories => {
-                            self.browser.open_selected_dir();
+                    if !self.browser.files.is_empty() {
+                        let path = self.browser.files[self.browser.file_index].path.clone();
+                        if self.browser.files[self.browser.file_index].is_dir {
+                            let is_expanded = self.browser.files[self.browser.file_index].is_expanded;
+                            if is_expanded {
+                                self.browser.expanded_paths.remove(&path);
+                            } else {
+                                self.browser.expanded_paths.insert(path);
+                            }
+                            self.browser.refresh();
+                            return;
                         }
-                        PaneType::Files => {
-                            if !self.browser.files.is_empty() {
-                                let path = self.browser.files[self.browser.file_index].path.clone();
-                                if matches_audio_extension(&path) {
-                                    // Set up queue with currently visible files (if audio) to acts as list
-                                    self.queue.clear();
-                                    
-                                    let mut added_idx = 0;
-                                    for (idx, f) in self.browser.files.iter().enumerate() {
-                                        if matches_audio_extension(&f.path) {
-                                            self.queue.add(f.path.clone());
-                                            if idx == self.browser.file_index {
-                                                self.queue.current_index = Some(added_idx);
-                                            }
-                                            added_idx += 1;
-                                        }
+                        if matches_audio_extension(&path) {
+                            // Al dar Enter en un audio, cargamos todos los audios visibles como cola
+                            self.queue.clear();
+
+                            let mut added_idx = 0;
+                            for (idx, f) in self.browser.files.iter().enumerate() {
+                                if matches_audio_extension(&f.path) {
+                                    self.queue.add(f.path.clone());
+                                    if idx == self.browser.file_index {
+                                        self.queue.current_index = Some(added_idx);
                                     }
-                                    
-                                    self.audio.play(path);
-                                    self.sync_queue_selection();
-                                } else {
-                                    Self::open_file_with_default_app(&path);
+                                    added_idx += 1;
                                 }
                             }
+
+                            self.audio.play(path);
+                            self.sync_queue_selection();
+                        } else {
+                            Self::open_file_with_default_app(&path);
                         }
-                        PaneType::Preview => {}
                     }
                 }
             }
             AppScreen::Queue => {
                 let filtered = self.get_filtered_queue_indices();
-                if let Some(&(_, original_idx)) = filtered.get(self.queue_selected_index) {
-                    if original_idx < self.queue.items.len() {
+                if let Some(&(_, original_idx)) = filtered.get(self.queue_selected_index)
+                    && original_idx < self.queue.items.len() {
                         let path = self.queue.items[original_idx].clone();
                         self.queue.current_index = Some(original_idx);
                         self.audio.play(path);
                         self.sync_queue_selection();
                     }
-                }
-            }
-            AppScreen::Collections => {
-                if self.collections_focused_pane == PaneType::Files {
-                    let coll_names: Vec<&String> = self.collections.collections.keys().collect();
-                    if let Some(&name) = coll_names.get(self.selected_collection_index) {
-                        if let Some(files) = self.collections.collections.get(name) {
-                            if !files.is_empty() && self.active_collection_file_index < files.len() {
-                                let path = files[self.active_collection_file_index].clone();
-                                
-                                // Load this collection into playback queue
-                                self.queue.clear();
-                                self.queue.add_many(files.clone());
-                                self.queue.current_index = Some(self.active_collection_file_index);
-                                
-                                self.audio.play(path);
-                                self.sync_queue_selection();
-                            }
-                        }
-                    }
-                }
             }
         }
     }
@@ -1295,6 +2047,7 @@ impl App {
         }
     }
 
+    // Sincroniza queue_selected_index con el track que está sonando actualmente
     pub fn sync_queue_selection(&mut self) {
         if let Some(idx) = self.queue.current_index {
             let filtered = self.get_filtered_queue_indices();
@@ -1304,6 +2057,7 @@ impl App {
         }
     }
 
+    // Actualiza los metadatos y estado de reproducción en MPRIS (systray / playerctl)
     fn update_media_controls(&mut self) {
         if let Some(ref mut controls) = self.media_controls {
             let (status, current_track, metadata, elapsed, duration) = {
@@ -1317,22 +2071,34 @@ impl App {
 
             if status_changed || track_changed || elapsed_changed {
                 if track_changed {
+                    self.lyrics_scroll_offset = 0;
+                    let cover_url = current_track.as_ref().and_then(|p| Self::find_cover_art(p));
+                    self.current_cover_path = cover_url.as_ref()
+                        .and_then(|url| url.strip_prefix("file://"))
+                        .map(PathBuf::from);
+
                     if let Some(meta) = metadata {
                         let title = meta.title.as_deref();
                         let artist = meta.artist.as_deref();
                         let album = meta.album.as_deref();
-                        let cover_url = current_track.as_ref().and_then(|p| Self::find_cover_art(p));
                         let m_meta = souvlaki::MediaMetadata {
                             title,
                             artist,
                             album,
                             duration: Some(std::time::Duration::from_secs(duration)),
                             cover_url: cover_url.as_deref(),
-                            ..Default::default()
                         };
                         let _ = controls.set_metadata(m_meta);
                     } else {
-                        let _ = controls.set_metadata(souvlaki::MediaMetadata::default());
+                        let title = current_track.as_ref()
+                            .and_then(|p| p.file_name())
+                            .map(|s| s.to_string_lossy().into_owned());
+                        let m_meta = souvlaki::MediaMetadata {
+                            title: title.as_deref(),
+                            duration: Some(std::time::Duration::from_secs(duration)),
+                            ..Default::default()
+                        };
+                        let _ = controls.set_metadata(m_meta);
                     }
                     self.last_media_track = current_track;
                 }
@@ -1349,17 +2115,57 @@ impl App {
                         PlaybackStatus::Paused => souvlaki::MediaPlayback::Paused { progress },
                         PlaybackStatus::Stopped => souvlaki::MediaPlayback::Stopped,
                     };
-                    let _ = controls.set_playback(playback);
+                    if let Err(e) = controls.set_playback(playback)
+                        && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("debug_mpris.log") {
+                            use std::io::Write;
+                            let _ = writeln!(f, "set_playback error: {:?}", e);
+                        }
 
                     self.last_media_status = Some(status);
                     self.last_media_elapsed = elapsed;
                 }
             }
         }
+        self.update_discord_presence();
     }
 
-    fn find_cover_art(track_path: &Path) -> Option<String> {
-        // 1. Look for local cover image in the same directory as the track
+    fn update_discord_presence(&mut self) {
+        let (status, current_track, metadata, elapsed, duration) = {
+            let state = self.audio.shared_state.lock().unwrap();
+            (state.status, state.current_track.clone(), state.metadata.clone(), state.elapsed_secs, state.duration_secs)
+        };
+
+        let status_changed = Some(status) != self.last_discord_status;
+        let track_changed = current_track != self.last_discord_track;
+
+        if !status_changed && !track_changed {
+            return;
+        }
+
+        match status {
+            PlaybackStatus::Stopped => {
+                self.discord.clear_activity();
+            }
+            PlaybackStatus::Playing | PlaybackStatus::Paused => {
+                let title = metadata.as_ref()
+                    .and_then(|m| m.title.clone())
+                    .or_else(|| current_track.as_ref()
+                        .and_then(|p| p.file_stem())
+                        .map(|s| s.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| "Unknown".to_string());
+                let artist = metadata.as_ref()
+                    .and_then(|m| m.artist.clone())
+                    .unwrap_or_default();
+                self.discord.set_activity(&title, &artist, elapsed, duration);
+            }
+        }
+
+        self.last_discord_status = Some(status);
+        self.last_discord_track = current_track;
+    }
+
+    // Busca carátula: primero en disco junto al track, luego embebida con lofty y la cachea
+    pub fn find_cover_art(track_path: &Path) -> Option<String> {
         if let Some(parent) = track_path.parent() {
             let common_names = ["cover.jpg", "cover.png", "folder.jpg", "folder.png", "front.jpg", "front.png", "Cover.jpg", "Cover.png", "Folder.jpg", "Folder.png"];
             for name in &common_names {
@@ -1368,56 +2174,53 @@ impl App {
                     return Some(format!("file://{}", img_path.to_string_lossy()));
                 }
             }
-            
-            // case-insensitive check
+
             if let Ok(entries) = std::fs::read_dir(parent) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_file() {
-                        if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                    if path.is_file()
+                        && let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
                             let lower = filename.to_lowercase();
                             if lower == "cover.jpg" || lower == "cover.png" || lower == "folder.jpg" || lower == "folder.png" || lower == "front.jpg" || lower == "front.png" {
                                 return Some(format!("file://{}", path.to_string_lossy()));
                             }
                         }
-                    }
                 }
             }
         }
 
-        // 2. Try to extract embedded cover art from the audio file itself using lofty
-        if let Ok(tagged_file) = Probe::open(track_path).and_then(|p| p.read()) {
-            if let Some(tag) = tagged_file.primary_tag() {
-                if let Some(picture) = tag.pictures().first() {
+        // Si no hay imagen en disco, intentamos extraerla del tag del archivo y cacheamos en disco
+        if let Ok(tagged_file) = Probe::open(track_path).and_then(|p| p.read())
+            && let Some(tag) = tagged_file.primary_tag()
+                && let Some(picture) = tag.pictures().first() {
                     let data = picture.data();
                     if let Some(cache_dir) = dirs::cache_dir() {
                         let art_cache_dir = cache_dir.join("stash").join("album_art");
                         if std::fs::create_dir_all(&art_cache_dir).is_ok() {
                             use std::collections::hash_map::DefaultHasher;
                             use std::hash::{Hash, Hasher};
-                            
+
                             let mut hasher = DefaultHasher::new();
                             track_path.hash(&mut hasher);
                             let hash = hasher.finish();
-                            
+
                             let mime_str = picture.mime_type().map(|m| m.as_str()).unwrap_or("image/jpeg");
                             let ext = if mime_str.contains("png") { "png" } else { "jpg" };
-                            
+
                             let cached_path = art_cache_dir.join(format!("{}.{}", hash, ext));
-                            
-                            // Only write if it doesn't exist
+
                             if cached_path.exists() || std::fs::write(&cached_path, data).is_ok() {
                                 return Some(format!("file://{}", cached_path.to_string_lossy()));
                             }
                         }
                     }
                 }
-            }
-        }
 
         None
     }
 
+    // Regresa los índices de la cola filtrados por búsqueda y respetando el orden shuffle
+    // Cada tupla es (índice_visual_base, índice_original_en_items)
     pub fn get_filtered_queue_indices(&self) -> Vec<(usize, usize)> {
         let is_shuffle = {
             if let Ok(state) = self.audio.shared_state.lock() {
@@ -1473,31 +2276,10 @@ impl App {
         if !self.browser.selected_paths.is_empty() {
             self.browser.selected_paths.iter().cloned().collect()
         } else {
-            match self.browser.focused_pane {
-                PaneType::Directories => {
-                    if !self.browser.directories.is_empty() && self.browser.dir_index < self.browser.directories.len() {
-                        let path = self.browser.directories[self.browser.dir_index].clone();
-                        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                            if name != "." && name != ".." {
-                                vec![path]
-                            } else {
-                                vec![]
-                            }
-                        } else {
-                            vec![]
-                        }
-                    } else {
-                        vec![]
-                    }
-                }
-                PaneType::Files => {
-                    if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
-                        vec![self.browser.files[self.browser.file_index].path.clone()]
-                    } else {
-                        vec![]
-                    }
-                }
-                PaneType::Preview => vec![],
+            if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
+                vec![self.browser.files[self.browser.file_index].path.clone()]
+            } else {
+                vec![]
             }
         }
     }
@@ -1506,71 +2288,58 @@ impl App {
         let mut bytes = Vec::new();
         let mut chars = s.as_bytes().iter().peekable();
         while let Some(&b) = chars.next() {
-            if b == b'%' {
-                if let (Some(&h), Some(&l)) = (chars.next(), chars.next()) {
-                    if let Ok(hex_str) = std::str::from_utf8(&[h, l]) {
-                        if let Ok(val) = u8::from_str_radix(hex_str, 16) {
+            if b == b'%'
+                && let (Some(&h), Some(&l)) = (chars.next(), chars.next())
+                    && let Ok(hex_str) = std::str::from_utf8(&[h, l])
+                        && let Ok(val) = u8::from_str_radix(hex_str, 16) {
                             bytes.push(val);
                             continue;
                         }
-                    }
-                }
-            }
             bytes.push(b);
         }
         String::from_utf8(bytes)
     }
 
+    // Parsea texto de drag & drop que puede venir como file:// URLs, rutas crudas, con comillas o con espacios escapados
     fn parse_dropped_paths(text: &str) -> Vec<PathBuf> {
         let mut paths = Vec::new();
-        
-        // Split by lines first
+
         for line in text.lines() {
             let cleaned = line.trim().to_string();
             if cleaned.is_empty() {
                 continue;
             }
 
-            // A line could be a single path, e.g., "file:///home/user/Music/some file.mp3"
-            // or it could be quoted multiple paths, e.g., "'file:///home/user/Music/file 1.mp3' 'file:///home/user/Music/file 2.mp3'"
-            // Or it could be a raw path with spaces, e.g. "/home/user/Music/some file.mp3"
-            
-            // Let's first check if the entire trimmed line (after stripping file:// and url-decoding) exists.
             let mut candidate = cleaned.clone();
-            
-            // Strip single/double quotes around the candidate if they enclose the whole line
-            if (candidate.starts_with('\'') && candidate.ends_with('\'')) || 
+
+            if (candidate.starts_with('\'') && candidate.ends_with('\'')) ||
                (candidate.starts_with('"') && candidate.ends_with('"')) {
                 candidate = candidate[1..candidate.len()-1].to_string();
             }
 
-            if candidate.starts_with("file://") {
-                if let Some(stripped) = candidate.strip_prefix("file://") {
+            if candidate.starts_with("file://")
+                && let Some(stripped) = candidate.strip_prefix("file://") {
                     candidate = stripped.to_string();
                 }
-            }
-            if candidate.contains('%') {
-                if let Ok(decoded) = Self::url_decode(&candidate) {
+            if candidate.contains('%')
+                && let Ok(decoded) = Self::url_decode(&candidate) {
                     candidate = decoded;
                 }
-            }
-            
+
             let candidate_path = PathBuf::from(&candidate);
             if candidate_path.exists() {
-                // The entire line is a single existing path!
                 paths.push(candidate_path);
                 continue;
             }
-            
-            // If the entire line doesn't exist, it might contain multiple paths separated by spaces/quotes/escapes.
-            // We run the classic tokenization parser on this line.
+
+            // Si el path completo no existe, puede ser que la línea tenga múltiples rutas separadas por espacios
             let mut current = String::new();
             let mut in_single_quote = false;
             let mut in_double_quote = false;
             let mut escaped = false;
-            let mut chars = line.chars().peekable();
-            
-            while let Some(c) = chars.next() {
+            let chars = line.chars().peekable();
+
+            for c in chars {
                 if escaped {
                     current.push(c);
                     escaped = false;
@@ -1583,16 +2352,14 @@ impl App {
                 } else if (c == ' ' || c == '\t') && !in_single_quote && !in_double_quote {
                     if !current.is_empty() {
                         let mut p_val = current.clone();
-                        if p_val.starts_with("file://") {
-                            if let Some(stripped) = p_val.strip_prefix("file://") {
+                        if p_val.starts_with("file://")
+                            && let Some(stripped) = p_val.strip_prefix("file://") {
                                 p_val = stripped.to_string();
                             }
-                        }
-                        if p_val.contains('%') {
-                            if let Ok(decoded) = Self::url_decode(&p_val) {
+                        if p_val.contains('%')
+                            && let Ok(decoded) = Self::url_decode(&p_val) {
                                 p_val = decoded;
                             }
-                        }
                         let pb = PathBuf::from(p_val);
                         if pb.exists() {
                             paths.push(pb);
@@ -1605,26 +2372,26 @@ impl App {
             }
             if !current.is_empty() {
                 let mut p_val = current;
-                if p_val.starts_with("file://") {
-                    if let Some(stripped) = p_val.strip_prefix("file://") {
+                if p_val.starts_with("file://")
+                    && let Some(stripped) = p_val.strip_prefix("file://") {
                         p_val = stripped.to_string();
                     }
-                }
-                if p_val.contains('%') {
-                    if let Ok(decoded) = Self::url_decode(&p_val) {
+                if p_val.contains('%')
+                    && let Ok(decoded) = Self::url_decode(&p_val) {
                         p_val = decoded;
                     }
-                }
                 let pb = PathBuf::from(p_val);
                 if pb.exists() {
                     paths.push(pb);
                 }
             }
         }
-        
+
         paths
     }
 
+    // Copia las rutas al portapapeles: primero via OSC 52 (funciona en cualquier terminal),
+    // luego intenta wl-copy (Wayland) o xclip (X11) para que file managers también puedan pegar
     fn copy_paths_to_clipboard(paths: &[PathBuf]) -> Result<(), String> {
         if paths.is_empty() {
             return Err("No paths selected".to_string());
@@ -1639,14 +2406,13 @@ impl App {
                     plain_text.push(' ');
                 }
                 plain_text.push_str(&path_str);
-                
+
                 uri_list.push_str("file://");
                 uri_list.push_str(&path_str);
                 uri_list.push('\n');
             }
         }
 
-        // 1. Copy via OSC 52 (highly reliable terminal clipboard bypass)
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(plain_text.as_bytes());
         let osc52 = format!("\x1b]52;c;{}\x07", b64);
@@ -1655,30 +2421,26 @@ impl App {
         let _ = stdout.write_all(osc52.as_bytes());
         let _ = stdout.flush();
 
-        // 2. Try Wayland wl-copy (enables file manager pasting)
         let use_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
         if use_wayland {
             let child = std::process::Command::new("wl-copy")
                 .args(["-t", "text/uri-list"])
                 .stdin(std::process::Stdio::piped())
                 .spawn();
-            
-            if let Ok(mut c) = child {
-                if c.stdin.as_mut().unwrap().write_all(uri_list.as_bytes()).is_ok() {
+
+            if let Ok(mut c) = child
+                && c.stdin.as_mut().unwrap().write_all(uri_list.as_bytes()).is_ok() {
                     let _ = c.wait();
                 }
-            }
         } else {
-            // 3. Try X11 xclip
             let child = std::process::Command::new("xclip")
                 .args(["-selection", "clipboard", "-t", "text/uri-list"])
                 .stdin(std::process::Stdio::piped())
                 .spawn();
-            if let Ok(mut c) = child {
-                if c.stdin.as_mut().unwrap().write_all(uri_list.as_bytes()).is_ok() {
+            if let Ok(mut c) = child
+                && c.stdin.as_mut().unwrap().write_all(uri_list.as_bytes()).is_ok() {
                     let _ = c.wait();
                 }
-            }
         }
 
         Ok(())
@@ -1690,6 +2452,7 @@ impl App {
         }
 
         let total_items = source_paths.len();
+        let total_bytes = Self::get_total_size(&source_paths);
         let progress = Arc::clone(&self.file_progress);
         let op_type = "Dropping".to_string();
 
@@ -1700,15 +2463,23 @@ impl App {
                 current_file: String::new(),
                 completed_files: 0,
                 total_files: total_items,
+                bytes_copied: 0,
+                total_bytes,
                 finished: false,
                 error: None,
                 canceled: false,
+                conflict_file: None,
+                conflict_src_size: 0,
+                conflict_dest_size: 0,
+                conflict_action: None,
+                replace_all: false,
+                skip_all: false,
             });
         }
 
         thread::spawn(move || {
-            if !dest_dir.exists() {
-                if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+            if !dest_dir.exists()
+                && let Err(e) = std::fs::create_dir_all(&dest_dir) {
                     let mut p = progress.lock().unwrap();
                     if let Some(ref mut state) = *p {
                         state.error = Some(e.to_string());
@@ -1716,17 +2487,15 @@ impl App {
                     }
                     return;
                 }
-            }
 
             let mut completed = 0;
             for path in source_paths {
                 {
                     let p = progress.lock().unwrap();
-                    if let Some(ref state) = *p {
-                        if state.canceled {
+                    if let Some(ref state) = *p
+                        && state.canceled {
                             break;
                         }
-                    }
                 }
 
                 if let Some(name) = path.file_name() {
@@ -1740,7 +2509,7 @@ impl App {
 
                     let dest_path = dest_dir.join(name);
                     let res = if path.is_file() {
-                        std::fs::copy(&path, &dest_path).map(|_| ())
+                        Self::copy_file_with_progress(&path, &dest_path, &progress)
                     } else if path.is_dir() {
                         Self::copy_dir_recursive(&path, &dest_path, &progress)
                     } else {
@@ -1781,9 +2550,11 @@ impl App {
             | InputMode::AddToCollectionList
             | InputMode::Search
             | InputMode::Rename
-            | InputMode::CopyPath
-            | InputMode::MovePath => {
+            | InputMode::CreateFolder => {
                 self.input_value.push_str(&content);
+            }
+            InputMode::CopyPath
+            | InputMode::MovePath => {
             }
             InputMode::Normal
             | InputMode::ConfirmDelete => {
@@ -1796,6 +2567,8 @@ impl App {
         }
     }
 
+    // Lanza la operación de copia/mover en un hilo separado con soporte de resolución de conflictos
+    // El hilo worker se bloquea en el Condvar cuando hay un conflicto hasta que el UI thread responda
     fn start_file_operation(&mut self, dest_dir: PathBuf, is_move: bool) {
         let paths: Vec<PathBuf> = self.browser.selected_paths.iter().cloned().collect();
         if paths.is_empty() {
@@ -1803,6 +2576,7 @@ impl App {
         }
 
         let total_items = paths.len();
+        let total_bytes = Self::get_total_size(&paths);
         let progress = Arc::clone(&self.file_progress);
         let op_type = if is_move { "Moving".to_string() } else { "Copying".to_string() };
 
@@ -1813,15 +2587,25 @@ impl App {
                 current_file: String::new(),
                 completed_files: 0,
                 total_files: total_items,
+                bytes_copied: 0,
+                total_bytes,
                 finished: false,
                 error: None,
                 canceled: false,
+                conflict_file: None,
+                conflict_src_size: 0,
+                conflict_dest_size: 0,
+                conflict_action: None,
+                replace_all: false,
+                skip_all: false,
             });
         }
 
+        let condvar = Arc::clone(&self.conflict_condvar);
+
         thread::spawn(move || {
-            if !dest_dir.exists() {
-                if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+            if !dest_dir.exists()
+                && let Err(e) = std::fs::create_dir_all(&dest_dir) {
                     let mut p = progress.lock().unwrap();
                     if let Some(ref mut state) = *p {
                         state.error = Some(e.to_string());
@@ -1829,18 +2613,15 @@ impl App {
                     }
                     return;
                 }
-            }
 
             let mut completed = 0;
             for path in paths {
-                // Check if operation was canceled by the user
                 {
                     let p = progress.lock().unwrap();
-                    if let Some(ref state) = *p {
-                        if state.canceled {
+                    if let Some(ref state) = *p
+                        && state.canceled {
                             break;
                         }
-                    }
                 }
 
                 if let Some(name) = path.file_name() {
@@ -1848,23 +2629,100 @@ impl App {
                     {
                         let mut p = progress.lock().unwrap();
                         if let Some(ref mut state) = *p {
-                            state.current_file = name_str;
+                            state.current_file = name_str.clone();
                         }
                     }
 
                     let dest_path = dest_dir.join(name);
+
+                    // Manejo de conflictos: si ya existe el destino, preguntamos al usuario
+                    let mut skip_file = false;
+                    if dest_path.exists() {
+                        let (already_skip_all, already_replace_all) = {
+                            let p = progress.lock().unwrap();
+                            p.as_ref().map(|s| (s.skip_all, s.replace_all)).unwrap_or((false, false))
+                        };
+                        if already_skip_all {
+                            skip_file = true;
+                        } else if !already_replace_all {
+                            let src_size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                            let dest_size = dest_path.metadata().map(|m| m.len()).unwrap_or(0);
+                            {
+                                let mut p = progress.lock().unwrap();
+                                if let Some(ref mut state) = *p {
+                                    state.conflict_file = Some(name_str.clone());
+                                    state.conflict_src_size = src_size;
+                                    state.conflict_dest_size = dest_size;
+                                    state.conflict_action = None;
+                                }
+                            }
+                            // Aquí nos quedamos dormidos esperando que el UI ponga la acción
+                            let action = {
+                                let guard = progress.lock().unwrap();
+                                let mut guard = condvar
+                                    .wait_while(guard, |p| {
+                                        p.as_ref()
+                                            .map(|s| s.conflict_action.is_none() && s.conflict_file.is_some())
+                                            .unwrap_or(false)
+                                    })
+                                    .unwrap();
+                                let action = guard.as_ref().and_then(|s| s.conflict_action.clone());
+                                if let Some(ref mut state) = *guard {
+                                    state.conflict_file = None;
+                                    state.conflict_action = None;
+                                    match &action {
+                                        Some(ConflictAction::SkipAll) => state.skip_all = true,
+                                        Some(ConflictAction::ReplaceAll) => state.replace_all = true,
+                                        _ => {}
+                                    }
+                                }
+                                action
+                            };
+                            match action {
+                                Some(ConflictAction::Skip) | Some(ConflictAction::SkipAll) => {
+                                    skip_file = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    if skip_file {
+                        completed += 1;
+                        let mut p = progress.lock().unwrap();
+                        if let Some(ref mut state) = *p {
+                            state.completed_files = completed;
+                        }
+                        continue;
+                    }
+                    let file_size = Self::get_total_size(std::slice::from_ref(&path));
                     let res = if path.is_file() {
                         if is_move {
-                            std::fs::rename(&path, &dest_path).or_else(|_| {
-                                std::fs::copy(&path, &dest_path).and_then(|_| std::fs::remove_file(&path))
+                            // Intentamos rename primero (atómico en mismo FS), si falla copiamos y borramos
+                            std::fs::rename(&path, &dest_path).map(|_| {
+                                let mut p = progress.lock().unwrap();
+                                if let Some(ref mut state) = *p {
+                                    state.bytes_copied += file_size;
+                                }
+                            }).or_else(|_| {
+                                Self::copy_file_with_progress(&path, &dest_path, &progress).and_then(|_| {
+                                    std::fs::remove_file(&path)
+                                })
                             })
                         } else {
-                            std::fs::copy(&path, &dest_path).map(|_| ())
+                            Self::copy_file_with_progress(&path, &dest_path, &progress)
                         }
                     } else if path.is_dir() {
                         if is_move {
-                            std::fs::rename(&path, &dest_path).or_else(|_| {
-                                Self::copy_dir_recursive(&path, &dest_path, &progress).and_then(|_| std::fs::remove_dir_all(&path))
+                            std::fs::rename(&path, &dest_path).map(|_| {
+                                let mut p = progress.lock().unwrap();
+                                if let Some(ref mut state) = *p {
+                                    state.bytes_copied += file_size;
+                                }
+                            }).or_else(|_| {
+                                Self::copy_dir_recursive(&path, &dest_path, &progress).and_then(|_| {
+                                    std::fs::remove_dir_all(&path)
+                                })
                             })
                         } else {
                             Self::copy_dir_recursive(&path, &dest_path, &progress)
@@ -1902,13 +2760,11 @@ impl App {
     }
 
     pub fn copy_dir_recursive(src: &Path, dst: &Path, progress: &Arc<Mutex<Option<FileOperationProgress>>>) -> std::io::Result<()> {
-        // Check cancellation
         {
-            if let Some(ref state) = *progress.lock().unwrap() {
-                if state.canceled {
+            if let Some(ref state) = *progress.lock().unwrap()
+                && state.canceled {
                     return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "Operation canceled by user"));
                 }
-            }
         }
 
         std::fs::create_dir_all(dst)?;
@@ -1917,122 +2773,89 @@ impl App {
             let entry_path = entry.path();
             let dest_path = dst.join(entry.file_name());
 
-            // Check cancellation before processing next entry
             {
-                if let Some(ref state) = *progress.lock().unwrap() {
-                    if state.canceled {
+                if let Some(ref state) = *progress.lock().unwrap()
+                    && state.canceled {
                         return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "Operation canceled by user"));
                     }
-                }
             }
 
             if entry_path.is_dir() {
                 Self::copy_dir_recursive(&entry_path, &dest_path, progress)?;
             } else {
-                std::fs::copy(&entry_path, &dest_path)?;
+                Self::copy_file_with_progress(&entry_path, &dest_path, progress)?;
             }
         }
         Ok(())
     }
 
-    pub fn autocomplete_path(input: &str) -> Option<String> {
-        let path = Path::new(input);
-        
-        let (search_dir, prefix) = if input.ends_with('/') || input.ends_with('\\') || input.is_empty() {
-            let dir = if input.is_empty() {
-                Path::new(".")
-            } else {
-                path
-            };
-            (dir, "")
-        } else {
-            let parent = path.parent().unwrap_or_else(|| Path::new("."));
-            let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            (parent, file_name)
-        };
+    // Copia en bloques de 64KB actualizando el progreso por chunk para que la barra no se trabe
+    fn copy_file_with_progress(
+        src: &Path,
+        dest: &Path,
+        progress: &Arc<Mutex<Option<FileOperationProgress>>>,
+    ) -> std::io::Result<()> {
+        use std::fs::File;
+        use std::io::{Read, Write};
 
-        let search_dir_resolved = if search_dir.to_string_lossy().starts_with('~') {
-            if let Some(home) = dirs::home_dir() {
-                let stripped = search_dir.strip_prefix("~").unwrap_or(Path::new(""));
-                home.join(stripped)
-            } else {
-                search_dir.to_path_buf()
-            }
-        } else {
-            search_dir.to_path_buf()
-        };
+        let mut src_file = File::open(src)?;
+        let mut dest_file = File::create(dest)?;
+        let mut buffer = vec![0; 64 * 1024];
 
-        if let Ok(entries) = std::fs::read_dir(&search_dir_resolved) {
-            let mut matches = Vec::new();
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with(prefix) {
-                    matches.push((name, entry.path().is_dir()));
-                }
+        loop {
+            {
+                let p = progress.lock().unwrap();
+                if let Some(ref state) = *p
+                    && state.canceled {
+                        return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "Operation canceled by user"));
+                    }
             }
 
-            matches.sort_by(|a, b| a.0.cmp(&b.0));
+            let bytes_read = src_file.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            dest_file.write_all(&buffer[..bytes_read])?;
 
-            if !matches.is_empty() {
-                let longest_common = Self::longest_common_prefix(&matches.iter().map(|m| m.0.as_str()).collect::<Vec<&str>>());
-                if longest_common.len() > prefix.len() {
-                    let parent_str = search_dir.to_string_lossy();
-                    let parent_str = if parent_str == "." && !input.starts_with('.') {
-                        "".to_string()
-                    } else if parent_str.ends_with('/') || parent_str.ends_with('\\') {
-                        parent_str.into_owned()
-                    } else if parent_str.is_empty() {
-                        "".to_string()
-                    } else {
-                        format!("{}{}", parent_str, std::path::MAIN_SEPARATOR)
-                    };
-                    
-                    let mut completed = format!("{}{}", parent_str, longest_common);
-                    if matches.len() == 1 && matches[0].1 {
-                        completed.push(std::path::MAIN_SEPARATOR);
-                    }
-                    return Some(completed);
-                } else if matches.len() == 1 {
-                    let parent_str = search_dir.to_string_lossy();
-                    let parent_str = if parent_str == "." && !input.starts_with('.') {
-                        "".to_string()
-                    } else if parent_str.ends_with('/') || parent_str.ends_with('\\') {
-                        parent_str.into_owned()
-                    } else if parent_str.is_empty() {
-                        "".to_string()
-                    } else {
-                        format!("{}{}", parent_str, std::path::MAIN_SEPARATOR)
-                    };
-                    
-                    let mut completed = format!("{}{}", parent_str, matches[0].0);
-                    if matches[0].1 {
-                        completed.push(std::path::MAIN_SEPARATOR);
-                    }
-                    return Some(completed);
+            {
+                let mut p = progress.lock().unwrap();
+                if let Some(ref mut state) = *p {
+                    state.bytes_copied += bytes_read as u64;
                 }
             }
         }
-        None
+        Ok(())
     }
 
-    fn longest_common_prefix(strs: &[&str]) -> String {
-        if strs.is_empty() {
-            return String::new();
-        }
-        let first = strs[0];
-        let mut length = first.len();
-        for &s in &strs[1..] {
-            length = length.min(s.len());
-            let mut i = 0;
-            for (c1, c2) in first.chars().zip(s.chars()) {
-                if c1 != c2 {
-                    break;
+    fn get_total_size(paths: &[PathBuf]) -> u64 {
+        let mut total = 0;
+        for path in paths {
+            if path.is_file() {
+                if let Ok(meta) = std::fs::metadata(path) {
+                    total += meta.len();
                 }
-                i += 1;
+            } else if path.is_dir() {
+                total += Self::get_dir_size(path);
             }
-            length = length.min(i);
         }
-        first.chars().take(length).collect()
+        total
+    }
+
+    fn get_dir_size(dir: &Path) -> u64 {
+        let mut total = 0;
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        total += meta.len();
+                    }
+                } else if path.is_dir() {
+                    total += Self::get_dir_size(&path);
+                }
+            }
+        }
+        total
     }
 
     fn navigate_page_up(&mut self) {
@@ -2043,27 +2866,6 @@ impl App {
             AppScreen::Queue => {
                 if self.queue_items_len() > 0 {
                     self.queue_selected_index = self.queue_selected_index.saturating_sub(10);
-                }
-            }
-            AppScreen::Collections => {
-                match self.collections_focused_pane {
-                    PaneType::Directories => {
-                        let count = self.collections.collections.len();
-                        if count > 0 {
-                            self.selected_collection_index = self.selected_collection_index.saturating_sub(10);
-                        }
-                    }
-                    PaneType::Files => {
-                        let coll_names: Vec<&String> = self.collections.collections.keys().collect();
-                        if let Some(&name) = coll_names.get(self.selected_collection_index) {
-                            if let Some(files) = self.collections.collections.get(name) {
-                                if !files.is_empty() {
-                                    self.active_collection_file_index = self.active_collection_file_index.saturating_sub(10);
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
                 }
             }
         }
@@ -2080,26 +2882,38 @@ impl App {
                     self.queue_selected_index = (self.queue_selected_index + 10).min(len.saturating_sub(1));
                 }
             }
-            AppScreen::Collections => {
-                match self.collections_focused_pane {
-                    PaneType::Directories => {
-                        let count = self.collections.collections.len();
-                        if count > 0 {
-                            self.selected_collection_index = (self.selected_collection_index + 10).min(count.saturating_sub(1));
-                        }
-                    }
-                    PaneType::Files => {
-                        let coll_names: Vec<&String> = self.collections.collections.keys().collect();
-                        if let Some(&name) = coll_names.get(self.selected_collection_index) {
-                            if let Some(files) = self.collections.collections.get(name) {
-                                let len = files.len();
-                                if len > 0 {
-                                    self.active_collection_file_index = (self.active_collection_file_index + 10).min(len.saturating_sub(1));
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
+        }
+    }
+
+    fn navigate_home(&mut self) {
+        match self.screen {
+            AppScreen::Browser => {
+                if !self.browser.files.is_empty() {
+                    self.browser.file_index = 0;
+                }
+            }
+            AppScreen::Queue => {
+                let filtered = self.get_filtered_queue_indices();
+                if !filtered.is_empty() {
+                    self.queue_selected_index = 0;
+                    self.sync_queue_selection();
+                }
+            }
+        }
+    }
+
+    fn navigate_end(&mut self) {
+        match self.screen {
+            AppScreen::Browser => {
+                if !self.browser.files.is_empty() {
+                    self.browser.file_index = self.browser.files.len() - 1;
+                }
+            }
+            AppScreen::Queue => {
+                let filtered = self.get_filtered_queue_indices();
+                if !filtered.is_empty() {
+                    self.queue_selected_index = filtered.len() - 1;
+                    self.sync_queue_selection();
                 }
             }
         }
@@ -2108,8 +2922,8 @@ impl App {
     pub fn remove_queue_item(&mut self, index: usize) {
         if index < self.queue.items.len() {
             self.queue.items.remove(index);
-            
-            // Adjust current_index if necessary
+
+            // Ajustamos current_index si apuntaba al item borrado o a uno posterior
             if let Some(curr) = self.queue.current_index {
                 if curr == index {
                     self.audio.stop();
@@ -2118,8 +2932,7 @@ impl App {
                     self.queue.current_index = Some(curr - 1);
                 }
             }
-            
-            // Adjust shuffle indices
+
             self.queue.shuffle_items();
             self.sync_queue_selection();
         }
@@ -2129,8 +2942,7 @@ impl App {
         let filtered = self.get_filtered_queue_indices();
         if let Some(&(_, original_idx)) = filtered.get(self.queue_selected_index) {
             self.remove_queue_item(original_idx);
-            
-            // Bound check queue_selected_index
+
             let new_len = self.get_filtered_queue_indices().len();
             if new_len == 0 {
                 self.queue_selected_index = 0;
@@ -2146,26 +2958,23 @@ impl App {
             if up {
                 if original_idx > 0 {
                     self.queue.items.swap(original_idx, original_idx - 1);
-                    // Update current_index
+                    // Ojo: hay que actualizar current_index si el swap afectó el track en reproducción
                     if self.queue.current_index == Some(original_idx) {
                         self.queue.current_index = Some(original_idx - 1);
                     } else if self.queue.current_index == Some(original_idx - 1) {
                         self.queue.current_index = Some(original_idx);
                     }
-                    // Adjust selected index
                     self.queue_selected_index = self.queue_selected_index.saturating_sub(1);
                     self.queue.shuffle_items();
                 }
             } else {
                 if original_idx + 1 < self.queue.items.len() {
                     self.queue.items.swap(original_idx, original_idx + 1);
-                    // Update current_index
                     if self.queue.current_index == Some(original_idx) {
                         self.queue.current_index = Some(original_idx + 1);
                     } else if self.queue.current_index == Some(original_idx + 1) {
                         self.queue.current_index = Some(original_idx);
                     }
-                    // Adjust selected index
                     let max_len = self.get_filtered_queue_indices().len();
                     self.queue_selected_index = (self.queue_selected_index + 1).min(max_len.saturating_sub(1));
                     self.queue.shuffle_items();
@@ -2185,30 +2994,26 @@ mod tests {
         let (tx, _rx) = channel();
         let mut app = App::new(tx, None, None);
 
-        // Clear queue and add dummy tracks
         app.queue.clear();
         app.queue.add(PathBuf::from("dance_electronic.mp3"));
         app.queue.add(PathBuf::from("ambient_chill.wav"));
         app.queue.add(PathBuf::from("rock_classic.flac"));
 
-        // By default, no search active, filtered indices should show all 3 items
         let indices = app.get_filtered_queue_indices();
         assert_eq!(indices.len(), 3);
         assert_eq!(indices[0], (0, 0));
         assert_eq!(indices[1], (1, 1));
         assert_eq!(indices[2], (2, 2));
 
-        // Activate search and set query
         app.search.active = true;
         app.search.query = "classic".to_string();
 
         let indices = app.get_filtered_queue_indices();
         assert_eq!(indices.len(), 1);
-        assert_eq!(indices[0].0, 2); // base_display_idx is 2
-        assert_eq!(indices[0].1, 2); // original index is 2
+        assert_eq!(indices[0].0, 2);
+        assert_eq!(indices[0].1, 2);
         assert_eq!(app.queue_items_len(), 1);
 
-        // Test lowercase matching
         app.search.query = "CHILL".to_string();
         let indices = app.get_filtered_queue_indices();
         assert_eq!(indices.len(), 1);
@@ -2216,27 +3021,19 @@ mod tests {
         assert_eq!(indices[0].1, 1);
         assert_eq!(app.queue_items_len(), 1);
 
-        // Test non-matching query
         app.search.query = "pop".to_string();
         assert_eq!(app.queue_items_len(), 0);
 
-        // Test shuffle interaction
         app.search.query = "electronic".to_string();
-        app.queue.shuffle_indices = vec![2, 0, 1]; // shuffled order
+        app.queue.shuffle_indices = vec![2, 0, 1];
         {
             let mut state = app.audio.shared_state.lock().unwrap();
             state.shuffle = true;
         }
 
-        // Under shuffle, the visual order is shuffle_indices.
-        // Index 0 in visual order is 2 (rock_classic.flac)
-        // Index 1 in visual order is 0 (dance_electronic.mp3)
-        // Index 2 in visual order is 1 (ambient_chill.wav)
-        // Since query is "electronic", it matches index 0 (dance_electronic.mp3).
-        // Therefore, it should match the 2nd visual item (base_idx = 1) whose original index is 0.
         let indices = app.get_filtered_queue_indices();
         assert_eq!(indices.len(), 1);
-        assert_eq!(indices[0], (1, 0)); // (base_idx 1, orig_idx 0)
+        assert_eq!(indices[0], (1, 0));
     }
 
     #[test]
@@ -2246,48 +3043,41 @@ mod tests {
             .unwrap()
             .join("target")
             .join("test_stash_rename");
-        
+
         if test_root.exists() {
             let _ = std::fs::remove_dir_all(&test_root);
         }
         std::fs::create_dir_all(&test_root).unwrap();
-        
+
         let file_path = test_root.join("test_file.mp3");
         std::fs::File::create(&file_path).unwrap();
 
         let mut app = App::new(tx, Some(test_root.clone()), None);
 
-        // Focus on files pane
         app.browser.focused_pane = PaneType::Files;
         app.browser.file_index = 0;
 
-        // Trigger rename with F2
         app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-        
+
         assert_eq!(app.input_mode, InputMode::Rename);
         assert_eq!(app.input_value, "test_file.mp3");
         assert_eq!(app.rename_target, Some(file_path.clone()));
 
-        // Simulate typing new name
         app.input_value = "renamed_file.mp3".to_string();
 
-        // Press Enter to confirm rename
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert_eq!(app.input_mode, InputMode::Normal);
         assert!(app.input_value.is_empty());
         assert_eq!(app.rename_target, None);
 
-        // Verify filesystem change
         assert!(!file_path.exists());
         let new_file_path = test_root.join("renamed_file.mp3");
         assert!(new_file_path.exists());
 
-        // Verify browser updated files list
         assert_eq!(app.browser.files.len(), 1);
         assert_eq!(app.browser.files[0].name, "renamed_file.mp3");
 
-        // Clean up
         let _ = std::fs::remove_dir_all(&test_root);
     }
 
@@ -2297,7 +3087,7 @@ mod tests {
             .unwrap()
             .join("target")
             .join("test_stash_find_cover_art");
-        
+
         if test_root.exists() {
             let _ = std::fs::remove_dir_all(&test_root);
         }
@@ -2324,7 +3114,7 @@ mod tests {
             .unwrap()
             .join("target")
             .join("test_stash_image_preview");
-        
+
         if test_root.exists() {
             let _ = std::fs::remove_dir_all(&test_root);
         }
@@ -2335,42 +3125,17 @@ mod tests {
 
         let mut app = App::new(tx, Some(test_root.clone()), None);
 
-        // Make sure it loads the files list
         assert_eq!(app.browser.files.len(), 1);
         assert_eq!(app.browser.files[0].name, "test_image.png");
 
-        // Focus on files pane
         app.browser.focused_pane = PaneType::Files;
         app.browser.file_index = 0;
 
-        // Verify matches_image_extension is true
         assert!(matches_image_extension(&image_path));
 
-        // Simulating Tab press to move focus to Preview pane
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.browser.focused_pane, PaneType::Preview);
 
-        // Under Preview focus, simulate panning up / down / left / right
-        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.image_offset_y, -10);
-
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(app.image_offset_y, 0);
-
-        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        assert_eq!(app.image_offset_x, -10);
-
-        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        assert_eq!(app.image_offset_x, 0);
-
-        // Simulate zoom in / out
-        app.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
-        assert_eq!(app.image_zoom, 1.25);
-
-        app.handle_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
-        assert_eq!(app.image_zoom, 1.0);
-
-        // Simulate BackTab (Shift+Tab) to focus back to Files pane
         app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
         assert_eq!(app.browser.focused_pane, PaneType::Files);
 
@@ -2384,7 +3149,7 @@ mod tests {
             .unwrap()
             .join("target")
             .join("test_stash_text_preview");
-        
+
         if test_root.exists() {
             let _ = std::fs::remove_dir_all(&test_root);
         }
@@ -2395,23 +3160,18 @@ mod tests {
 
         let mut app = App::new(tx, Some(test_root.clone()), None);
 
-        // Make sure it loads the files list
         assert_eq!(app.browser.files.len(), 1);
         assert_eq!(app.browser.files[0].name, "test_code.rs");
 
-        // Focus on files pane
         app.browser.focused_pane = PaneType::Files;
         app.browser.file_index = 0;
 
-        // Verify matches_text_extension is true
         assert!(matches_text_extension(&text_path));
         assert!(matches_text_extension(std::path::Path::new("app.desktop")));
 
-        // Simulating Tab press to move focus to Preview pane
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.browser.focused_pane, PaneType::Preview);
 
-        // Under Preview focus, simulate scrolling down / up / page down / page up
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.text_scroll_offset, 1);
 
@@ -2424,14 +3184,12 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
         assert_eq!(app.text_scroll_offset, 0);
 
-        // PageDown/PageUp scrolling
         app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
         assert_eq!(app.text_scroll_offset, 10);
 
         app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
         assert_eq!(app.text_scroll_offset, 0);
 
-        // Simulate BackTab (Shift+Tab) to focus back to Files pane
         app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
         assert_eq!(app.browser.focused_pane, PaneType::Files);
 
@@ -2445,7 +3203,7 @@ mod tests {
             .unwrap()
             .join("target")
             .join("test_stash_autocomplete");
-        
+
         if test_root.exists() {
             let _ = std::fs::remove_dir_all(&test_root);
         }
@@ -2456,19 +3214,16 @@ mod tests {
         std::fs::create_dir_all(&src_dir).unwrap();
         std::fs::write(src_dir.join("file.txt"), "hello").unwrap();
 
-        // 1. Autocomplete test
         let completed = App::autocomplete_path(&test_root.join("src_fo").to_string_lossy());
         assert!(completed.is_some());
         let val = completed.unwrap();
         assert!(val.contains("src_folder"));
 
-        // 2. Folder copying test
         let mut app = App::new(tx, Some(test_root.clone()), None);
         app.browser.selected_paths.insert(src_dir.clone());
 
         app.start_file_operation(dest_dir.clone(), false);
 
-        // Wait a tiny bit for the worker thread to finish
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let copied_folder = dest_dir.join("src_folder");
@@ -2485,62 +3240,53 @@ mod tests {
             .unwrap()
             .join("target")
             .join("test_stash_last_dest");
-        
+
         if test_root.exists() {
             let _ = std::fs::remove_dir_all(&test_root);
         }
         std::fs::create_dir_all(&test_root).unwrap();
-        
+
         let file_path = test_root.join("some_file.txt");
         std::fs::write(&file_path, "hello").unwrap();
 
         let mut app = App::new(tx, Some(test_root.clone()), None);
         app.browser.focused_pane = PaneType::Files;
         app.browser.file_index = 0;
-        
-        // select files
+
         app.browser.selected_paths.insert(file_path.clone());
-        
-        // Assert starts empty
+
         assert_eq!(app.last_operation_dest, "");
-        
-        // press 'v' (copy)
+
         app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
         assert_eq!(app.input_mode, InputMode::CopyPath);
-        assert_eq!(app.input_value, "");
-        
-        // simulate typing a destination path (we can use target/test_stash_last_dest/dest_v)
+        assert!(app.dest_browser.is_some());
+
         let dest_v = test_root.join("dest_v");
-        app.input_value = dest_v.to_string_lossy().into_owned();
-        
-        // press Enter to confirm
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        
-        // should remember last operation dest
+        app.dest_browser.as_mut().unwrap().current_dir = dest_v.clone();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
         assert_eq!(app.last_operation_dest, dest_v.to_string_lossy());
-        
-        // Wait a tiny bit for the worker thread to finish
+
         std::thread::sleep(std::time::Duration::from_millis(100));
-        
-        // Dismiss progress
+
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        
-        // now select again and press 'y' (move)
+
         app.browser.selected_paths.insert(file_path.clone());
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         assert_eq!(app.input_mode, InputMode::MovePath);
-        
-        // input_value should have pre-populated with last_operation_dest
-        assert_eq!(app.input_value, dest_v.to_string_lossy());
-        
-        // change it to target/test_stash_last_dest/dest_y
+
+        assert_eq!(
+            app.dest_browser.as_ref().unwrap().current_dir,
+            PathBuf::from(&app.last_operation_dest)
+        );
+
         let dest_y = test_root.join("dest_y");
-        app.input_value = dest_y.to_string_lossy().into_owned();
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        
+        app.dest_browser.as_mut().unwrap().current_dir = dest_y.clone();
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
         assert_eq!(app.last_operation_dest, dest_y.to_string_lossy());
-        
+
         let _ = std::fs::remove_dir_all(&test_root);
     }
 }
-

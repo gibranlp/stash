@@ -15,13 +15,14 @@ pub enum Event {
     MediaSetPosition(std::time::Duration),
 }
 
+// Aquí arrancamos dos hilos: uno que jala eventos del teclado/paste y otro
+// que manda un Tick cada 50ms pa que la UI se mantenga viva
 pub fn spawn_event_handler(tx: std::sync::mpsc::Sender<Event>) {
-    // Input thread
     let input_tx = tx.clone();
     thread::spawn(move || {
         loop {
-            if let Ok(has_event) = event::poll(Duration::from_millis(50)) {
-                if has_event {
+            if let Ok(has_event) = event::poll(Duration::from_millis(50))
+                && has_event {
                     match event::read() {
                         Ok(CrossEvent::Key(key_event)) => {
                             let _ = input_tx.send(Event::Key(key_event));
@@ -32,11 +33,9 @@ pub fn spawn_event_handler(tx: std::sync::mpsc::Sender<Event>) {
                         _ => {}
                     }
                 }
-            }
         }
     });
 
-    // Tick thread
     let tick_tx = tx;
     thread::spawn(move || {
         loop {

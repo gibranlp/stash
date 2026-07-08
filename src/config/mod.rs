@@ -19,6 +19,9 @@ pub struct AppConfig {
     pub visualizer_mode: VisualizerMode,
     #[serde(default = "default_visualizer_decay")]
     pub visualizer_decay: f32,
+    // ID de la app de Discord para el Rich Presence — si no lo pones, no hay status
+    #[serde(default)]
+    pub discord_app_id: Option<u64>,
 }
 
 fn default_visualizer_decay() -> f32 {
@@ -37,21 +40,20 @@ impl Default for AppConfig {
             repeat: RepeatMode::Off,
             visualizer_mode: VisualizerMode::Spectrum,
             visualizer_decay: 0.70,
+            discord_app_id: None,
         }
     }
 }
 
 impl AppConfig {
+    // Intentamos cargar el config del disco; si algo falla o no existe, jalamos el default y lo guardamos
     pub fn load() -> Self {
-        if let Some(path) = Self::config_file_path() {
-            if path.exists() {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    if let Ok(config) = serde_json::from_str::<AppConfig>(&content) {
+        if let Some(path) = Self::config_file_path()
+            && path.exists()
+                && let Ok(content) = fs::read_to_string(&path)
+                    && let Ok(config) = serde_json::from_str::<AppConfig>(&content) {
                         return config;
                     }
-                }
-            }
-        }
         let default_config = Self::default();
         let _ = default_config.save();
         default_config
@@ -73,11 +75,11 @@ impl AppConfig {
     }
 }
 
+// Expande el "~/" al home del usuario — sin esto las rutas del config quedan chuecas
 pub fn resolve_path(path_str: &str) -> PathBuf {
-    if path_str.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
+    if path_str.starts_with("~/")
+        && let Some(home) = dirs::home_dir() {
             return home.join(&path_str[2..]);
         }
-    }
     PathBuf::from(path_str)
 }
