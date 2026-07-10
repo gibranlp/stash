@@ -22,6 +22,8 @@ pub struct AppConfig {
     // ID de la app de Discord para el Rich Presence — si no lo pones, no hay status
     #[serde(default)]
     pub discord_app_id: Option<u64>,
+    #[serde(default)]
+    pub acoustid_api_key: Option<String>,
 }
 
 fn default_visualizer_decay() -> f32 {
@@ -41,6 +43,7 @@ impl Default for AppConfig {
             visualizer_mode: VisualizerMode::Spectrum,
             visualizer_decay: 0.70,
             discord_app_id: None,
+            acoustid_api_key: None,
         }
     }
 }
@@ -72,6 +75,25 @@ impl AppConfig {
 
     pub fn config_file_path() -> Option<PathBuf> {
         dirs::config_dir().map(|p| p.join("stash").join("config.json"))
+    }
+
+    pub fn add_music_folder(&mut self, path: &PathBuf) -> bool {
+        let canonical = path.to_string_lossy().into_owned();
+        let already = self.music_folders.iter().any(|f| resolve_path(f) == *path);
+        if !already {
+            self.music_folders.push(canonical);
+            let _ = self.save();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn remove_music_folder_at(&mut self, index: usize) {
+        if index < self.music_folders.len() {
+            self.music_folders.remove(index);
+            let _ = self.save();
+        }
     }
 }
 

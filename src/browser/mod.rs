@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 use crate::models::FileItem;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,21 +121,8 @@ impl BrowserState {
             let file = &self.files[idx];
             let path = file.path.clone();
             if file.is_dir {
-                // Si es carpeta, jalamos todos los archivos de adentro con WalkDir
                 if target_state {
                     self.selected_paths.insert(path.clone());
-                    for entry in WalkDir::new(&path)
-                        .into_iter()
-                        .filter_entry(|e| {
-                            self.show_hidden || !e.file_name().to_string_lossy().starts_with('.')
-                        })
-                        .flatten()
-                    {
-                        let p = entry.path().to_path_buf();
-                        if p.is_file() {
-                            self.selected_paths.insert(p);
-                        }
-                    }
                 } else {
                     self.selected_paths.remove(&path);
                     self.selected_paths.retain(|p| !p.starts_with(&path));
@@ -161,42 +147,23 @@ impl BrowserState {
             return;
         }
         let folder_path = self.files[idx].path.clone();
-        let folder_selected = self.selected_paths.contains(&folder_path);
-        let files_selected = self.selected_paths
-            .iter()
-            .any(|p| p != &folder_path && p.starts_with(&folder_path));
+        let already_selected = self.selected_paths.contains(&folder_path)
+            || self.selected_paths.iter().any(|p| p != &folder_path && p.starts_with(&folder_path));
 
-        if !folder_selected && !files_selected {
-            self.selected_paths.insert(folder_path.clone());
-            self.files[idx].is_selected = true;
-            for entry in WalkDir::new(&folder_path)
-                .into_iter()
-                .filter_entry(|e| {
-                    self.show_hidden || !e.file_name().to_string_lossy().starts_with('.')
-                })
-                .flatten()
-            {
-                let p = entry.path().to_path_buf();
-                if p.is_file() {
-                    self.selected_paths.insert(p);
-                }
-            }
-            for file in &mut self.files {
-                if !file.is_dir && file.path.starts_with(&folder_path) {
-                    file.is_selected = true;
-                }
-            }
-        } else if folder_selected {
+        if already_selected {
+            // Deselect folder and any individually-selected children
             self.selected_paths.remove(&folder_path);
-            self.files[idx].is_selected = false;
-        } else {
-            // Los archivos están seleccionados pero la carpeta no — limpiamos todo
             self.selected_paths.retain(|p| !p.starts_with(&folder_path));
+            self.files[idx].is_selected = false;
             for file in &mut self.files {
                 if file.path.starts_with(&folder_path) {
                     file.is_selected = false;
                 }
             }
+        } else {
+            // Select only the folder itself — operations expand contents recursively as needed
+            self.selected_paths.insert(folder_path.clone());
+            self.files[idx].is_selected = true;
         }
     }
 

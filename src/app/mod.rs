@@ -8,9 +8,16 @@ use crate::collections::Collections;
 use crate::config::{AppConfig, resolve_path};
 use crate::discord::DiscordPresence;
 use crate::events::Event;
+use crate::library::{LibraryState, LibraryPanel, LibraryTrack, ScanState, TagEditorState, write_tags, is_smart_playlist};
 use crate::models::{PlaybackStatus, RepeatMode, VisualizerMode};
 use crate::queue::PlaybackQueue;
 use crate::search::{SearchState, matches_audio_extension, matches_image_extension, matches_text_extension};
+use crate::stats::{ListenStats, StatsTracking, unix_ts_secs};
+use crate::healer::{HealerState, HealerScreen, HealScanState, HealLookupState, HealStatus};
+use crate::healer::backup::BackupStore;
+use crate::healer::pipeline;
+use crate::healer::musicbrainz;
+use crate::healer::fingerprint;
 use ratatui::widgets::ListState;
 use lofty::prelude::*;
 use lofty::probe::Probe;
@@ -22,6 +29,8 @@ type LoadingTextSlot  = Arc<Mutex<Option<(PathBuf, Option<Vec<String>>)>>>;
 pub enum AppScreen {
     Browser,
     Queue,
+    Library,
+    Healer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,7 +99,7 @@ impl DestBrowserState {
     // Navega a un directorio en background para no trancar el hilo principal
     pub fn navigate_to(&mut self, dir: PathBuf) {
         self.current_dir = dir.clone();
-        self.dir_index = 0;
+        self.dir_index = 1; // 0 = "Copy here" virtual entry, 1 = first real subdir
         self.dir_scroll = 0;
         self.loading = true;
         let slot: Arc<Mutex<Option<Vec<PathBuf>>>> = Arc::new(Mutex::new(None));
@@ -110,8 +119,12 @@ impl DestBrowserState {
             self.dirs = dirs;
             self.loading = false;
             self.pending_dirs = None;
-            if self.dir_index >= self.dirs.len() {
-                self.dir_index = self.dirs.len().saturating_sub(1);
+            // dir_index 0 = "Copy here", 1..=dirs.len() = actual subdirs
+            if self.dir_index > self.dirs.len() {
+                self.dir_index = self.dirs.len(); // clamp to last real dir
+            }
+            if self.dirs.is_empty() {
+                self.dir_index = 0; // no subdirs — default to "Copy here"
             }
             true
         } else {
@@ -120,8 +133,9 @@ impl DestBrowserState {
     }
 
     pub fn enter_highlighted(&mut self) {
-        if !self.dirs.is_empty() {
-            let target = self.dirs[self.dir_index].clone();
+        // dir_index 0 = "Copy here" virtual entry; real dirs are at 1..=dirs.len()
+        if self.dir_index > 0 && !self.dirs.is_empty() {
+            let target = self.dirs[self.dir_index - 1].clone();
             self.navigate_to(target);
         }
     }
@@ -142,7 +156,8 @@ impl DestBrowserState {
     }
 
     pub fn move_down(&mut self) {
-        if self.dir_index + 1 < self.dirs.len() {
+        // Allow moving through 0 (Copy here) up to dirs.len() (last real subdir)
+        if self.dir_index < self.dirs.len() {
             self.dir_index += 1;
         }
         self.clamp_scroll(10);
@@ -168,6 +183,9 @@ pub enum InputMode {
     ConfirmDelete,
     Rename,
     CreateFolder,
+    TagEdit,
+    ConfirmDeletePlaylist,
+    ManageMusicFolders,
 }
 
 #[derive(Debug, Clone)]
@@ -200,13 +218,13 @@ pub struct App {
     pub input_value: String,
     pub input_cursor: usize,
     pub show_help: bool,
+    pub help_scroll: u16,
     pub should_quit: bool,
     pub selected_add_collection_index: usize,
     pub queue_selected_index: usize,
     pub file_progress: Arc<Mutex<Option<FileOperationProgress>>>,
     pub files_list_state: ListState,
     pub queue_list_state: ListState,
-    pub add_coll_list_state: ListState,
     pub media_controls: Option<souvlaki::MediaControls>,
     pub last_media_status: Option<PlaybackStatus>,
     pub last_media_track: Option<PathBuf>,
@@ -237,6 +255,18 @@ pub struct App {
     pub external_drives: Vec<PathBuf>,
     pub dest_browser: Option<DestBrowserState>,
     pub conflict_condvar: Arc<Condvar>,
+    pub library: LibraryState,
+    pub pending_delete_playlist: Option<String>,
+    pub library_pending_add_paths: Vec<PathBuf>,
+    pub add_coll_creating: bool, // true = "New playlist" sub-input is active in the popup
+    pub update: crate::updater::UpdateSlot,
+    pub manage_folders_index: usize,
+    pub notification: Option<(String, u8)>,  // (message, ticks_remaining at 50ms each)
+    pub library_track_list_state: ListState,
+    pub stats: ListenStats,
+    pub stats_tracking: StatsTracking,
+    pub healer: HealerState,
+    pub healer_backup: BackupStore,
 }
 
 // Escanea interfaces USB buscando dispositivos MTP (clase 06 = Still Image / MTP)
@@ -465,13 +495,13 @@ impl App {
             input_value: String::new(),
             input_cursor: 0,
             show_help: false,
+            help_scroll: 0,
             should_quit: false,
             selected_add_collection_index: 0,
             queue_selected_index: 0,
             file_progress: Arc::new(Mutex::new(None)),
             files_list_state: ListState::default(),
             queue_list_state: ListState::default(),
-            add_coll_list_state: ListState::default(),
             media_controls,
             last_media_status: None,
             last_media_track: None,
@@ -502,6 +532,22 @@ impl App {
             external_drives: scan_external_drives(),
             dest_browser: None,
             conflict_condvar: Arc::new(Condvar::new()),
+            library: LibraryState::new(),
+            pending_delete_playlist: None,
+            library_pending_add_paths: Vec::new(),
+            add_coll_creating: false,
+            update: {
+                let slot = crate::updater::new_slot();
+                crate::updater::spawn_check(slot.clone());
+                slot
+            },
+            manage_folders_index: 0,
+            notification: None,
+            library_track_list_state: ListState::default(),
+            stats: ListenStats::load(),
+            stats_tracking: StatsTracking::default(),
+            healer: HealerState::new(),
+            healer_backup: BackupStore::load(),
         }
     }
 
@@ -617,6 +663,13 @@ impl App {
             Event::Key(key) => self.handle_key(key),
             Event::Paste(content) => self.handle_paste(content),
             Event::Tick => {
+                if let Some((_, ref mut ticks)) = self.notification {
+                    if *ticks == 0 {
+                        self.notification = None;
+                    } else {
+                        *ticks -= 1;
+                    }
+                }
                 if let Some(ref mut db) = self.dest_browser {
                     db.poll_pending();
                 }
@@ -761,6 +814,45 @@ impl App {
                 }
 
                 self.update_media_controls();
+
+                if self.library.scan_state == ScanState::Scanning {
+                    self.library.poll_scan();
+                }
+                if self.healer.scan_state == HealScanState::Scanning {
+                    self.healer.poll_scan();
+                }
+                if self.healer.lookup_state == HealLookupState::Searching {
+                    self.healer.poll_lookup();
+                }
+
+                // Detect track changes to record play/skip stats
+                let (new_track, new_elapsed, new_duration) = {
+                    let state = self.audio.shared_state.lock().unwrap();
+                    (state.current_track.clone(), state.elapsed_secs, state.duration_secs)
+                };
+                if new_track != self.stats_tracking.current_track {
+                    if let Some(ref old_path) = self.stats_tracking.current_track.clone() {
+                        let elapsed = self.stats_tracking.last_elapsed;
+                        let duration = self.stats_tracking.last_duration;
+                        if self.stats_tracking.natural_finish || (duration > 0 && elapsed * 10 >= duration * 8) {
+                            self.stats.record_play(old_path, elapsed);
+                        } else if elapsed >= 5 {
+                            self.stats.record_skip(old_path, elapsed);
+                        }
+                        self.stats_tracking.session_listen_secs += elapsed;
+                        let _ = self.stats.save();
+                    }
+                    if new_track.is_some() {
+                        if self.stats_tracking.session_start_ts == 0 {
+                            self.stats_tracking.session_start_ts = unix_ts_secs();
+                        }
+                        self.stats_tracking.session_tracks += 1;
+                    }
+                    self.stats_tracking.current_track = new_track;
+                    self.stats_tracking.natural_finish = false;
+                }
+                self.stats_tracking.last_elapsed = new_elapsed;
+                self.stats_tracking.last_duration = new_duration;
             }
             Event::AudioFinished => {
                 self.handle_audio_finished();
@@ -769,23 +861,37 @@ impl App {
                 self.toggle_playback();
             }
             Event::MediaNext => {
-                let shuffle = {
-                    let state = self.audio.shared_state.lock().unwrap();
-                    state.shuffle
-                };
-                if let Some(next_path) = self.queue.next(shuffle) {
-                    self.audio.play(next_path);
-                    self.sync_queue_selection();
+                if self.is_queue_search_active() {
+                    if let Some(next_path) = self.next_search_result() {
+                        self.audio.play(next_path);
+                        self.sync_queue_selection();
+                    }
+                } else {
+                    let shuffle = {
+                        let state = self.audio.shared_state.lock().unwrap();
+                        state.shuffle
+                    };
+                    if let Some(next_path) = self.queue.next(shuffle) {
+                        self.audio.play(next_path);
+                        self.sync_queue_selection();
+                    }
                 }
             }
             Event::MediaPrev => {
-                let shuffle = {
-                    let state = self.audio.shared_state.lock().unwrap();
-                    state.shuffle
-                };
-                if let Some(prev_path) = self.queue.prev(shuffle) {
-                    self.audio.play(prev_path);
-                    self.sync_queue_selection();
+                if self.is_queue_search_active() {
+                    if let Some(prev_path) = self.prev_search_result() {
+                        self.audio.play(prev_path);
+                        self.sync_queue_selection();
+                    }
+                } else {
+                    let shuffle = {
+                        let state = self.audio.shared_state.lock().unwrap();
+                        state.shuffle
+                    };
+                    if let Some(prev_path) = self.queue.prev(shuffle) {
+                        self.audio.play(prev_path);
+                        self.sync_queue_selection();
+                    }
                 }
             }
             Event::MediaSeek(direction, duration) => {
@@ -803,10 +909,14 @@ impl App {
     }
 
     fn handle_audio_finished(&mut self) {
+        self.stats_tracking.natural_finish = true;
+
         let (repeat, shuffle) = {
             let state = self.audio.shared_state.lock().unwrap();
             (state.repeat, state.shuffle)
         };
+
+        let search_active = self.is_queue_search_active();
 
         match repeat {
             RepeatMode::One => {
@@ -815,7 +925,18 @@ impl App {
                 }
             }
             RepeatMode::All => {
-                if let Some(next_path) = self.queue.next(shuffle) {
+                if search_active {
+                    if let Some(next_path) = self.next_search_result() {
+                        self.audio.play(next_path);
+                        self.sync_queue_selection();
+                    } else {
+                        self.queue.current_index = None;
+                        if let Some(next_path) = self.next_search_result() {
+                            self.audio.play(next_path);
+                            self.sync_queue_selection();
+                        }
+                    }
+                } else if let Some(next_path) = self.queue.next(shuffle) {
                     self.audio.play(next_path);
                     self.sync_queue_selection();
                 } else {
@@ -830,7 +951,12 @@ impl App {
                 }
             }
             RepeatMode::Off => {
-                if let Some(next_path) = self.queue.next(shuffle) {
+                if search_active {
+                    if let Some(next_path) = self.next_search_result() {
+                        self.audio.play(next_path);
+                        self.sync_queue_selection();
+                    }
+                } else if let Some(next_path) = self.queue.next(shuffle) {
                     self.audio.play(next_path);
                     self.sync_queue_selection();
                 }
@@ -840,12 +966,14 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.save_session_on_quit();
             self.should_quit = true;
             return;
         }
 
         if self.input_mode == InputMode::Normal
             && key.code == KeyCode::Char('q') {
+                self.save_session_on_quit();
                 self.should_quit = true;
                 return;
             }
@@ -891,7 +1019,24 @@ impl App {
         }
 
         if self.show_help {
-            self.show_help = false;
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.help_scroll = self.help_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    self.help_scroll = self.help_scroll.saturating_sub(10);
+                }
+                KeyCode::PageDown => {
+                    self.help_scroll = self.help_scroll.saturating_add(10);
+                }
+                _ => {
+                    self.show_help = false;
+                    self.help_scroll = 0;
+                }
+            }
             return;
         }
 
@@ -905,10 +1050,68 @@ impl App {
             InputMode::ConfirmDelete => self.handle_confirm_delete_key(key),
             InputMode::Rename => self.handle_rename_key(key),
             InputMode::CreateFolder => self.handle_create_folder_key(key),
+            InputMode::TagEdit => self.handle_tag_edit_key(key),
+            InputMode::ConfirmDeletePlaylist => self.handle_confirm_delete_playlist_key(key),
+            InputMode::ManageMusicFolders => self.handle_manage_folders_key(key),
         }
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
+        // U triggers update from any screen when an update is available
+        if key.code == KeyCode::Char('U') && key.modifiers.is_empty() {
+            let state = self.update.lock().unwrap().clone();
+            if let crate::updater::UpdateProgress::Available { version, url } = state {
+                crate::updater::spawn_download(version, url, self.update.clone());
+                return;
+            }
+        }
+
+        // Number keys switch screens from anywhere
+        if key.modifiers.is_empty() {
+            match key.code {
+                KeyCode::Char('1') => {
+                    self.screen = AppScreen::Browser;
+                    self.search.active = false;
+                    self.search.query.clear();
+                    return;
+                }
+                KeyCode::Char('2') => {
+                    self.screen = AppScreen::Queue;
+                    self.search.active = false;
+                    self.search.query.clear();
+                    self.queue_selected_index = 0;
+                    self.sync_queue_selection();
+                    return;
+                }
+                KeyCode::Char('3') => {
+                    self.screen = AppScreen::Library;
+                    self.search.active = false;
+                    self.search.query.clear();
+                    if self.library.scan_state == ScanState::Idle {
+                        self.library.start_scan(&self.config.music_folders);
+                    }
+                    return;
+                }
+                KeyCode::Char('4') => {
+                    self.screen = AppScreen::Healer;
+                    self.search.active = false;
+                    self.search.query.clear();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if self.screen == AppScreen::Library {
+            self.handle_library_normal_key(key);
+            return;
+        }
+
+        if self.screen == AppScreen::Healer {
+            self.handle_healer_key(key);
+            return;
+        }
+
         // Cuando el foco está en el panel de preview de texto, las teclas de scroll se quedan aquí
         if self.screen == AppScreen::Browser && self.browser.focused_pane == PaneType::Preview {
             let is_txt = if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
@@ -1005,18 +1208,7 @@ impl App {
             }
             KeyCode::Char('?') => {
                 self.show_help = true;
-            }
-            KeyCode::Char('1') => {
-                self.screen = AppScreen::Browser;
-                self.search.active = false;
-                self.search.query.clear();
-            }
-            KeyCode::Char('2') => {
-                self.screen = AppScreen::Queue;
-                self.search.active = false;
-                self.search.query.clear();
-                self.queue_selected_index = 0;
-                self.sync_queue_selection();
+                self.help_scroll = 0;
             }
             KeyCode::Char('Q') => {
                 if self.screen == AppScreen::Queue {
@@ -1203,6 +1395,25 @@ impl App {
                     self.toggle_playback();
                 }
             }
+            KeyCode::Char('*') => {
+                if self.screen == AppScreen::Browser {
+                    let all_selected = !self.browser.files.is_empty()
+                        && self.browser.files.iter().all(|f| f.is_selected);
+                    if all_selected {
+                        self.browser.clear_selections();
+                    } else {
+                        let paths: Vec<PathBuf> = self.browser.files.iter()
+                            .map(|f| f.path.clone())
+                            .collect();
+                        for path in paths {
+                            self.browser.selected_paths.insert(path);
+                        }
+                        for file in &mut self.browser.files {
+                            file.is_selected = true;
+                        }
+                    }
+                }
+            }
             KeyCode::Char('p') | KeyCode::Char('P') => {
                 self.toggle_playback();
             }
@@ -1210,6 +1421,11 @@ impl App {
                 if self.screen == AppScreen::Browser {
                     self.input_mode = InputMode::CreateFolder;
                     self.input_clear();
+                } else if self.is_queue_search_active() {
+                    if let Some(next_path) = self.next_search_result() {
+                        self.audio.play(next_path);
+                        self.sync_queue_selection();
+                    }
                 } else {
                     let shuffle = {
                         let state = self.audio.shared_state.lock().unwrap();
@@ -1222,13 +1438,20 @@ impl App {
                 }
             }
             KeyCode::Char('b') => {
-                let shuffle = {
-                    let state = self.audio.shared_state.lock().unwrap();
-                    state.shuffle
-                };
-                if let Some(prev_path) = self.queue.prev(shuffle) {
-                    self.audio.play(prev_path);
-                    self.sync_queue_selection();
+                if self.is_queue_search_active() {
+                    if let Some(prev_path) = self.prev_search_result() {
+                        self.audio.play(prev_path);
+                        self.sync_queue_selection();
+                    }
+                } else {
+                    let shuffle = {
+                        let state = self.audio.shared_state.lock().unwrap();
+                        state.shuffle
+                    };
+                    if let Some(prev_path) = self.queue.prev(shuffle) {
+                        self.audio.play(prev_path);
+                        self.sync_queue_selection();
+                    }
                 }
             }
             KeyCode::Char('s') => {
@@ -1283,8 +1506,24 @@ impl App {
             }
             KeyCode::Char('q') => {
                 if !self.browser.selected_paths.is_empty() {
-                    let paths: Vec<PathBuf> = self.browser.selected_paths.iter().cloned().collect();
-                    self.queue.add_many(paths);
+                    let mut audio_paths: Vec<PathBuf> = Vec::new();
+                    for p in self.browser.selected_paths.iter() {
+                        if p.is_dir() {
+                            for entry in walkdir::WalkDir::new(p)
+                                .into_iter()
+                                .filter_entry(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                                .flatten()
+                            {
+                                if entry.file_type().is_file() && matches_audio_extension(entry.path()) {
+                                    audio_paths.push(entry.path().to_path_buf());
+                                }
+                            }
+                        } else if matches_audio_extension(p) {
+                            audio_paths.push(p.clone());
+                        }
+                    }
+                    audio_paths.sort();
+                    self.queue.add_many(audio_paths);
                     self.browser.clear_selections();
                 } else if self.screen == AppScreen::Browser {
                     match self.browser.focused_pane {
@@ -1322,6 +1561,69 @@ impl App {
                             }
                         }
                         PaneType::Preview => {}
+                    }
+                }
+            }
+
+            KeyCode::Char('a') => {
+                if self.screen == AppScreen::Browser {
+                    if !self.browser.selected_paths.is_empty() {
+                        // Expand any selected folders to audio file paths
+                        let mut audio_paths: Vec<PathBuf> = Vec::new();
+                        for p in self.browser.selected_paths.iter() {
+                            if p.is_dir() {
+                                for entry in walkdir::WalkDir::new(p)
+                                    .into_iter()
+                                    .filter_entry(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                                    .flatten()
+                                {
+                                    if entry.file_type().is_file() && matches_audio_extension(entry.path()) {
+                                        audio_paths.push(entry.path().to_path_buf());
+                                    }
+                                }
+                            } else if matches_audio_extension(p) {
+                                audio_paths.push(p.clone());
+                            }
+                        }
+                        audio_paths.sort();
+                        self.library_pending_add_paths = audio_paths;
+                        self.selected_add_collection_index = 0;
+                        self.input_mode = InputMode::AddToCollectionList;
+                    } else if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
+                        let (is_dir, item_path) = {
+                            let item = &self.browser.files[self.browser.file_index];
+                            (item.is_dir, item.path.clone())
+                        };
+                        if is_dir {
+                            let in_library = self.config.music_folders.iter().any(|f| {
+                                item_path.starts_with(resolve_path(f))
+                            });
+                            if !in_library {
+                                self.notification = Some(("Folder not in Library — press 'm' to add it first".to_string(), 80));
+                            } else {
+                                let mut paths: Vec<PathBuf> = Vec::new();
+                                for entry in walkdir::WalkDir::new(&item_path)
+                                    .into_iter()
+                                    .filter_entry(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                                    .flatten()
+                                {
+                                    let p = entry.path().to_path_buf();
+                                    if p.is_file() && matches_audio_extension(&p) {
+                                        paths.push(p);
+                                    }
+                                }
+                                if !paths.is_empty() {
+                                    paths.sort();
+                                    self.library_pending_add_paths = paths;
+                                    self.selected_add_collection_index = 0;
+                                    self.input_mode = InputMode::AddToCollectionList;
+                                }
+                            }
+                        } else if matches_audio_extension(&item_path) {
+                            self.library_pending_add_paths = vec![item_path];
+                            self.selected_add_collection_index = 0;
+                            self.input_mode = InputMode::AddToCollectionList;
+                        }
                     }
                 }
             }
@@ -1424,6 +1726,21 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('m') => {
+                if self.screen == AppScreen::Browser {
+                    if let Some(item) = self.browser.files.get(self.browser.file_index) {
+                        if item.is_dir {
+                            let path = item.path.clone();
+                            if self.config.add_music_folder(&path) {
+                                self.library.start_scan(&self.config.music_folders);
+                                self.notification = Some(("Added to Library — scanning now".to_string(), 50));
+                            } else {
+                                self.notification = Some(("Already in Library".to_string(), 50));
+                            }
+                        }
+                    }
+                }
+            }
             KeyCode::Char('M') => {
                 if self.screen == AppScreen::Browser {
                     self.jump_to_mtp();
@@ -1452,6 +1769,8 @@ impl App {
                     self.search.execute(&[root]);
                 } else if self.screen == AppScreen::Queue {
                     self.queue_selected_index = 0;
+                } else if self.screen == AppScreen::Library {
+                    self.library.track_index = 0;
                 }
             }
             KeyCode::Char(c) => {
@@ -1461,6 +1780,8 @@ impl App {
                     self.search.execute(&[root]);
                 } else if self.screen == AppScreen::Queue {
                     self.queue_selected_index = 0;
+                } else if self.screen == AppScreen::Library {
+                    self.library.track_index = 0;
                 }
             }
             _ => {}
@@ -1657,29 +1978,114 @@ impl App {
         }
     }
 
+    // Ensures any selected folders (or their parents) are indexed in the library.
+    // Called right before clearing selections after a playlist add.
+    fn ensure_selections_in_library(&mut self) {
+        // Prefer the original folder selections; fall back to parent dirs of audio files.
+        let mut folders: Vec<PathBuf> = self.browser.selected_paths.iter()
+            .filter(|p| p.is_dir())
+            .cloned()
+            .collect();
+
+        if folders.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            for p in &self.library_pending_add_paths {
+                if let Some(parent) = p.parent() {
+                    let parent = parent.to_path_buf();
+                    if seen.insert(parent.clone()) {
+                        folders.push(parent);
+                    }
+                }
+            }
+        }
+
+        let mut added = false;
+        for folder in folders {
+            if self.config.add_music_folder(&folder) {
+                added = true;
+            }
+        }
+        if added {
+            self.library.start_scan(&self.config.music_folders);
+            self.notification = Some(("Added to library — scanning now".to_string(), 60));
+        }
+    }
+
     fn handle_add_to_collection_list_key(&mut self, key: KeyEvent) {
-        let coll_names: Vec<&String> = self.collections.collections.keys().collect();
+        // While the "New playlist" inline input is active, handle text editing
+        if self.add_coll_creating {
+            match key.code {
+                KeyCode::Enter => {
+                    let name = self.input_value.trim().to_string();
+                    if !name.is_empty() {
+                        self.collections.create_collection(&name);
+                        self.ensure_selections_in_library();
+                        let paths = std::mem::take(&mut self.library_pending_add_paths);
+                        if !paths.is_empty() {
+                            self.collections.add_to_collection(&name, paths);
+                        }
+                        self.browser.clear_selections();
+                    }
+                    self.add_coll_creating = false;
+                    self.input_clear();
+                    self.input_mode = InputMode::Normal;
+                }
+                KeyCode::Esc => {
+                    self.add_coll_creating = false;
+                    self.input_clear();
+                }
+                KeyCode::Backspace => { self.input_delete_before_cursor(); }
+                KeyCode::Delete    => { self.input_delete_after_cursor(); }
+                KeyCode::Left      => { self.input_move_left(); }
+                KeyCode::Right     => { self.input_move_right(); }
+                KeyCode::Char(c)   => { self.input_insert_char(c); }
+                _ => {}
+            }
+            return;
+        }
+
+        // Index 0 = virtual "New playlist" entry; 1..=N = existing collections
+        let coll_names: Vec<String> = {
+            let mut v: Vec<String> = self.collections.collections.keys().cloned().collect();
+            v.sort();
+            v
+        };
+        let total = coll_names.len() + 1; // +1 for "New playlist"
+
         match key.code {
-            KeyCode::Up => {
-                if !coll_names.is_empty() && self.selected_add_collection_index > 0 {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.selected_add_collection_index > 0 {
                     self.selected_add_collection_index -= 1;
                 }
             }
-            KeyCode::Down => {
-                if !coll_names.is_empty() && self.selected_add_collection_index + 1 < coll_names.len() {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.selected_add_collection_index + 1 < total {
                     self.selected_add_collection_index += 1;
                 }
             }
             KeyCode::Enter => {
-                if !coll_names.is_empty() && self.selected_add_collection_index < coll_names.len() {
-                    let name = coll_names[self.selected_add_collection_index].clone();
-                    let paths: Vec<PathBuf> = self.browser.selected_paths.iter().cloned().collect();
-                    self.collections.add_to_collection(&name, paths);
-                    self.browser.clear_selections();
+                if self.selected_add_collection_index == 0 {
+                    // Activate inline "New playlist" input
+                    self.add_coll_creating = true;
+                    self.input_clear();
+                } else {
+                    let idx = self.selected_add_collection_index - 1;
+                    if idx < coll_names.len() {
+                        let name = coll_names[idx].clone();
+                        self.ensure_selections_in_library();
+                        let paths = std::mem::take(&mut self.library_pending_add_paths);
+                        if !paths.is_empty() {
+                            self.collections.add_to_collection(&name, paths);
+                        }
+                        self.browser.clear_selections();
+                    }
+                    self.input_mode = InputMode::Normal;
                 }
-                self.input_mode = InputMode::Normal;
             }
             KeyCode::Esc => {
+                self.library_pending_add_paths.clear();
+                self.add_coll_creating = false;
+                self.input_clear();
                 self.input_mode = InputMode::Normal;
             }
             _ => {}
@@ -1759,13 +2165,8 @@ impl App {
                 if let Some(ref mut db) = self.dest_browser { db.move_down(); }
             }
             KeyCode::Enter => {
-                // Si hay subdirectorios disponibles, entramos; si no, confirmamos el directorio actual
-                let has_dirs = self.dest_browser.as_ref().map(|db| !db.dirs.is_empty() && !db.loading).unwrap_or(false);
-                if has_dirs {
-                    if let Some(ref mut db) = self.dest_browser {
-                        db.enter_highlighted();
-                    }
-                } else {
+                let copy_here = self.dest_browser.as_ref().map(|db| db.dir_index == 0).unwrap_or(false);
+                if copy_here {
                     if let Some(ref db) = self.dest_browser {
                         let dest = db.current_dir.clone();
                         let is_move = db.is_move;
@@ -1774,11 +2175,15 @@ impl App {
                         self.input_mode = InputMode::Normal;
                         self.start_file_operation(dest, is_move);
                     }
+                } else if let Some(ref mut db) = self.dest_browser {
+                    if !db.dirs.is_empty() && !db.loading {
+                        db.enter_highlighted();
+                    }
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => {
                 if let Some(ref mut db) = self.dest_browser
-                    && !db.dirs.is_empty() && !db.loading {
+                    && db.dir_index > 0 && !db.dirs.is_empty() && !db.loading {
                         db.enter_highlighted();
                     }
             }
@@ -1852,6 +2257,8 @@ impl App {
                     self.queue_selected_index -= 1;
                 }
             }
+            AppScreen::Library => {}
+            AppScreen::Healer => {}
         }
     }
 
@@ -1872,6 +2279,8 @@ impl App {
                     self.queue_selected_index += 1;
                 }
             }
+            AppScreen::Library => {}
+            AppScreen::Healer => {}
         }
     }
 
@@ -1964,6 +2373,8 @@ impl App {
                     self.screen = AppScreen::Browser;
                 }
             }
+            AppScreen::Library => {}
+            AppScreen::Healer => {}
         }
     }
 
@@ -2029,6 +2440,8 @@ impl App {
                         self.sync_queue_selection();
                     }
             }
+            AppScreen::Library => {}
+            AppScreen::Healer => {}
         }
     }
 
@@ -2259,8 +2672,63 @@ impl App {
         self.get_filtered_queue_indices().len()
     }
 
+    fn is_queue_search_active(&self) -> bool {
+        self.search.active && !self.search.query.is_empty()
+    }
+
+    fn next_search_result(&mut self) -> Option<PathBuf> {
+        let filtered = self.get_filtered_queue_indices();
+        if filtered.is_empty() {
+            return None;
+        }
+        if let Some(curr) = self.queue.current_index {
+            if let Some(pos) = filtered.iter().position(|(_, orig)| *orig == curr) {
+                let next_pos = pos + 1;
+                if next_pos < filtered.len() {
+                    let next_orig = filtered[next_pos].1;
+                    self.queue.current_index = Some(next_orig);
+                    return Some(self.queue.items[next_orig].clone());
+                }
+                return None;
+            }
+        }
+        let first_orig = filtered[0].1;
+        self.queue.current_index = Some(first_orig);
+        Some(self.queue.items[first_orig].clone())
+    }
+
+    fn prev_search_result(&mut self) -> Option<PathBuf> {
+        let filtered = self.get_filtered_queue_indices();
+        if filtered.is_empty() {
+            return None;
+        }
+        if let Some(curr) = self.queue.current_index {
+            if let Some(pos) = filtered.iter().position(|(_, orig)| *orig == curr) {
+                if pos > 0 {
+                    let prev_orig = filtered[pos - 1].1;
+                    self.queue.current_index = Some(prev_orig);
+                    return Some(self.queue.items[prev_orig].clone());
+                }
+                return None;
+            }
+        }
+        let last_orig = filtered[filtered.len() - 1].1;
+        self.queue.current_index = Some(last_orig);
+        Some(self.queue.items[last_orig].clone())
+    }
+
     pub fn is_file_operation_active(&self) -> bool {
         self.file_progress.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    fn save_session_on_quit(&mut self) {
+        if self.stats_tracking.session_start_ts > 0 {
+            let duration = self.stats_tracking.session_listen_secs;
+            let tracks = self.stats_tracking.session_tracks;
+            let start = self.stats_tracking.session_start_ts;
+            self.stats.record_session(duration, tracks, start);
+            let _ = self.stats.save();
+        }
     }
 
     pub fn has_preview(&self) -> bool {
@@ -2557,7 +3025,10 @@ impl App {
             | InputMode::MovePath => {
             }
             InputMode::Normal
-            | InputMode::ConfirmDelete => {
+            | InputMode::ConfirmDelete
+            | InputMode::TagEdit
+            | InputMode::ConfirmDeletePlaylist
+            | InputMode::ManageMusicFolders => {
                 let paths = Self::parse_dropped_paths(&content);
                 if !paths.is_empty() {
                     let dest_dir = self.browser.current_dir.clone();
@@ -2570,13 +3041,26 @@ impl App {
     // Lanza la operación de copia/mover en un hilo separado con soporte de resolución de conflictos
     // El hilo worker se bloquea en el Condvar cuando hay un conflicto hasta que el UI thread responda
     fn start_file_operation(&mut self, dest_dir: PathBuf, is_move: bool) {
-        let paths: Vec<PathBuf> = self.browser.selected_paths.iter().cloned().collect();
+        // Deduplicate: if a directory is selected, don't also process its children
+        // individually — copy_dir_recursive handles them. Without this, selecting a folder
+        // and its contents (via toggle_folder_select) would copy everything twice.
+        // Pre-collect dirs with N stat() calls; the filter then only does string prefix checks.
+        let paths: Vec<PathBuf> = {
+            let all: Vec<PathBuf> = self.browser.selected_paths.iter().cloned().collect();
+            let selected_dirs: Vec<PathBuf> = all.iter().filter(|p| p.is_dir()).cloned().collect();
+            if selected_dirs.is_empty() {
+                all
+            } else {
+                all.into_iter()
+                    .filter(|p| !selected_dirs.iter().any(|d| d != p && p.starts_with(d)))
+                    .collect()
+            }
+        };
         if paths.is_empty() {
             return;
         }
 
         let total_items = paths.len();
-        let total_bytes = Self::get_total_size(&paths);
         let progress = Arc::clone(&self.file_progress);
         let op_type = if is_move { "Moving".to_string() } else { "Copying".to_string() };
 
@@ -2588,7 +3072,7 @@ impl App {
                 completed_files: 0,
                 total_files: total_items,
                 bytes_copied: 0,
-                total_bytes,
+                total_bytes: 0, // computed in background thread to avoid blocking UI
                 finished: false,
                 error: None,
                 canceled: false,
@@ -2613,6 +3097,15 @@ impl App {
                     }
                     return;
                 }
+
+            // Compute total size here so the main thread is never blocked
+            let total_bytes = Self::get_total_size(&paths);
+            {
+                let mut p = progress.lock().unwrap();
+                if let Some(ref mut state) = *p {
+                    state.total_bytes = total_bytes;
+                }
+            }
 
             let mut completed = 0;
             for path in paths {
@@ -2868,6 +3361,8 @@ impl App {
                     self.queue_selected_index = self.queue_selected_index.saturating_sub(10);
                 }
             }
+            AppScreen::Library => {}
+            AppScreen::Healer => {}
         }
     }
 
@@ -2882,6 +3377,8 @@ impl App {
                     self.queue_selected_index = (self.queue_selected_index + 10).min(len.saturating_sub(1));
                 }
             }
+            AppScreen::Library => {}
+            AppScreen::Healer => {}
         }
     }
 
@@ -2899,6 +3396,8 @@ impl App {
                     self.sync_queue_selection();
                 }
             }
+            AppScreen::Library => {}
+            AppScreen::Healer => {}
         }
     }
 
@@ -2916,6 +3415,8 @@ impl App {
                     self.sync_queue_selection();
                 }
             }
+            AppScreen::Library => {}
+            AppScreen::Healer => {}
         }
     }
 
@@ -2979,6 +3480,827 @@ impl App {
                     self.queue_selected_index = (self.queue_selected_index + 1).min(max_len.saturating_sub(1));
                     self.queue.shuffle_items();
                 }
+            }
+        }
+    }
+
+    fn handle_library_normal_key(&mut self, key: KeyEvent) {
+        // Tag editor takes priority when open — intercept navigation and editing keys
+        if self.library.tag_editor.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.library.tag_editor = None;
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                    if let Some(ref mut ed) = self.library.tag_editor {
+                        ed.active_field = (ed.active_field + 1) % 6;
+                        ed.cursor_pos = ed.fields[ed.active_field].chars().count();
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                    if let Some(ref mut ed) = self.library.tag_editor {
+                        ed.active_field = if ed.active_field == 0 { 5 } else { ed.active_field - 1 };
+                        ed.cursor_pos = ed.fields[ed.active_field].chars().count();
+                    }
+                }
+                KeyCode::Enter => {
+                    self.input_mode = InputMode::TagEdit;
+                }
+                KeyCode::Char('w') => {
+                    self.do_write_tags();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        let filter_query = if self.search.active { self.search.query.clone() } else { String::new() };
+
+        match key.code {
+            KeyCode::Char('1') => {
+                self.screen = AppScreen::Browser;
+                self.search.active = false;
+                self.search.query.clear();
+            }
+            KeyCode::Char('2') => {
+                self.screen = AppScreen::Queue;
+                self.search.active = false;
+                self.search.query.clear();
+                self.queue_selected_index = 0;
+                self.sync_queue_selection();
+            }
+            KeyCode::Char('3') => {}
+            KeyCode::Char('?') => { self.show_help = true; self.help_scroll = 0; }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.library.focused_panel = match self.library.focused_panel {
+                    LibraryPanel::Playlists => LibraryPanel::Tracks,
+                    LibraryPanel::Tracks => LibraryPanel::Playlists,
+                };
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                match self.library.focused_panel {
+                    LibraryPanel::Playlists => {
+                        if self.library.playlist_index > 0 {
+                            self.library.playlist_index -= 1;
+                            self.library.track_index = 0;
+                        }
+                    }
+                    LibraryPanel::Tracks => {
+                        if self.library.track_index > 0 {
+                            self.library.track_index -= 1;
+                        }
+                    }
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                match self.library.focused_panel {
+                    LibraryPanel::Playlists => {
+                        let count = LibraryState::playlist_names(&self.collections).len();
+                        if self.library.playlist_index + 1 < count {
+                            self.library.playlist_index += 1;
+                            self.library.track_index = 0;
+                        }
+                    }
+                    LibraryPanel::Tracks => {
+                        let count = self.library.visible_tracks(&self.collections, &filter_query, &self.stats).len();
+                        if self.library.track_index + 1 < count {
+                            self.library.track_index += 1;
+                        }
+                    }
+                }
+            }
+            KeyCode::Home => {
+                match self.library.focused_panel {
+                    LibraryPanel::Playlists => self.library.playlist_index = 0,
+                    LibraryPanel::Tracks => self.library.track_index = 0,
+                }
+            }
+            KeyCode::End => {
+                match self.library.focused_panel {
+                    LibraryPanel::Playlists => {
+                        let count = LibraryState::playlist_names(&self.collections).len();
+                        if count > 0 { self.library.playlist_index = count - 1; }
+                    }
+                    LibraryPanel::Tracks => {
+                        let count = self.library.visible_tracks(&self.collections, &filter_query, &self.stats).len();
+                        if count > 0 { self.library.track_index = count - 1; }
+                    }
+                }
+            }
+            KeyCode::PageUp => {
+                match self.library.focused_panel {
+                    LibraryPanel::Playlists => {
+                        self.library.playlist_index = self.library.playlist_index.saturating_sub(10);
+                    }
+                    LibraryPanel::Tracks => {
+                        self.library.track_index = self.library.track_index.saturating_sub(10);
+                    }
+                }
+            }
+            KeyCode::PageDown => {
+                match self.library.focused_panel {
+                    LibraryPanel::Playlists => {
+                        let count = LibraryState::playlist_names(&self.collections).len();
+                        self.library.playlist_index = (self.library.playlist_index + 10).min(count.saturating_sub(1));
+                    }
+                    LibraryPanel::Tracks => {
+                        let count = self.library.visible_tracks(&self.collections, &filter_query, &self.stats).len();
+                        self.library.track_index = (self.library.track_index + 10).min(count.saturating_sub(1));
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                if self.library.focused_panel == LibraryPanel::Tracks {
+                    let visible_paths: Vec<PathBuf> = self.library
+                        .visible_tracks(&self.collections, &filter_query, &self.stats)
+                        .iter().map(|t| t.path.clone()).collect();
+                    let idx = self.library.track_index;
+                    if let Some(path) = visible_paths.get(idx).cloned() {
+                        self.queue.clear();
+                        let audio_paths: Vec<PathBuf> = visible_paths.iter()
+                            .filter(|p| matches_audio_extension(p))
+                            .cloned().collect();
+                        let play_idx = audio_paths.iter().position(|p| p == &path).unwrap_or(0);
+                        for p in &audio_paths {
+                            self.queue.add(p.clone());
+                        }
+                        self.queue.current_index = Some(play_idx);
+                        self.audio.play(path);
+                        self.sync_queue_selection();
+                    }
+                }
+            }
+            KeyCode::Char(' ') => {
+                if self.library.focused_panel == LibraryPanel::Tracks {
+                    let visible_paths: Vec<PathBuf> = self.library
+                        .visible_tracks(&self.collections, &filter_query, &self.stats)
+                        .iter().map(|t| t.path.clone()).collect();
+                    if let Some(path) = visible_paths.get(self.library.track_index).cloned() {
+                        if matches_audio_extension(&path) {
+                            self.queue.add(path);
+                        }
+                    }
+                } else {
+                    self.toggle_playback();
+                }
+            }
+            KeyCode::Char('e') => {
+                if self.library.focused_panel == LibraryPanel::Tracks {
+                    self.open_tag_editor_for_selected();
+                }
+            }
+            KeyCode::Char('a') => {
+                if self.library.focused_panel == LibraryPanel::Tracks {
+                    let visible_paths: Vec<PathBuf> = self.library
+                        .visible_tracks(&self.collections, &filter_query, &self.stats)
+                        .iter().map(|t| t.path.clone()).collect();
+                    if let Some(path) = visible_paths.get(self.library.track_index).cloned() {
+                        self.library_pending_add_paths = vec![path];
+                        self.selected_add_collection_index = 0;
+                        self.input_mode = InputMode::AddToCollectionList;
+                    }
+                }
+            }
+            KeyCode::Char('N') => {
+                if self.library.focused_panel == LibraryPanel::Playlists {
+                    self.input_mode = InputMode::CreateCollection;
+                    self.input_clear();
+                }
+            }
+            KeyCode::Char('D') => {
+                if self.library.focused_panel == LibraryPanel::Playlists {
+                    let names = LibraryState::playlist_names(&self.collections);
+                    if self.library.playlist_index > 0 {
+                        if let Some(name) = names.get(self.library.playlist_index).cloned() {
+                            if !is_smart_playlist(&name) {
+                                self.pending_delete_playlist = Some(name);
+                                self.input_mode = InputMode::ConfirmDeletePlaylist;
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('x') => {
+                if self.library.focused_panel == LibraryPanel::Tracks {
+                    self.library_remove_from_playlist();
+                }
+            }
+            KeyCode::Char('s') => {
+                self.library.sort = self.library.sort.next();
+                self.library.track_index = 0;
+            }
+            KeyCode::Char('R') => {
+                self.library.start_scan(&self.config.music_folders);
+            }
+            KeyCode::Char('F') => {
+                self.manage_folders_index = 0;
+                self.input_mode = InputMode::ManageMusicFolders;
+            }
+            KeyCode::Char('/') => {
+                self.input_mode = InputMode::Search;
+                self.search.active = true;
+                self.search.query.clear();
+            }
+            KeyCode::Esc | KeyCode::Backspace => {
+                if self.search.active {
+                    self.search.active = false;
+                    self.search.query.clear();
+                    let q = String::new();
+                    self.library.clamp_track_index(&self.collections, &q, &self.stats);
+                }
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => { self.toggle_playback(); }
+            KeyCode::Char('n') => {
+                let shuffle = { let s = self.audio.shared_state.lock().unwrap(); s.shuffle };
+                if self.is_queue_search_active() {
+                    if let Some(p) = self.next_search_result() { self.audio.play(p); self.sync_queue_selection(); }
+                } else if let Some(p) = self.queue.next(shuffle) { self.audio.play(p); self.sync_queue_selection(); }
+            }
+            KeyCode::Char('b') => {
+                let shuffle = { let s = self.audio.shared_state.lock().unwrap(); s.shuffle };
+                if self.is_queue_search_active() {
+                    if let Some(p) = self.prev_search_result() { self.audio.play(p); self.sync_queue_selection(); }
+                } else if let Some(p) = self.queue.prev(shuffle) { self.audio.play(p); self.sync_queue_selection(); }
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                let v = { let s = self.audio.shared_state.lock().unwrap(); s.volume };
+                let nv = v.saturating_add(5).min(100);
+                self.audio.set_volume(nv);
+                self.config.default_volume = nv;
+                let _ = self.config.save();
+            }
+            KeyCode::Char('-') => {
+                let v = { let s = self.audio.shared_state.lock().unwrap(); s.volume };
+                let nv = v.saturating_sub(5);
+                self.audio.set_volume(nv);
+                self.config.default_volume = nv;
+                let _ = self.config.save();
+            }
+            KeyCode::Char('r') => {
+                let nr = {
+                    let mut s = self.audio.shared_state.lock().unwrap();
+                    s.repeat = match s.repeat {
+                        RepeatMode::Off => RepeatMode::All,
+                        RepeatMode::All => RepeatMode::One,
+                        RepeatMode::One => RepeatMode::Off,
+                    };
+                    s.repeat
+                };
+                self.config.repeat = nr;
+                let _ = self.config.save();
+            }
+            KeyCode::Char('z') => {
+                let ns = {
+                    let mut s = self.audio.shared_state.lock().unwrap();
+                    s.shuffle = !s.shuffle;
+                    s.shuffle
+                };
+                if ns { self.queue.shuffle_items(); }
+                self.sync_queue_selection();
+                self.config.shuffle = ns;
+                let _ = self.config.save();
+            }
+            KeyCode::Char('H') => self.seek_relative(-5),
+            KeyCode::Char('L') => self.seek_relative(5),
+            _ => {}
+        }
+    }
+
+    fn open_tag_editor_for_selected(&mut self) {
+        let filter_query = if self.search.active { self.search.query.clone() } else { String::new() };
+        let visible: Vec<LibraryTrack> = self.library
+            .visible_tracks(&self.collections, &filter_query, &self.stats)
+            .iter().map(|t| (*t).clone()).collect();
+        let idx = self.library.track_index;
+        if let Some(track) = visible.get(idx) {
+            let editor = TagEditorState {
+                path: track.path.clone(),
+                fields: [
+                    track.title.clone().unwrap_or_default(),
+                    track.artist.clone().unwrap_or_default(),
+                    track.album.clone().unwrap_or_default(),
+                    track.track.map(|n| n.to_string()).unwrap_or_default(),
+                    track.year.map(|n| n.to_string()).unwrap_or_default(),
+                    track.genre.clone().unwrap_or_default(),
+                ],
+                active_field: 0,
+                cursor_pos: 0,
+                dirty: false,
+                save_result: None,
+            };
+            self.library.tag_editor = Some(editor);
+        }
+    }
+
+    fn do_write_tags(&mut self) {
+        if let Some(ref mut editor) = self.library.tag_editor {
+            write_tags(editor);
+        }
+        // Update in-memory track on success
+        if let Some(ref editor) = self.library.tag_editor {
+            if matches!(&editor.save_result, Some(Ok(()))) {
+                let path = editor.path.clone();
+                let new_title = editor.fields[0].clone();
+                let new_artist = editor.fields[1].clone();
+                let new_album = editor.fields[2].clone();
+                let new_track = editor.fields[3].parse::<u32>().ok();
+                let new_year = editor.fields[4].parse::<u32>().ok();
+                let new_genre = editor.fields[5].clone();
+                if let Some(t) = self.library.tracks.iter_mut().find(|t| t.path == path) {
+                    t.title = if new_title.is_empty() { None } else { Some(new_title) };
+                    t.artist = if new_artist.is_empty() { None } else { Some(new_artist) };
+                    t.album = if new_album.is_empty() { None } else { Some(new_album) };
+                    t.track = new_track;
+                    t.year = new_year;
+                    t.genre = if new_genre.is_empty() { None } else { Some(new_genre) };
+                }
+            }
+        }
+    }
+
+    fn library_remove_from_playlist(&mut self) {
+        let filter_query = if self.search.active { self.search.query.clone() } else { String::new() };
+        let names = LibraryState::playlist_names(&self.collections);
+        if self.library.playlist_index == 0 {
+            return;
+        }
+        if let Some(playlist_name) = names.get(self.library.playlist_index).cloned() {
+            if is_smart_playlist(&playlist_name) {
+                return;
+            }
+            let visible_paths: Vec<PathBuf> = self.library
+                .visible_tracks(&self.collections, &filter_query, &self.stats)
+                .iter().map(|t| t.path.clone()).collect();
+            if let Some(path) = visible_paths.get(self.library.track_index).cloned() {
+                self.collections.remove_from_collection(&playlist_name, &path);
+                let q = filter_query;
+                self.library.clamp_track_index(&self.collections, &q, &self.stats);
+            }
+        }
+    }
+
+    fn handle_tag_edit_key(&mut self, key: KeyEvent) {
+        if self.library.tag_editor.is_none() {
+            self.input_mode = InputMode::Normal;
+            return;
+        }
+        match key.code {
+            KeyCode::Enter | KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Tab => {
+                if let Some(ref mut ed) = self.library.tag_editor {
+                    ed.active_field = (ed.active_field + 1) % 6;
+                    ed.cursor_pos = ed.fields[ed.active_field].chars().count();
+                }
+            }
+            KeyCode::BackTab => {
+                if let Some(ref mut ed) = self.library.tag_editor {
+                    ed.active_field = if ed.active_field == 0 { 5 } else { ed.active_field - 1 };
+                    ed.cursor_pos = ed.fields[ed.active_field].chars().count();
+                }
+            }
+            KeyCode::Left => {
+                if let Some(ref mut ed) = self.library.tag_editor {
+                    if ed.cursor_pos > 0 { ed.cursor_pos -= 1; }
+                }
+            }
+            KeyCode::Right => {
+                if let Some(ref mut ed) = self.library.tag_editor {
+                    let len = ed.fields[ed.active_field].chars().count();
+                    if ed.cursor_pos < len { ed.cursor_pos += 1; }
+                }
+            }
+            KeyCode::Home => {
+                if let Some(ref mut ed) = self.library.tag_editor { ed.cursor_pos = 0; }
+            }
+            KeyCode::End => {
+                if let Some(ref mut ed) = self.library.tag_editor {
+                    ed.cursor_pos = ed.fields[ed.active_field].chars().count();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(ref mut ed) = self.library.tag_editor {
+                    let pos = ed.cursor_pos;
+                    if pos > 0 {
+                        let field = &mut ed.fields[ed.active_field];
+                        let byte_pos = field.char_indices().nth(pos - 1).map(|(i, _)| i).unwrap_or(0);
+                        field.remove(byte_pos);
+                        ed.cursor_pos -= 1;
+                        ed.dirty = true;
+                    }
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(ref mut ed) = self.library.tag_editor {
+                    let pos = ed.cursor_pos;
+                    let field = &mut ed.fields[ed.active_field];
+                    let len = field.chars().count();
+                    if pos < len {
+                        let byte_pos = field.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(field.len());
+                        field.remove(byte_pos);
+                        ed.dirty = true;
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(ref mut ed) = self.library.tag_editor {
+                    let pos = ed.cursor_pos;
+                    let field = &mut ed.fields[ed.active_field];
+                    let byte_pos = field.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(field.len());
+                    field.insert(byte_pos, c);
+                    ed.cursor_pos += 1;
+                    ed.dirty = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_confirm_delete_playlist_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                if let Some(name) = self.pending_delete_playlist.take() {
+                    self.collections.delete_collection(&name);
+                    self.library.clamp_playlist_index(&self.collections);
+                    self.library.track_index = 0;
+                }
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.pending_delete_playlist = None;
+                self.input_mode = InputMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_manage_folders_key(&mut self, key: KeyEvent) {
+        let len = self.config.music_folders.len();
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.manage_folders_index > 0 {
+                    self.manage_folders_index -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if len > 0 && self.manage_folders_index + 1 < len {
+                    self.manage_folders_index += 1;
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Char('x') => {
+                if len > 0 && self.manage_folders_index < len {
+                    self.config.remove_music_folder_at(self.manage_folders_index);
+                    if self.manage_folders_index >= self.config.music_folders.len()
+                        && self.manage_folders_index > 0
+                    {
+                        self.manage_folders_index -= 1;
+                    }
+                    self.library.start_scan(&self.config.music_folders);
+                }
+            }
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    // ── Library Healer ────────────────────────────────────────────────────────
+
+    fn handle_healer_key(&mut self, key: KeyEvent) {
+        match self.healer.screen {
+            HealerScreen::Menu     => self.handle_healer_menu_key(key),
+            HealerScreen::Scanning => self.handle_healer_scanning_key(key),
+            HealerScreen::Report   => self.handle_healer_report_key(key),
+            HealerScreen::FileList => self.handle_healer_list_key(key),
+            HealerScreen::Preview  => self.handle_healer_preview_key(key),
+            HealerScreen::Editor   => self.handle_healer_editor_key(key),
+        }
+    }
+
+    fn handle_healer_menu_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('1') | KeyCode::Esc => {
+                self.screen = AppScreen::Browser;
+            }
+            KeyCode::Char('2') => {
+                self.screen = AppScreen::Queue;
+                self.queue_selected_index = 0;
+                self.sync_queue_selection();
+            }
+            KeyCode::Char('3') => {
+                self.screen = AppScreen::Library;
+                if self.library.scan_state == ScanState::Idle {
+                    self.library.start_scan(&self.config.music_folders);
+                }
+            }
+            KeyCode::Char('s') | KeyCode::Enter => {
+                if self.healer.scan_state != HealScanState::Scanning {
+                    self.healer_start_scan_library();
+                }
+            }
+            KeyCode::Char('r') => {
+                if self.healer.report.is_some() {
+                    self.healer.screen = HealerScreen::Report;
+                }
+            }
+            KeyCode::Char('f') => {
+                if !self.healer.files.is_empty() {
+                    self.healer.list_idx = 0;
+                    self.healer.screen = HealerScreen::FileList;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_healer_scanning_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc {
+            self.healer.screen = HealerScreen::Menu;
+        }
+    }
+
+    fn handle_healer_report_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.healer.screen = HealerScreen::Menu;
+            }
+            KeyCode::Char('1') => {
+                self.screen = AppScreen::Browser;
+            }
+            KeyCode::Char('2') => {
+                self.screen = AppScreen::Queue;
+                self.queue_selected_index = 0;
+                self.sync_queue_selection();
+            }
+            KeyCode::Char('3') => {
+                self.screen = AppScreen::Library;
+            }
+            KeyCode::Enter | KeyCode::Char('f') => {
+                if !self.healer.files.is_empty() {
+                    self.healer.list_idx = 0;
+                    self.healer.list_state.select(Some(0));
+                    self.healer.screen = HealerScreen::FileList;
+                }
+            }
+            KeyCode::Char('s') => {
+                self.healer_start_scan_library();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_healer_list_key(&mut self, key: KeyEvent) {
+        let file_count = self.healer.files.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.healer.screen = HealerScreen::Report;
+            }
+            KeyCode::Char('1') => { self.screen = AppScreen::Browser; }
+            KeyCode::Char('2') => {
+                self.screen = AppScreen::Queue;
+                self.queue_selected_index = 0;
+                self.sync_queue_selection();
+            }
+            KeyCode::Char('3') => { self.screen = AppScreen::Library; }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.healer.list_idx > 0 {
+                    self.healer.list_idx -= 1;
+                    self.healer.list_state.select(Some(self.healer.list_idx));
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if file_count > 0 && self.healer.list_idx + 1 < file_count {
+                    self.healer.list_idx += 1;
+                    self.healer.list_state.select(Some(self.healer.list_idx));
+                }
+            }
+            KeyCode::PageUp => {
+                self.healer.list_idx = self.healer.list_idx.saturating_sub(10);
+                self.healer.list_state.select(Some(self.healer.list_idx));
+            }
+            KeyCode::PageDown => {
+                if file_count > 0 {
+                    self.healer.list_idx = (self.healer.list_idx + 10).min(file_count - 1);
+                    self.healer.list_state.select(Some(self.healer.list_idx));
+                }
+            }
+            KeyCode::Enter => {
+                self.healer.match_idx = 0;
+                self.healer.screen = HealerScreen::Preview;
+            }
+            KeyCode::Char('l') => {
+                self.healer_start_lookup();
+            }
+            KeyCode::Char('e') => {
+                self.healer.load_editor_from_original();
+                self.healer.screen = HealerScreen::Editor;
+            }
+            KeyCode::Char('s') => {
+                if let Some(f) = self.healer.current_file_mut() {
+                    f.status = HealStatus::Skipped;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_healer_preview_key(&mut self, key: KeyEvent) {
+        let match_count = self.healer.current_file().map(|f| f.matches.len()).unwrap_or(0);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.healer.screen = HealerScreen::FileList;
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                if self.healer.match_idx > 0 { self.healer.match_idx -= 1; }
+            }
+            KeyCode::Right | KeyCode::Char('m') => {
+                if match_count > 0 && self.healer.match_idx + 1 < match_count {
+                    self.healer.match_idx += 1;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('a') => {
+                self.healer_apply_match();
+            }
+            KeyCode::Char('e') => {
+                self.healer.load_editor_from_match();
+                self.healer.screen = HealerScreen::Editor;
+            }
+            KeyCode::Char('s') => {
+                if let Some(f) = self.healer.current_file_mut() {
+                    f.status = HealStatus::Skipped;
+                }
+                self.healer.screen = HealerScreen::FileList;
+            }
+            KeyCode::Char('L') => {
+                self.healer_start_lookup();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_healer_editor_key(&mut self, key: KeyEvent) {
+        if self.healer.edit_typing {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.healer.edit_typing = false;
+                }
+                KeyCode::Char(c) => {
+                    let idx = self.healer.edit_field_idx;
+                    let cursor = self.healer.edit_cursor;
+                    self.healer.edit_fields[idx].insert(cursor, c);
+                    self.healer.edit_cursor += 1;
+                }
+                KeyCode::Backspace => {
+                    let idx = self.healer.edit_field_idx;
+                    let cursor = self.healer.edit_cursor;
+                    if cursor > 0 {
+                        self.healer.edit_fields[idx].remove(cursor - 1);
+                        self.healer.edit_cursor -= 1;
+                    }
+                }
+                KeyCode::Left  => { if self.healer.edit_cursor > 0 { self.healer.edit_cursor -= 1; } }
+                KeyCode::Right => {
+                    let len = self.healer.edit_fields[self.healer.edit_field_idx].chars().count();
+                    if self.healer.edit_cursor < len { self.healer.edit_cursor += 1; }
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => { self.healer.screen = HealerScreen::Preview; }
+            KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') => {
+                self.healer.edit_field_idx = (self.healer.edit_field_idx + 1) % 8;
+                self.healer.edit_cursor = self.healer.edit_fields[self.healer.edit_field_idx].chars().count();
+            }
+            KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') => {
+                self.healer.edit_field_idx = if self.healer.edit_field_idx == 0 { 7 } else { self.healer.edit_field_idx - 1 };
+                self.healer.edit_cursor = self.healer.edit_fields[self.healer.edit_field_idx].chars().count();
+            }
+            KeyCode::Enter => { self.healer.edit_typing = true; }
+            KeyCode::Char('w') | KeyCode::Char('s') => {
+                let m = self.healer.editor_as_match();
+                self.healer_apply_match_data(m);
+            }
+            _ => {}
+        }
+    }
+
+    fn healer_start_scan_library(&mut self) {
+        let dirs: Vec<std::path::PathBuf> = self.config.music_folders.iter()
+            .map(|f| crate::config::resolve_path(f))
+            .collect();
+        let mut paths = Vec::new();
+        for dir in dirs {
+            if !dir.is_dir() { continue; }
+            for entry in walkdir::WalkDir::new(&dir)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                .flatten()
+            {
+                let p = entry.path();
+                if p.is_file() && crate::search::matches_audio_extension(p) {
+                    paths.push(p.to_path_buf());
+                }
+            }
+        }
+        self.healer_start_scan_paths(paths);
+    }
+
+    fn healer_start_scan_paths(&mut self, paths: Vec<std::path::PathBuf>) {
+        let slot: std::sync::Arc<std::sync::Mutex<Option<Vec<crate::healer::HealerFile>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        self.healer.pending_scan = Some(slot.clone());
+        self.healer.scan_state = HealScanState::Scanning;
+        self.healer.screen = HealerScreen::Scanning;
+        let progress = self.healer.scan_progress.clone();
+        pipeline::scan_files(paths, progress, slot);
+    }
+
+    fn healer_start_lookup(&mut self) {
+        if self.healer.lookup_state == HealLookupState::Searching { return; }
+        let file = match self.healer.current_file() { Some(f) => f, None => return };
+        let title   = file.original.title.clone().unwrap_or_default();
+        let artist  = file.original.artist.clone().unwrap_or_default();
+        let path    = file.path.clone();
+        let api_key = self.config.acoustid_api_key.clone().unwrap_or_default();
+
+        let slot: std::sync::Arc<std::sync::Mutex<Option<Vec<crate::healer::HealMatch>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        self.healer.pending_lookup = Some(slot.clone());
+        self.healer.lookup_state = HealLookupState::Searching;
+
+        std::thread::spawn(move || {
+            let mut all_matches = Vec::new();
+            let mb = musicbrainz::search_recording(&title, &artist);
+            all_matches.extend(mb);
+            if !api_key.is_empty() {
+                if let Some(fp) = fingerprint::compute(&path) {
+                    all_matches.extend(fingerprint::lookup(&fp, &api_key));
+                }
+            }
+            all_matches.sort_by(|a, b| b.confidence.cmp(&a.confidence));
+            *slot.lock().unwrap() = Some(all_matches);
+        });
+    }
+
+    fn healer_apply_match(&mut self) {
+        let (path, m, original) = match self.healer.current_file() {
+            Some(f) => {
+                let m = match f.matches.get(self.healer.match_idx) {
+                    Some(m) => m.clone(),
+                    None => return,
+                };
+                (f.path.clone(), m, f.original.clone())
+            }
+            None => return,
+        };
+        self.healer_apply_match_at(path, m, original);
+    }
+
+    fn healer_apply_match_data(&mut self, m: crate::healer::HealMatch) {
+        let (path, original) = match self.healer.current_file() {
+            Some(f) => (f.path.clone(), f.original.clone()),
+            None => return,
+        };
+        self.healer_apply_match_at(path, m, original);
+    }
+
+    fn healer_apply_match_at(&mut self, path: std::path::PathBuf, m: crate::healer::HealMatch, original: crate::healer::TagSnapshot) {
+        match pipeline::apply_match(&path, &m, &mut self.healer_backup, &original) {
+            Ok(()) => {
+                // Patch the in-memory library track so the UI reflects the new tags immediately
+                if let Some(track) = self.library.tracks.iter_mut().find(|t| t.path == path) {
+                    if let Some(ref v) = m.tags.title  { track.title  = Some(v.clone()); }
+                    if let Some(ref v) = m.tags.artist { track.artist = Some(v.clone()); }
+                    if let Some(ref v) = m.tags.album  { track.album  = Some(v.clone()); }
+                    if let Some(ref v) = m.tags.genre  { track.genre  = Some(v.clone()); }
+                    if let Some(v) = m.tags.year       { track.year   = Some(v); }
+                    if let Some(v) = m.tags.track      { track.track  = Some(v); }
+                }
+                // Remove the now-fixed file from the healer list
+                let idx = self.healer.list_idx;
+                if idx < self.healer.files.len() {
+                    self.healer.files.remove(idx);
+                }
+                let new_len = self.healer.files.len();
+                if new_len == 0 {
+                    self.healer.list_idx = 0;
+                    self.healer.list_state.select(None);
+                } else {
+                    if self.healer.list_idx >= new_len {
+                        self.healer.list_idx = new_len - 1;
+                    }
+                    self.healer.list_state.select(Some(self.healer.list_idx));
+                }
+                self.notification = Some(("Tags applied successfully".to_string(), 40));
+                self.healer.screen = HealerScreen::FileList;
+            }
+            Err(e) => {
+                self.notification = Some((format!("Healer: {}", e), 80));
             }
         }
     }

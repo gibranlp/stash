@@ -53,4 +53,16 @@ impl Collections {
             let _ = self.save();
         }
     }
+
+    pub fn delete_collection(&mut self, name: &str) {
+        self.collections.remove(name);
+        let _ = self.save();
+    }
+
+    pub fn remove_from_collection(&mut self, name: &str, path: &PathBuf) {
+        if let Some(entry) = self.collections.get_mut(name) {
+            entry.retain(|p| p != path);
+            let _ = self.save();
+        }
+    }
 }

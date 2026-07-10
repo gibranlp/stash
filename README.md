@@ -8,15 +8,15 @@ Designed for terminal power users, it supports smooth, standard list scrolling, 
 
 ## Key Features
 
-1. **Dual-Pane File Browser**: Navigate directories recursively on the left, and view/play files on the right.
-2. **Dynamic FFT Visualizer**: Real-time 160-channel audio frequency spectrum analyzer (Cooley-Tukey Radix-2 FFT + Hanning window) that adjusts dynamically to your terminal width, styled with standard ANSI colors to work out of the box with `pywal` schemes.
-3. **Asynchronous File Operations**: Perform copy (`v`), move (`y`), and delete (`d`) operations on background worker threads with a progress bar and current filename overlay, ensuring the UI remains completely responsive.
-4. **Quick Page Navigation**: Press `PageUp` and `PageDown` to jump selection cursor by 10 items.
-5. **Virtual Collections**: Organize favorite tracks or files into virtual playlists (persisted in `~/.config/stash/collections.json`) without duplicate disk space.
-6. **Playback Queue**: Queue multiple songs using standard commands and skip tracks cleanly with shuffle/repeat toggles.
-7. **Live Search**: Recursively search directory items live with incremental character matching using walkdir.
-8. **Directory Navigation Prepends**: Quick navigation directories `.` and `..` are automatically sorted at the top of the folder list.
-9. **MPRIS D-Bus Integration**: Native support for OS media controls, letting you control playback (play/pause, next, previous) using `playerctl`, lock screens, or system media keys (like `XF86AudioPlay`).
+1. **Dual-Pane File Browser**: Navigate directories recursively, preview files on the right, and perform async copy, move, and delete operations on background threads with a live progress bar.
+2. **Music Library (Tab 3)**: Scans your configured music folders and presents all tracks in a searchable, sortable list. Organize tracks into custom playlists, edit tags inline, and sort by Title, Artist, Album, Year, or Duration.
+3. **Library Healer (Tab 4)**: Scans for files with missing or incomplete metadata and proposes fixes — from filename parsing, MusicBrainz, or AcoustID fingerprinting. Review diffs, apply with one key, or edit tags manually before saving.
+4. **Dynamic FFT Visualizer**: Real-time 160-channel audio frequency spectrum analyzer (Cooley-Tukey Radix-2 FFT + Hanning window) that adjusts dynamically to your terminal width, styled with standard ANSI colors to work out of the box with `pywal` schemes.
+5. **Playback Queue**: Queue multiple songs, skip tracks, seek, adjust volume, and toggle shuffle/repeat. Embedded lyrics display with automatic LRCLIB fallback.
+6. **Virtual Playlists**: Organize tracks into named playlists (persisted in `~/.config/stash/collections.json`) without duplicating files on disk. Smart playlists (Most Played, Top 100, Most Skipped) are generated automatically.
+7. **Live Search**: Incremental filename search in the Browser; filter by title, artist, album, or filename in the Library.
+8. **Page Navigation Everywhere**: `PageUp` / `PageDown` jumps 10 items in every list — Browser, Queue, Library, and Healer.
+9. **MPRIS D-Bus Integration**: Native support for OS media controls, letting you control playback using `playerctl`, lock screens, or system media keys (like `XF86AudioPlay`).
 
 ---
 
@@ -157,6 +157,20 @@ s       Open current folder in STASH
 ---
 
 ## Recent Version Changelog
+
+### v0.5.0
+
+- **Library Healer (Tab 4)**: New dedicated screen that scans all music folders for files with missing metadata (title, artist, album, year, track number). For each problematic file it automatically proposes tag fixes parsed from the filename, and can query MusicBrainz and AcoustID online for higher-confidence matches. Results are shown as a diff (original vs. proposed) with a confidence percentage. Accepting a match writes the tags to disk, updates the in-memory library immediately, and removes the file from the healer list. A built-in tag editor lets you manually correct any field before saving.
+- **Library Sort**: Press `s` in the Library screen to cycle through sort modes — Default → Title → Artist → Album → Year → Duration. The active sort is shown in the panel title. Smart playlists (Most Played, Top 100, Most Skipped) keep their own order and are unaffected.
+- **"Copy Here" in Destination Browser**: The destination picker now always shows a `↵ Copy here` entry at the top, letting you copy or move files into the currently displayed directory without having to navigate all the way to a leaf folder.
+- **Duplicate-Free Folder Copy**: Selecting a folder and its contents no longer produces duplicate files. The copy/move engine deduplicates paths so that when a parent folder is selected, individual child paths are automatically dropped.
+- **Faster Folder Selection**: Toggling a folder with `Space` is now instant. The folder path is stored directly instead of walking the entire tree on every keypress; file expansion happens lazily when the operation actually runs.
+- **Add to Playlist — Inline Creation**: The "Add to Playlist" popup now always shows a `+ New playlist` entry at the top. If no playlists exist yet, you can create one and add tracks to it in a single step.
+- **Auto-Add to Library**: Adding a folder to a playlist automatically registers its parent directory in `music_folders` and triggers a rescan, so tracks appear in the Library immediately without a manual rescan step.
+- **Select All / Deselect All**: Press `*` in the Browser to select every visible item at once. Press again to deselect all.
+- **PageUp / PageDown Everywhere**: Page navigation now works consistently in the Browser, Queue, Library (both panels), and the Healer file list — all jump 10 rows per press.
+- **Redesigned Bottom Bar**: Each screen now shows a compact tab strip (`1  2  3 Library  4`) where only the active screen displays its name, giving instant orientation without cluttering the bar. Per-screen action hints are reduced to the six most-used shortcuts, with the full reference available via `?`.
+- **Comprehensive Help Guide (`?`)**: The help popup was fully rewritten to include every shortcut accurately — including the corrected `h` (toggle hidden) vs. `←` / `Backspace` (go to parent) distinction, `Shift+↑/↓` range selection, `*` select-all, `p/P` pause from any screen, and a complete Healer section covering all four sub-screens.
 
 ### v0.4.0
 
