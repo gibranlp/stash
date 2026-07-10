@@ -50,6 +50,12 @@ impl BrowserState {
             &mut new_files,
         );
 
+        // On macOS, /Volumes/ may contain a symlink for the root system volume — strip it.
+        #[cfg(target_os = "macos")]
+        if self.current_dir == Path::new("/Volumes") {
+            new_files.retain(|f| !f.path.is_symlink());
+        }
+
         // When browsing /media, also surface drives from /run/media/*/
         // (udisks2 mounts there on Arch/systemd systems)
         if self.current_dir == Path::new("/media") {

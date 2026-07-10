@@ -5,6 +5,8 @@ use std::thread;
 use lofty::prelude::*;
 use lofty::probe::Probe;
 use lofty::config::{ParseOptions, ParsingMode, WriteOptions};
+use lofty::file::FileType;
+use lofty::tag::TagType;
 use serde::{Deserialize, Serialize};
 
 use crate::collections::Collections;
@@ -477,7 +479,12 @@ fn scan_single_track(path: PathBuf) -> LibraryTrack {
 
 pub fn write_tags(editor: &mut TagEditorState) {
     let result = (|| -> anyhow::Result<()> {
-        let parse_opts = ParseOptions::new().parsing_mode(ParsingMode::Relaxed);
+        // read_properties(false) skips MPEG audio-frame scanning, which is what
+        // causes "File contains an invalid frame" on files with a malformed sync header.
+        // We only need tags here, not bitrate/sample-rate.
+        let parse_opts = ParseOptions::new()
+            .parsing_mode(ParsingMode::BestAttempt)
+            .read_properties(false);
         let mut tagged_file = Probe::open(&editor.path)
             .map_err(|e| anyhow::anyhow!("Cannot open: {}", e))?
             .options(parse_opts)
@@ -507,15 +514,97 @@ pub fn write_tags(editor: &mut TagEditorState) {
             return Err(anyhow::anyhow!("No writable tag found in file"));
         }
 
-        tagged_file
-            .save_to_path(&editor.path, WriteOptions::default())
-            .map_err(|e| anyhow::anyhow!("Cannot save: {}", e))?;
+        // lofty's Tag::save_to re-probes the file via content detection to confirm the
+        // format before writing. For malformed MPEG files where the sync frame is corrupt,
+        // this content probe fails even though the extension is .mp3. Fall back to writing
+        // the ID3v2 tag directly — serialised with dump_to (no probing) — for this case.
+        if let Err(save_err) = tagged_file.save_to_path(&editor.path, WriteOptions::default()) {
+            let is_probe_failure = {
+                let s = save_err.to_string();
+                s.contains("does not support") || s.contains("No format could be determined")
+            };
+            let is_mpeg = matches!(FileType::from_path(&editor.path), Some(FileType::Mpeg));
+            if is_probe_failure && is_mpeg {
+                write_id3v2_direct(&tagged_file, &editor.path)?;
+            } else {
+                return Err(anyhow::anyhow!("Cannot save: {}", save_err));
+            }
+        }
 
         Ok(())
     })();
 
     editor.save_result = Some(result.map_err(|e| e.to_string()));
     editor.dirty = false;
+}
+
+// Writes an ID3v2 tag to an MPEG file without going through lofty's save path,
+// which re-probes file content and fails on malformed MPEG sync frames.
+// Serialises the tag with dump_to (probe-free), then splices it in place of any
+// existing ID3v2 header at the start of the file.
+fn write_id3v2_direct(
+    tagged_file: &lofty::file::TaggedFile,
+    path: &Path,
+) -> anyhow::Result<()> {
+    use std::io::{Read, Write, Seek, SeekFrom};
+    use std::fs::OpenOptions;
+
+    let tag = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag())
+        .ok_or_else(|| anyhow::anyhow!("No tag found for direct write"))?;
+
+    if tag.tag_type() != TagType::Id3v2 {
+        return Err(anyhow::anyhow!(
+            "Direct write only supports ID3v2, got {:?}",
+            tag.tag_type()
+        ));
+    }
+
+    // Serialise without touching the file (no probe, no format check)
+    let mut tag_bytes: Vec<u8> = Vec::new();
+    tag.dump_to(&mut tag_bytes, WriteOptions::default())
+        .map_err(|e| anyhow::anyhow!("Cannot serialise tag: {}", e))?;
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("Cannot open for write: {}", e))?;
+
+    // Measure the existing ID3v2 block so we can skip past it
+    let mut hdr = [0u8; 10];
+    let n = file.read(&mut hdr).unwrap_or(0);
+    let skip: u64 = if n >= 10 && &hdr[..3] == b"ID3" {
+        // Size is a 28-bit syncsafe integer stored across bytes 6-9
+        let content = ((hdr[6] as u32) << 21)
+            | ((hdr[7] as u32) << 14)
+            | ((hdr[8] as u32) << 7)
+            | (hdr[9] as u32);
+        // Bit 4 of the flags byte (hdr[5]) signals an appended footer (10 bytes)
+        let footer = if hdr[5] & 0x10 != 0 { 10u32 } else { 0 };
+        (10 + content + footer) as u64
+    } else {
+        0
+    };
+
+    file.seek(SeekFrom::Start(skip))
+        .map_err(|e| anyhow::anyhow!("Cannot seek: {}", e))?;
+
+    let mut audio: Vec<u8> = Vec::new();
+    file.read_to_end(&mut audio)
+        .map_err(|e| anyhow::anyhow!("Cannot read audio data: {}", e))?;
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| anyhow::anyhow!("Cannot seek to start: {}", e))?;
+    file.set_len(0)
+        .map_err(|e| anyhow::anyhow!("Cannot truncate: {}", e))?;
+    file.write_all(&tag_bytes)
+        .map_err(|e| anyhow::anyhow!("Cannot write tag: {}", e))?;
+    file.write_all(&audio)
+        .map_err(|e| anyhow::anyhow!("Cannot write audio: {}", e))?;
+
+    Ok(())
 }
 
 fn apply_tag_fields(tag: &mut lofty::tag::Tag, editor: &TagEditorState) {

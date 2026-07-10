@@ -39,6 +39,7 @@ pub struct AudioSharedState {
     pub lyrics_state: LyricsState,
     pub device_error: Option<String>,
     pub visualizer_data: Vec<f32>,
+    pub visualizer_peaks: Vec<f32>,
     pub visualizer_decay: f32,
     pub left_level: f32,
     pub right_level: f32,
@@ -64,6 +65,7 @@ impl AudioEngine {
             lyrics_state: LyricsState::NotFound,
             device_error: None,
             visualizer_data: vec![0.0; 160],
+            visualizer_peaks: vec![0.0; 160],
             visualizer_decay: default_decay,
             left_level: 0.0,
             right_level: 0.0,
@@ -287,6 +289,7 @@ impl AudioEngine {
                             st.metadata = None;
                             st.lyrics_state = LyricsState::NotFound;
                             st.visualizer_data.fill(0.0);
+                            st.visualizer_peaks.fill(0.0);
                             elapsed_millis = 0;
                         }
                         AudioCommand::SetVolume(vol) => {
@@ -307,6 +310,13 @@ impl AudioEngine {
                         }
                     }
                 }
+
+                // Compute delta before decay so it can be used for time-normalized decay
+                let now = Instant::now();
+                let delta = now.duration_since(last_tick);
+                last_tick = now;
+                // How many 60fps frames elapsed — used to normalize decay to frame rate
+                let dt_frames = (delta.as_secs_f32() * 60.0).clamp(0.5, 4.0);
 
                 // Jalamos todos los frames del visualizador que hayan llegado en este tick
                 let mut new_samples = Vec::new();
@@ -360,7 +370,11 @@ impl AudioEngine {
                         let avg = sum / (end - start) as f32;
 
                         let boost = 1.0 + (i as f32 / num_bars as f32) * 2.5;
-                        *bar = avg * boost * 0.7;
+                        let raw_lin = avg * boost;
+                        // Log-scale normalization so typical music fills 40-85% height
+                        // log10 range [-1, 2.5] mapped to [0, 1]
+                        let log_val = raw_lin.max(1e-10_f32).log10();
+                        *bar = ((log_val + 1.0) / 3.5).clamp(0.0, 1.0);
                     }
 
                     // Aplicamos el filtro de decay: cada barra baja gradualmente
@@ -368,34 +382,47 @@ impl AudioEngine {
                     let mut st = state_clone.lock().unwrap();
                     if st.visualizer_data.len() != num_bars {
                         st.visualizer_data = vec![0.0; num_bars];
+                        st.visualizer_peaks = vec![0.0; num_bars];
                     }
-                    let decay = st.visualizer_decay;
-                    for (vd, &nb) in st.visualizer_data.iter_mut().zip(new_bars.iter()) {
-                        *vd = (*vd * decay).max(nb);
+                    // Time-normalized decay: config value is "per 60fps frame"; scale by
+                    // actual elapsed frames so behavior is independent of thread wake rate.
+                    let frame_decay = st.visualizer_decay.powf(dt_frames);
+                    let peak_decay = 0.94_f32.powf(dt_frames);
+                    let AudioSharedState { ref mut visualizer_data, ref mut visualizer_peaks, ref mut left_level, ref mut right_level, .. } = *st;
+                    for ((vd, pk), &nb) in visualizer_data.iter_mut()
+                        .zip(visualizer_peaks.iter_mut())
+                        .zip(new_bars.iter())
+                    {
+                        *vd = (*vd * frame_decay).max(nb);
+                        if nb > *pk {
+                            *pk = nb;
+                        } else {
+                            *pk = (*pk * peak_decay).max(0.0);
+                        }
                     }
-                    st.left_level = (st.left_level * decay).max(last_left_peak);
-                    st.right_level = (st.right_level * decay).max(last_right_peak);
+                    *left_level = (*left_level * frame_decay).max(last_left_peak);
+                    *right_level = (*right_level * frame_decay).max(last_right_peak);
                 } else {
                     let mut st = state_clone.lock().unwrap();
                     if st.status != PlaybackStatus::Playing {
                         st.visualizer_data.fill(0.0);
+                        st.visualizer_peaks.fill(0.0);
                         st.left_level = 0.0;
                         st.right_level = 0.0;
                     } else {
-                        // Está reproduciendo pero no llegaron samples nuevos —
-                        // decaemos suavito pa que no se vea que se congeló
-                        let decay = (st.visualizer_decay + 0.15).min(0.95);
-                        for val in &mut st.visualizer_data {
-                            *val = (*val * decay).max(0.0);
+                        let frame_decay = st.visualizer_decay.powf(dt_frames);
+                        let peak_decay = 0.94_f32.powf(dt_frames);
+                        let AudioSharedState { ref mut visualizer_data, ref mut visualizer_peaks, ref mut left_level, ref mut right_level, .. } = *st;
+                        for (val, pk) in visualizer_data.iter_mut()
+                            .zip(visualizer_peaks.iter_mut())
+                        {
+                            *val = (*val * frame_decay).max(0.0);
+                            *pk = (*pk * peak_decay).max(0.0);
                         }
-                        st.left_level = (st.left_level * decay).max(0.0);
-                        st.right_level = (st.right_level * decay).max(0.0);
+                        *left_level = (*left_level * frame_decay).max(0.0);
+                        *right_level = (*right_level * frame_decay).max(0.0);
                     }
                 }
-
-                let now = Instant::now();
-                let delta = now.duration_since(last_tick);
-                last_tick = now;
 
                 // Sacamos el send_finished del bloque del mutex pa no mandarlo
                 // con el lock tomado — el send puede bloquearse un momento
@@ -416,6 +443,7 @@ impl AudioEngine {
                             st.current_track = None;
                             st.metadata = None;
                             st.visualizer_data.fill(0.0);
+                            st.visualizer_peaks.fill(0.0);
                             elapsed_millis = 0;
                             true
                         } else {
@@ -430,8 +458,8 @@ impl AudioEngine {
                     let _ = event_tx.send(crate::events::Event::AudioFinished);
                 }
 
-                // 30ms = ~33 FPS, suficiente pa que el visualizador se vea fluido
-                thread::sleep(Duration::from_millis(30));
+                // 16ms = ~60 FPS audio state updates
+                thread::sleep(Duration::from_millis(16));
             }
         });
 

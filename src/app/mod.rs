@@ -351,25 +351,44 @@ pub fn mtp_display_name(path: &Path) -> String {
 
 pub fn scan_external_drives() -> Vec<PathBuf> {
     let mut drives: Vec<PathBuf> = Vec::new();
-    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
-        for line in mounts.lines() {
-            let mut parts = line.split_whitespace();
-            let _device = parts.next();
-            let mount_point = match parts.next() {
-                Some(p) => p,
-                None => continue,
-            };
-            let is_external = mount_point.starts_with("/media/")
-                || mount_point.starts_with("/run/media/")
-                || (mount_point.starts_with("/mnt/") && mount_point.len() > 5);
-            if is_external {
-                let path = PathBuf::from(mount_point);
-                if path.is_dir() && !drives.contains(&path) {
+
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS, all volumes (external drives, USB sticks, disk images) mount under /Volumes/.
+        // The root system volume shows up as a symlink there — skip it.
+        if let Ok(entries) = std::fs::read_dir("/Volumes") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && !path.is_symlink() && !drives.contains(&path) {
                     drives.push(path);
                 }
             }
         }
     }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+            for line in mounts.lines() {
+                let mut parts = line.split_whitespace();
+                let _device = parts.next();
+                let mount_point = match parts.next() {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let is_external = mount_point.starts_with("/media/")
+                    || mount_point.starts_with("/run/media/")
+                    || (mount_point.starts_with("/mnt/") && mount_point.len() > 5);
+                if is_external {
+                    let path = PathBuf::from(mount_point);
+                    if path.is_dir() && !drives.contains(&path) {
+                        drives.push(path);
+                    }
+                }
+            }
+        }
+    }
+
     drives.sort();
     drives
 }
@@ -673,7 +692,10 @@ impl App {
                         self.external_drives = fresh;
                         // Refresh browser if it's showing a media directory
                         let cur = &self.browser.current_dir;
-                        if cur == Path::new("/media") || cur.starts_with("/run/media") {
+                        if cur == Path::new("/media")
+                            || cur.starts_with("/run/media")
+                            || cur == Path::new("/Volumes")
+                        {
                             self.browser.refresh();
                         }
                     }
@@ -1705,7 +1727,7 @@ impl App {
             KeyCode::Char('<') | KeyCode::Char(',') => {
                 if self.screen == AppScreen::Queue {
                     let mut current_decay = self.config.visualizer_decay;
-                    current_decay = (current_decay - 0.05).max(0.10);
+                    current_decay = (current_decay - 0.02).max(0.50);
                     self.config.visualizer_decay = current_decay;
                     if let Ok(mut state) = self.audio.shared_state.lock() {
                         state.visualizer_decay = current_decay;
@@ -1716,7 +1738,7 @@ impl App {
             KeyCode::Char('>') | KeyCode::Char('.') => {
                 if self.screen == AppScreen::Queue {
                     let mut current_decay = self.config.visualizer_decay;
-                    current_decay = (current_decay + 0.05).min(0.95);
+                    current_decay = (current_decay + 0.02).min(0.99);
                     self.config.visualizer_decay = current_decay;
                     if let Ok(mut state) = self.audio.shared_state.lock() {
                         state.visualizer_decay = current_decay;

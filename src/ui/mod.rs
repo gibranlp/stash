@@ -24,7 +24,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         vec![
             Constraint::Length(0),
             Constraint::Min(5),
-            Constraint::Length(6),
+            Constraint::Length(14),
             Constraint::Length(5),
             Constraint::Length(1),
         ]
@@ -742,32 +742,32 @@ pub fn render(f: &mut Frame, app: &mut App) {
         let player_text = player_lines;
 
         let bars = audio_state.visualizer_data.clone();
-        let visualizer_height = 4;
+        let raw_peaks = audio_state.visualizer_peaks.clone();
+        let visualizer_height = 12;
 
         // Interpolamos las barras del visualizador para que llenen el ancho disponible de la terminal
         let available_width = chunks[2].width.saturating_sub(2);
         let target_bars = (available_width / 2) as usize;
 
-        let mut interpolated_bars = Vec::new();
-        if target_bars > 0 && !bars.is_empty() {
-            let src_len = bars.len();
-            if target_bars == 1 {
-                interpolated_bars.push(bars[0]);
-            } else {
-                for j in 0..target_bars {
-                    let src_idx = (j as f32 / (target_bars - 1) as f32) * (src_len - 1) as f32;
-                    let idx_low = src_idx.floor() as usize;
-                    let idx_high = src_idx.ceil() as usize;
-                    let weight = src_idx - idx_low as f32;
-                    let val = if idx_low < src_len && idx_high < src_len {
-                        (1.0 - weight) * bars[idx_low] + weight * bars[idx_high]
-                    } else {
-                        bars[idx_low.min(src_len - 1)]
-                    };
-                    interpolated_bars.push(val);
+        let interpolate = |src: &[f32]| -> Vec<f32> {
+            if target_bars == 0 || src.is_empty() { return Vec::new(); }
+            let src_len = src.len();
+            if target_bars == 1 { return vec![src[0]]; }
+            (0..target_bars).map(|j| {
+                let src_idx = (j as f32 / (target_bars - 1) as f32) * (src_len - 1) as f32;
+                let idx_low = src_idx.floor() as usize;
+                let idx_high = src_idx.ceil() as usize;
+                let weight = src_idx - idx_low as f32;
+                if idx_low < src_len && idx_high < src_len {
+                    (1.0 - weight) * src[idx_low] + weight * src[idx_high]
+                } else {
+                    src[idx_low.min(src_len - 1)]
                 }
-            }
-        }
+            }).collect()
+        };
+
+        let interpolated_bars = interpolate(&bars);
+        let interpolated_peaks = interpolate(&raw_peaks);
 
         let num_bars = interpolated_bars.len();
         let mode_name = match app.config.visualizer_mode {
@@ -794,12 +794,18 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
                 if num_bars > 0 {
                     // Construimos el espectro fila por fila de abajo para arriba usando bloques Unicode graduales
-                    let chars = [" ", " ", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+                    let chars = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
                     for row in (0..visualizer_height).rev() {
                         let mut line = String::new();
-                        for &val in &interpolated_bars {
+                        for (bar_j, &val) in interpolated_bars.iter().enumerate() {
                             let scaled_val = val * visualizer_height as f32;
                             let row_floor = row as f32;
+                            // Peak row for this bar (0 = bottom)
+                            let peak_row = if bar_j < interpolated_peaks.len() {
+                                (interpolated_peaks[bar_j] * visualizer_height as f32) as usize
+                            } else {
+                                0
+                            };
                             if scaled_val >= row_floor + 1.0 {
                                 line.push_str("█ ");
                             } else if scaled_val > row_floor {
@@ -807,6 +813,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
                                 let char_idx = (fraction * 8.0) as usize;
                                 let idx = char_idx.min(8);
                                 line.push_str(&format!("{} ", chars[idx]));
+                            } else if peak_row == row && peak_row > 0 {
+                                // Cava-style falling peak marker
+                                line.push_str("▀ ");
                             } else {
                                 line.push_str("  ");
                             }
@@ -815,19 +824,26 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     }
                 }
 
-                let row_colors = [
-                    Color::Red,
-                    Color::Magenta,
-                    Color::Yellow,
-                    Color::Green,
-                ];
-
                 Paragraph::new(
                     lines
                         .iter()
                         .enumerate()
                         .map(|(row_idx, l)| {
-                            let color = row_colors.get(row_idx).copied().unwrap_or(Color::Cyan);
+                            // Cava-style gradient: top rows red, bottom rows cyan
+                            let t = row_idx as f32 / (visualizer_height as f32 - 1.0);
+                            let color = if t < 0.17 {
+                                Color::Red
+                            } else if t < 0.33 {
+                                Color::LightRed
+                            } else if t < 0.5 {
+                                Color::Yellow
+                            } else if t < 0.67 {
+                                Color::LightGreen
+                            } else if t < 0.83 {
+                                Color::Green
+                            } else {
+                                Color::Cyan
+                            };
                             Line::from(vec![
                                 Span::raw(padding_str.clone()),
                                 Span::styled(l.clone(), Style::default().fg(color).add_modifier(Modifier::BOLD)),
@@ -847,12 +863,13 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 };
 
                 if num_bars > 0 {
-                    // La onda simétrica: calculamos qué tan lejos está cada fila del centro (1.5)
+                    let center = (visualizer_height as f32 - 1.0) / 2.0;
+                    let max_dist = center;
                     for (row, line_str) in lines.iter_mut().enumerate() {
                         let mut line = String::new();
                         for &val in &interpolated_bars {
-                            let dist = (row as f32 - 1.5).abs();
-                            let scaled_val = (val * 2.5).min(1.5);
+                            let dist = (row as f32 - center).abs();
+                            let scaled_val = (val * (max_dist + 0.5)).min(max_dist);
                             if scaled_val >= dist {
                                 line.push_str("█ ");
                             } else {
@@ -863,19 +880,23 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     }
                 }
 
-                let row_colors = [
-                    Color::Red,
-                    Color::Magenta,
-                    Color::Magenta,
-                    Color::Red,
-                ];
-
                 Paragraph::new(
                     lines
                         .iter()
                         .enumerate()
                         .map(|(row_idx, l)| {
-                            let color = row_colors.get(row_idx).copied().unwrap_or(Color::Cyan);
+                            let center = (visualizer_height as f32 - 1.0) / 2.0;
+                            let dist_from_center = (row_idx as f32 - center).abs();
+                            let t = dist_from_center / center;
+                            let color = if t > 0.75 {
+                                Color::Red
+                            } else if t > 0.5 {
+                                Color::LightRed
+                            } else if t > 0.25 {
+                                Color::Yellow
+                            } else {
+                                Color::Cyan
+                            };
                             Line::from(vec![
                                 Span::raw(padding_str.clone()),
                                 Span::styled(l.clone(), Style::default().fg(color).add_modifier(Modifier::BOLD)),

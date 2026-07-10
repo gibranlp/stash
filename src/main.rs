@@ -111,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             true,
         );
 
-        match rx.recv_timeout(Duration::from_millis(if cfg!(target_os = "macos") { 20 } else { 50 })) {
+        match rx.recv_timeout(Duration::from_millis(16)) {
             Ok(event) => {
                 app.handle_event(event);
                 while let Ok(e) = rx.try_recv() {

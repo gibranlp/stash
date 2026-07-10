@@ -27,7 +27,7 @@ pub struct AppConfig {
 }
 
 fn default_visualizer_decay() -> f32 {
-    0.70
+    0.88
 }
 
 impl Default for AppConfig {
@@ -41,7 +41,7 @@ impl Default for AppConfig {
             shuffle: false,
             repeat: RepeatMode::Off,
             visualizer_mode: VisualizerMode::Spectrum,
-            visualizer_decay: 0.70,
+            visualizer_decay: 0.88,
             discord_app_id: None,
             acoustid_api_key: None,
         }
