@@ -29,3 +29,6 @@ base64 = "0.21"
 ureq = { version = "2", features = ["json"] }
 urlencoding = "2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
+

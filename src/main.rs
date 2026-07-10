@@ -99,7 +99,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Loop principal: esperamos maximo 50ms por un evento, procesamos todos los que haya
     // acumulados, y luego pintamos. Así no se traba con rafagas de teclas
     while !app.should_quit {
-        match rx.recv_timeout(Duration::from_millis(50)) {
+        // souvlaki's macOS backend (MPRemoteCommandCenter/MPNowPlayingInfoCenter) talks to
+        // mediaremoted/nowplayingd over an XPC connection scheduled on this thread's run
+        // loop. Since we never run a Cocoa/CFRunLoop (no NSApplication, no winit), incoming
+        // media-key commands and Now Playing registration silently never get delivered.
+        // Pumping it briefly each tick is enough — no window required.
+        #[cfg(target_os = "macos")]
+        core_foundation::runloop::CFRunLoop::run_in_mode(
+            unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
+            Duration::from_millis(10),
+            true,
+        );
+
+        match rx.recv_timeout(Duration::from_millis(if cfg!(target_os = "macos") { 20 } else { 50 })) {
             Ok(event) => {
                 app.handle_event(event);
                 while let Ok(e) = rx.try_recv() {
