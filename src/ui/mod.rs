@@ -136,7 +136,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
             // Si hay unidades externas conectadas, les damos un panel abajo del árbol
             let drives = &app.external_drives;
             let (tree_area, devices_panel_area) = if !drives.is_empty() {
-                let panel_height = (drives.len() as u16 + 2).min(6);
+                // Fixed 2 content rows; columns expand horizontally to fit many drives
+                let panel_height = 4u16;
                 let v = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Min(3), Constraint::Length(panel_height)])
@@ -293,23 +294,49 @@ pub fn render(f: &mut Frame, app: &mut App) {
             f.render_stateful_widget(files_list, tree_area, &mut app.files_list_state);
 
             if let Some(panel_area) = devices_panel_area {
-                let drive_items: Vec<ratatui::widgets::ListItem> = app.external_drives.iter().map(|path| {
-                    let name = path.file_name()
+                let drives = &app.external_drives;
+                let inner_w = panel_area.width.saturating_sub(2) as usize;
+
+                let max_name = drives.iter()
+                    .map(|p| p.file_name().map(|n| n.to_string_lossy().chars().count()).unwrap_or(4))
+                    .max().unwrap_or(6);
+                // col_w: 3 chars for " `` " prefix + name + 1 trailing space
+                let col_w = (max_name + 4).max(8).min(32);
+                let num_cols = (inner_w / col_w).max(1);
+
+                let drive_names: Vec<String> = drives.iter().map(|p| {
+                    let raw: String = p.file_name()
                         .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                    ratatui::widgets::ListItem::new(Line::from(vec![
-                        Span::styled("  \u{f0a0} ", Style::default().fg(Color::Yellow)),
-                        Span::styled(name, Style::default().fg(Color::White)),
-                    ]))
+                        .unwrap_or_else(|| p.to_string_lossy().into_owned());
+                    let max_chars = col_w.saturating_sub(4);
+                    let chars: Vec<char> = raw.chars().collect();
+                    if chars.len() > max_chars {
+                        let mut s: String = chars[..max_chars.saturating_sub(1)].iter().collect();
+                        s.push('…');
+                        s
+                    } else {
+                        raw
+                    }
                 }).collect();
-                let drives_list = List::new(drive_items).block(
+
+                let lines: Vec<Line> = drive_names.chunks(num_cols).map(|row| {
+                    let mut spans: Vec<Span> = Vec::new();
+                    for name in row {
+                        let padded = format!("{:<width$}", name, width = col_w.saturating_sub(4));
+                        spans.push(Span::styled(" \u{f0a0} ", Style::default().fg(Color::Yellow)));
+                        spans.push(Span::styled(padded, Style::default().fg(Color::White)));
+                    }
+                    Line::from(spans)
+                }).collect();
+
+                let drives_para = Paragraph::new(lines).block(
                     Block::default()
                         .borders(Borders::ALL)
                         .border_type(BorderType::Plain)
                         .border_style(Style::default().fg(Color::DarkGray))
                         .title(Span::styled(" Drives [E] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
                 );
-                f.render_widget(drives_list, panel_area);
+                f.render_widget(drives_para, panel_area);
             }
 
             if let Some(area) = preview_area {

@@ -253,6 +253,7 @@ pub struct App {
     pub last_operation_dest: String,
     pub picker: Option<ratatui_image::picker::Picker>,
     pub external_drives: Vec<PathBuf>,
+    pub drive_scan_ticks: u16,
     pub dest_browser: Option<DestBrowserState>,
     pub conflict_condvar: Arc<Condvar>,
     pub library: LibraryState,
@@ -530,6 +531,7 @@ impl App {
             last_operation_dest: String::new(),
             picker,
             external_drives: scan_external_drives(),
+            drive_scan_ticks: 0,
             dest_browser: None,
             conflict_condvar: Arc::new(Condvar::new()),
             library: LibraryState::new(),
@@ -663,6 +665,11 @@ impl App {
             Event::Key(key) => self.handle_key(key),
             Event::Paste(content) => self.handle_paste(content),
             Event::Tick => {
+                self.drive_scan_ticks += 1;
+                if self.drive_scan_ticks >= 100 {
+                    self.drive_scan_ticks = 0;
+                    self.external_drives = scan_external_drives();
+                }
                 if let Some((_, ref mut ticks)) = self.notification {
                     if *ticks == 0 {
                         self.notification = None;
