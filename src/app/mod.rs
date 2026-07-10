@@ -666,9 +666,17 @@ impl App {
             Event::Paste(content) => self.handle_paste(content),
             Event::Tick => {
                 self.drive_scan_ticks += 1;
-                if self.drive_scan_ticks >= 100 {
+                if self.drive_scan_ticks >= 20 {
                     self.drive_scan_ticks = 0;
-                    self.external_drives = scan_external_drives();
+                    let fresh = scan_external_drives();
+                    if fresh != self.external_drives {
+                        self.external_drives = fresh;
+                        // Refresh browser if it's showing a media directory
+                        let cur = &self.browser.current_dir;
+                        if cur == Path::new("/media") || cur.starts_with("/run/media") {
+                            self.browser.refresh();
+                        }
+                    }
                 }
                 if let Some((_, ref mut ticks)) = self.notification {
                     if *ticks == 0 {
@@ -4059,10 +4067,40 @@ impl App {
     }
 
     fn handle_healer_list_key(&mut self, key: KeyEvent) {
-        let file_count = self.healer.files.len();
+        // When search is active, route input to the search query
+        if self.healer.search_active {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.healer.search_active = false;
+                }
+                KeyCode::Backspace => {
+                    self.healer.search_query.pop();
+                    self.healer.list_idx = 0;
+                    self.healer.list_state.select(Some(0));
+                }
+                KeyCode::Char(c) => {
+                    self.healer.search_query.push(c);
+                    self.healer.list_idx = 0;
+                    self.healer.list_state.select(Some(0));
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        let file_count = self.healer.filtered_indices().len();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.healer.screen = HealerScreen::Report;
+                if !self.healer.search_query.is_empty() {
+                    self.healer.search_query.clear();
+                    self.healer.list_idx = 0;
+                    self.healer.list_state.select(Some(0));
+                } else {
+                    self.healer.screen = HealerScreen::Report;
+                }
+            }
+            KeyCode::Char('/') => {
+                self.healer.search_active = true;
             }
             KeyCode::Char('1') => { self.screen = AppScreen::Browser; }
             KeyCode::Char('2') => {
@@ -4289,17 +4327,16 @@ impl App {
                     if let Some(v) = m.tags.track      { track.track  = Some(v); }
                 }
                 // Remove the now-fixed file from the healer list
-                let idx = self.healer.list_idx;
-                if idx < self.healer.files.len() {
-                    self.healer.files.remove(idx);
+                if let Some(actual_idx) = self.healer.current_file_index() {
+                    self.healer.files.remove(actual_idx);
                 }
-                let new_len = self.healer.files.len();
-                if new_len == 0 {
+                let new_visible = self.healer.filtered_indices().len();
+                if new_visible == 0 {
                     self.healer.list_idx = 0;
                     self.healer.list_state.select(None);
                 } else {
-                    if self.healer.list_idx >= new_len {
-                        self.healer.list_idx = new_len - 1;
+                    if self.healer.list_idx >= new_visible {
+                        self.healer.list_idx = new_visible - 1;
                     }
                     self.healer.list_state.select(Some(self.healer.list_idx));
                 }

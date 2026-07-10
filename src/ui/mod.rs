@@ -1139,7 +1139,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(search_para, search_rect);
 
         // Posicionamos el cursor del terminal justo después del texto del query
-        let cursor_x = (search_rect.x + 9 + app.search.query.width() as u16)
+        let cursor_x = (search_rect.x + 10 + app.search.query.width() as u16)
             .min(search_rect.x + search_rect.width.saturating_sub(1));
         f.set_cursor(cursor_x, search_y);
     }
@@ -2799,7 +2799,7 @@ fn render_tag_editor_popup(f: &mut Frame, app: &App) {
 
     // Position terminal cursor when editing
     if app.input_mode == InputMode::TagEdit {
-        let field_line_y = inner.y + 1 + editor.active_field as u16 + 1;
+        let field_line_y = inner.y + 1 + editor.active_field as u16;
         let prefix_width = 2 + 2 + 9 + 2; // "> " + "  " + fieldname padded + ": "
         let value_before: String = editor.fields[editor.active_field].chars().take(editor.cursor_pos).collect();
         let cursor_x = (inner.x + prefix_width + value_before.width() as u16)
@@ -2966,15 +2966,20 @@ fn render_healer_report(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_healer_filelist(f: &mut Frame, app: &mut App, area: Rect) {
+    let search_hint = if !app.healer.search_query.is_empty() {
+        format!(" Files With Issues — filter: {} ", app.healer.search_query)
+    } else {
+        " Files With Issues ".to_string()
+    };
     let block = Block::default()
-        .title(" Files With Issues ")
+        .title(search_hint)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan));
 
-    let sick_files = &app.healer.files;
-
-    let items: Vec<ListItem> = sick_files.iter().enumerate().map(|(i, hf)| {
+    let indices = app.healer.filtered_indices();
+    let items: Vec<ListItem> = indices.iter().enumerate().map(|(display_i, &file_i)| {
+        let hf = &app.healer.files[file_i];
         let status_char = match hf.status {
             HealStatus::Pending => "?",
             HealStatus::Skipped => "-",
@@ -2990,7 +2995,7 @@ fn render_healer_filelist(f: &mut Frame, app: &mut App, area: Rect) {
             String::new()
         };
         let label = format!(" [{}] {}{} | {}", status_char, fname, match_hint, issues_str.join(", "));
-        let style = if i == app.healer.list_idx {
+        let style = if display_i == app.healer.list_idx {
             Style::default().fg(Color::Black).bg(Color::Cyan)
         } else {
             match hf.status {
@@ -3002,8 +3007,28 @@ fn render_healer_filelist(f: &mut Frame, app: &mut App, area: Rect) {
         ListItem::new(Line::from(Span::styled(label, style)))
     }).collect();
 
+    let inner = block.inner(area);
     let list = List::new(items).block(block);
     f.render_stateful_widget(list, area, &mut app.healer.list_state);
+
+    // Search bar overlay at the bottom of the list area
+    if app.healer.search_active || !app.healer.search_query.is_empty() {
+        let bar_y = inner.y + inner.height.saturating_sub(1);
+        let bar = Rect::new(inner.x, bar_y, inner.width, 1);
+        let search_para = Paragraph::new(Line::from(vec![
+            Span::styled("Search /: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(&app.healer.search_query, Style::default().fg(Color::White)),
+        ]));
+        f.render_widget(Clear, bar);
+        f.render_widget(search_para, bar);
+
+        if app.healer.search_active {
+            use unicode_width::UnicodeWidthStr;
+            let cursor_x = (bar.x + 10 + app.healer.search_query.width() as u16)
+                .min(bar.x + bar.width.saturating_sub(1));
+            f.set_cursor(cursor_x, bar_y);
+        }
+    }
 }
 
 fn render_healer_preview(f: &mut Frame, app: &App, area: Rect) {

@@ -49,6 +49,56 @@ impl BrowserState {
             &self.selected_paths,
             &mut new_files,
         );
+
+        // When browsing /media, also surface drives from /run/media/*/
+        // (udisks2 mounts there on Arch/systemd systems)
+        if self.current_dir == Path::new("/media") {
+            let mut injected: Vec<(String, PathBuf)> = Vec::new();
+            if let Ok(user_dirs) = fs::read_dir("/run/media") {
+                for user_entry in user_dirs.flatten() {
+                    let user_dir = user_entry.path();
+                    if !user_dir.is_dir() { continue; }
+                    if let Ok(drives) = fs::read_dir(&user_dir) {
+                        for drive_entry in drives.flatten() {
+                            let drive_path = drive_entry.path();
+                            if drive_path.is_dir()
+                                && !new_files.iter().any(|f| f.path == drive_path)
+                            {
+                                let name = drive_entry.file_name().to_string_lossy().into_owned();
+                                injected.push((name, drive_path));
+                            }
+                        }
+                    }
+                }
+            }
+            injected.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+            for (name, drive_path) in injected {
+                let is_selected = self.selected_paths.contains(&drive_path);
+                let is_expanded = self.expanded_paths.contains(&drive_path);
+                new_files.push(crate::models::FileItem {
+                    name,
+                    path: drive_path.clone(),
+                    size: 0,
+                    is_dir: true,
+                    modified: None,
+                    is_selected,
+                    metadata: None,
+                    depth: 0,
+                    is_expanded,
+                });
+                if is_expanded {
+                    build_tree(
+                        &drive_path,
+                        1,
+                        self.show_hidden,
+                        &self.expanded_paths,
+                        &self.selected_paths,
+                        &mut new_files,
+                    );
+                }
+            }
+        }
+
         self.files = new_files;
 
         if self.files.is_empty() {

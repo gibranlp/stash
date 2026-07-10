@@ -140,6 +140,8 @@ pub struct HealerState {
     pub edit_cursor:    usize,
     pub edit_typing:    bool,
     pub edit_original:  Option<[String; 8]>,
+    pub search_query:   String,
+    pub search_active:  bool,
 }
 
 impl HealerState {
@@ -161,6 +163,8 @@ impl HealerState {
             edit_cursor:    0,
             edit_typing:    false,
             edit_original:  None,
+            search_query:   String::new(),
+            search_active:  false,
         }
     }
 
@@ -203,17 +207,37 @@ impl HealerState {
         }
     }
 
+    pub fn filtered_indices(&self) -> Vec<usize> {
+        if self.search_query.is_empty() {
+            return (0..self.files.len()).collect();
+        }
+        let q = self.search_query.to_lowercase();
+        self.files.iter().enumerate()
+            .filter(|(_, f)| {
+                let name = f.path.file_name()
+                    .map(|n| n.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                name.contains(&q)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn current_file_index(&self) -> Option<usize> {
+        self.filtered_indices().get(self.list_idx).copied()
+    }
+
     pub fn current_file(&self) -> Option<&HealerFile> {
-        self.files.get(self.list_idx)
+        self.current_file_index().and_then(|i| self.files.get(i))
     }
 
     pub fn current_file_mut(&mut self) -> Option<&mut HealerFile> {
-        self.files.get_mut(self.list_idx)
+        let i = self.current_file_index()?;
+        self.files.get_mut(i)
     }
 
     pub fn current_match(&self) -> Option<&HealMatch> {
-        self.files.get(self.list_idx)
-            .and_then(|f| f.matches.get(self.match_idx))
+        self.current_file().and_then(|f| f.matches.get(self.match_idx))
     }
 
     pub fn load_editor_from_match(&mut self) {
@@ -238,7 +262,8 @@ impl HealerState {
     }
 
     pub fn load_editor_from_original(&mut self) {
-        if let Some(f) = self.files.get(self.list_idx) {
+        let idx = self.current_file_index();
+        if let Some(f) = idx.and_then(|i| self.files.get(i)) {
             let t = &f.original;
             let fields = [
                 t.title.clone().unwrap_or_default(),

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use lofty::prelude::*;
 use lofty::probe::Probe;
-use lofty::config::WriteOptions;
+use lofty::config::{ParseOptions, ParsingMode, WriteOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::collections::Collections;
@@ -477,8 +477,10 @@ fn scan_single_track(path: PathBuf) -> LibraryTrack {
 
 pub fn write_tags(editor: &mut TagEditorState) {
     let result = (|| -> anyhow::Result<()> {
+        let parse_opts = ParseOptions::new().parsing_mode(ParsingMode::Relaxed);
         let mut tagged_file = Probe::open(&editor.path)
             .map_err(|e| anyhow::anyhow!("Cannot open: {}", e))?
+            .options(parse_opts)
             .read()
             .map_err(|e| anyhow::anyhow!("Cannot read: {}", e))?;
 
