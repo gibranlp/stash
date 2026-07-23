@@ -188,6 +188,7 @@ pub enum InputMode {
     BulkTagEdit,
     ConfirmDeletePlaylist,
     ManageMusicFolders,
+    ConfirmUpdate,
 }
 
 #[derive(Debug, Clone)]
@@ -1150,15 +1151,16 @@ impl App {
             InputMode::BulkTagEdit => self.handle_bulk_tag_edit_key(key),
             InputMode::ConfirmDeletePlaylist => self.handle_confirm_delete_playlist_key(key),
             InputMode::ManageMusicFolders => self.handle_manage_folders_key(key),
+            InputMode::ConfirmUpdate => self.handle_confirm_update_key(key),
         }
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
-        // U triggers update from any screen when an update is available
-        if key.code == KeyCode::Char('U') {
+        // U or u opens the update confirmation dialog from any screen when an update is available
+        if key.code == KeyCode::Char('U') || key.code == KeyCode::Char('u') {
             let state = self.update.lock().unwrap().clone();
-            if let crate::updater::UpdateProgress::Available { version, url } = state {
-                crate::updater::spawn_download(version, url, self.update.clone());
+            if let crate::updater::UpdateProgress::Available { .. } = state {
+                self.input_mode = InputMode::ConfirmUpdate;
                 return;
             }
         }
@@ -2306,6 +2308,22 @@ impl App {
         }
     }
 
+    fn handle_confirm_update_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                let state = self.update.lock().unwrap().clone();
+                if let crate::updater::UpdateProgress::Available { version, url } = state {
+                    crate::updater::spawn_download(version, url, self.update.clone());
+                }
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
     fn toggle_playback(&self) {
         let status = {
             let state = self.audio.shared_state.lock().unwrap();
@@ -3127,7 +3145,8 @@ impl App {
             | InputMode::TagEdit
             | InputMode::BulkTagEdit
             | InputMode::ConfirmDeletePlaylist
-            | InputMode::ManageMusicFolders => {
+            | InputMode::ManageMusicFolders
+            | InputMode::ConfirmUpdate => {
                 let paths = Self::parse_dropped_paths(&content);
                 if !paths.is_empty() {
                     let dest_dir = self.browser.current_dir.clone();
