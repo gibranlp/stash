@@ -1155,7 +1155,7 @@ impl App {
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
         // U triggers update from any screen when an update is available
-        if key.code == KeyCode::Char('U') && key.modifiers.is_empty() {
+        if key.code == KeyCode::Char('U') {
             let state = self.update.lock().unwrap().clone();
             if let crate::updater::UpdateProgress::Available { version, url } = state {
                 crate::updater::spawn_download(version, url, self.update.clone());
