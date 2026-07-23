@@ -28,6 +28,7 @@ ratatui-image = { version = "0.5.1", features = ["crossterm"] }
 base64 = "0.21"
 ureq = { version = "2", features = ["json"] }
 urlencoding = "2"
+notify = { version = "6", features = ["macos_fsevent"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9"

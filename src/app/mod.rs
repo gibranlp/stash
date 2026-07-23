@@ -8,7 +8,7 @@ use crate::collections::Collections;
 use crate::config::{AppConfig, resolve_path};
 use crate::discord::DiscordPresence;
 use crate::events::Event;
-use crate::library::{LibraryState, LibraryPanel, LibraryTrack, ScanState, TagEditorState, write_tags, is_smart_playlist};
+use crate::library::{LibraryState, LibraryPanel, LibraryTrack, ScanState, TagEditorState, BulkTagEditorState, write_tags, write_bulk_tag_to_path, is_smart_playlist, start_library_watcher};
 use crate::models::{PlaybackStatus, RepeatMode, VisualizerMode};
 use crate::queue::PlaybackQueue;
 use crate::search::{SearchState, matches_audio_extension, matches_image_extension, matches_text_extension};
@@ -21,6 +21,7 @@ use crate::healer::fingerprint;
 use ratatui::widgets::ListState;
 use lofty::prelude::*;
 use lofty::probe::Probe;
+use notify::RecommendedWatcher;
 
 type LoadingImageSlot = Arc<Mutex<Option<(PathBuf, Option<image::DynamicImage>)>>>;
 type LoadingTextSlot  = Arc<Mutex<Option<(PathBuf, Option<Vec<String>>)>>>;
@@ -184,6 +185,7 @@ pub enum InputMode {
     Rename,
     CreateFolder,
     TagEdit,
+    BulkTagEdit,
     ConfirmDeletePlaylist,
     ManageMusicFolders,
 }
@@ -268,6 +270,13 @@ pub struct App {
     pub stats_tracking: StatsTracking,
     pub healer: HealerState,
     pub healer_backup: BackupStore,
+    pub m_hold_start: Option<std::time::Instant>,
+    pub m_last_press: Option<std::time::Instant>,
+    pub m_select_all_triggered: bool,
+    pub m_clear_all_triggered: bool,
+    pub library_rescan_after: Option<std::time::Instant>,
+    _library_watcher: Option<RecommendedWatcher>,
+    event_tx: std::sync::mpsc::Sender<Event>,
 }
 
 // Escanea interfaces USB buscando dispositivos MTP (clase 06 = Still Image / MTP)
@@ -504,6 +513,8 @@ impl App {
             }
         };
 
+        let library_watcher = start_library_watcher(&config.music_folders, event_tx.clone());
+
         Self {
             browser,
             audio,
@@ -569,7 +580,18 @@ impl App {
             stats_tracking: StatsTracking::default(),
             healer: HealerState::new(),
             healer_backup: BackupStore::load(),
+            m_hold_start: None,
+            m_last_press: None,
+            m_select_all_triggered: false,
+            m_clear_all_triggered: false,
+            library_rescan_after: None,
+            _library_watcher: library_watcher,
+            event_tx,
         }
+    }
+
+    fn restart_library_watcher(&mut self) {
+        self._library_watcher = start_library_watcher(&self.config.music_folders, self.event_tx.clone());
     }
 
     fn jump_to_external_drives(&mut self) {
@@ -684,6 +706,29 @@ impl App {
             Event::Key(key) => self.handle_key(key),
             Event::Paste(content) => self.handle_paste(content),
             Event::Tick => {
+                // Detect 'm' key release: no 'm' press for 300ms means the key was let go
+                if let Some(last) = self.m_last_press {
+                    if last.elapsed() >= std::time::Duration::from_millis(300) {
+                        if !self.m_select_all_triggered && self.m_hold_start.is_some() {
+                            // Short tap — toggle the current track
+                            let filter_query = if self.search.active { self.search.query.clone() } else { String::new() };
+                            let visible: Vec<PathBuf> = self.library
+                                .visible_tracks(&self.collections, &filter_query, &self.stats)
+                                .iter().map(|t| t.path.clone()).collect();
+                            if let Some(path) = visible.get(self.library.track_index).cloned() {
+                                if self.library.selected_tracks.contains(&path) {
+                                    self.library.selected_tracks.remove(&path);
+                                } else {
+                                    self.library.selected_tracks.insert(path);
+                                }
+                            }
+                        }
+                        self.m_hold_start = None;
+                        self.m_last_press = None;
+                        self.m_select_all_triggered = false;
+                        self.m_clear_all_triggered = false;
+                    }
+                }
                 self.drive_scan_ticks += 1;
                 if self.drive_scan_ticks >= 20 {
                     self.drive_scan_ticks = 0;
@@ -855,6 +900,14 @@ impl App {
                 if self.library.scan_state == ScanState::Scanning {
                     self.library.poll_scan();
                 }
+                if let Some(deadline) = self.library_rescan_after {
+                    if std::time::Instant::now() >= deadline {
+                        self.library_rescan_after = None;
+                        if self.library.scan_state != ScanState::Scanning {
+                            self.library.start_scan(&self.config.music_folders);
+                        }
+                    }
+                }
                 if self.healer.scan_state == HealScanState::Scanning {
                     self.healer.poll_scan();
                 }
@@ -941,6 +994,12 @@ impl App {
             }
             Event::MediaSetPosition(duration) => {
                 self.audio.seek(duration);
+            }
+            Event::LibraryChanged => {
+                // Debounce: wait 2s after the last change before triggering a rescan
+                self.library_rescan_after = Some(
+                    std::time::Instant::now() + std::time::Duration::from_secs(2)
+                );
             }
         }
     }
@@ -1088,6 +1147,7 @@ impl App {
             InputMode::Rename => self.handle_rename_key(key),
             InputMode::CreateFolder => self.handle_create_folder_key(key),
             InputMode::TagEdit => self.handle_tag_edit_key(key),
+            InputMode::BulkTagEdit => self.handle_bulk_tag_edit_key(key),
             InputMode::ConfirmDeletePlaylist => self.handle_confirm_delete_playlist_key(key),
             InputMode::ManageMusicFolders => self.handle_manage_folders_key(key),
         }
@@ -2043,6 +2103,7 @@ impl App {
             }
         }
         if added {
+            self.restart_library_watcher();
             self.library.start_scan(&self.config.music_folders);
             self.notification = Some(("Added to library — scanning now".to_string(), 60));
         }
@@ -3064,6 +3125,7 @@ impl App {
             InputMode::Normal
             | InputMode::ConfirmDelete
             | InputMode::TagEdit
+            | InputMode::BulkTagEdit
             | InputMode::ConfirmDeletePlaylist
             | InputMode::ManageMusicFolders => {
                 let paths = Self::parse_dropped_paths(&content);
@@ -3522,7 +3584,40 @@ impl App {
     }
 
     fn handle_library_normal_key(&mut self, key: KeyEvent) {
-        // Tag editor takes priority when open — intercept navigation and editing keys
+        // Bulk tag editor intercept
+        if self.library.bulk_tag_editor.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.library.bulk_tag_editor = None;
+                    self.input_mode = InputMode::Normal;
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                    if let Some(ref mut ed) = self.library.bulk_tag_editor {
+                        ed.active_field = (ed.active_field + 1) % 5;
+                        ed.cursor_pos = ed.fields[ed.active_field].chars().count();
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                    if let Some(ref mut ed) = self.library.bulk_tag_editor {
+                        ed.active_field = if ed.active_field == 0 { 4 } else { ed.active_field - 1 };
+                        ed.cursor_pos = ed.fields[ed.active_field].chars().count();
+                    }
+                }
+                KeyCode::Enter => {
+                    self.input_mode = InputMode::BulkTagEdit;
+                }
+                KeyCode::Char('w') => {
+                    self.do_write_bulk_tags();
+                }
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.do_write_bulk_tags();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Single tag editor takes priority when open — intercept navigation and editing keys
         if self.library.tag_editor.is_some() {
             match key.code {
                 KeyCode::Esc => {
@@ -3545,6 +3640,12 @@ impl App {
                 }
                 KeyCode::Char('w') => {
                     self.do_write_tags();
+                }
+                KeyCode::Char('n') => {
+                    self.navigate_tag_editor(1);
+                }
+                KeyCode::Char('p') => {
+                    self.navigate_tag_editor(-1);
                 }
                 _ => {}
             }
@@ -3683,7 +3784,52 @@ impl App {
             }
             KeyCode::Char('e') => {
                 if self.library.focused_panel == LibraryPanel::Tracks {
-                    self.open_tag_editor_for_selected();
+                    if !self.library.selected_tracks.is_empty() {
+                        self.open_bulk_tag_editor();
+                    } else {
+                        self.open_tag_editor_for_selected();
+                    }
+                }
+            }
+            KeyCode::Char('m') => {
+                if self.library.focused_panel == LibraryPanel::Tracks {
+                    let now = std::time::Instant::now();
+                    if self.m_hold_start.is_none() {
+                        // First press — start hold timer, don't act yet
+                        self.m_hold_start = Some(now);
+                        self.m_last_press = Some(now);
+                        self.m_select_all_triggered = false;
+                        self.m_clear_all_triggered = false;
+                    } else {
+                        self.m_last_press = Some(now);
+                        let elapsed = now.duration_since(self.m_hold_start.unwrap());
+                        if self.m_select_all_triggered && !self.m_clear_all_triggered
+                            && elapsed >= std::time::Duration::from_secs(3)
+                        {
+                            // Held 3s — clear all selection
+                            self.library.selected_tracks.clear();
+                            self.m_clear_all_triggered = true;
+                        } else if !self.m_select_all_triggered
+                            && elapsed >= std::time::Duration::from_secs(2)
+                        {
+                            // Held 2s — select all visible tracks
+                            let filter_query = if self.search.active { self.search.query.clone() } else { String::new() };
+                            let paths: Vec<PathBuf> = self.library
+                                .visible_tracks(&self.collections, &filter_query, &self.stats)
+                                .iter().map(|t| t.path.clone()).collect();
+                            for p in paths {
+                                self.library.selected_tracks.insert(p);
+                            }
+                            self.m_select_all_triggered = true;
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('E') => {
+                if self.library.focused_panel == LibraryPanel::Tracks
+                    && !self.library.selected_tracks.is_empty()
+                {
+                    self.open_bulk_tag_editor();
                 }
             }
             KeyCode::Char('a') => {
@@ -3727,7 +3873,10 @@ impl App {
                 self.library.track_index = 0;
             }
             KeyCode::Char('R') => {
-                self.library.start_scan(&self.config.music_folders);
+                if self.library.scan_state != ScanState::Scanning {
+                    self.library.start_scan(&self.config.music_folders);
+                    self.notification = Some(("Library scan started".to_string(), 40));
+                }
             }
             KeyCode::Char('F') => {
                 self.manage_folders_index = 0;
@@ -3808,6 +3957,7 @@ impl App {
         let visible: Vec<LibraryTrack> = self.library
             .visible_tracks(&self.collections, &filter_query, &self.stats)
             .iter().map(|t| (*t).clone()).collect();
+        let track_list: Vec<PathBuf> = visible.iter().map(|t| t.path.clone()).collect();
         let idx = self.library.track_index;
         if let Some(track) = visible.get(idx) {
             let editor = TagEditorState {
@@ -3824,9 +3974,129 @@ impl App {
                 cursor_pos: 0,
                 dirty: false,
                 save_result: None,
+                track_list,
+                track_list_idx: idx,
             };
             self.library.tag_editor = Some(editor);
         }
+    }
+
+    fn navigate_tag_editor(&mut self, delta: i64) {
+        // Save dirty state first
+        if self.library.tag_editor.as_ref().map(|e| e.dirty).unwrap_or(false) {
+            self.do_write_tags();
+        }
+
+        let (track_list, current_idx, active_field) = match self.library.tag_editor {
+            Some(ref ed) => (ed.track_list.clone(), ed.track_list_idx, ed.active_field),
+            None => return,
+        };
+
+        let new_idx = if delta > 0 {
+            current_idx + 1
+        } else {
+            current_idx.saturating_sub(1)
+        };
+
+        if new_idx == current_idx || new_idx >= track_list.len() { return; }
+
+        let path = track_list[new_idx].clone();
+        if let Some(track) = self.library.tracks.iter().find(|t| t.path == path).cloned() {
+            let editor = TagEditorState {
+                path: track.path.clone(),
+                fields: [
+                    track.title.clone().unwrap_or_default(),
+                    track.artist.clone().unwrap_or_default(),
+                    track.album.clone().unwrap_or_default(),
+                    track.track.map(|n| n.to_string()).unwrap_or_default(),
+                    track.year.map(|n| n.to_string()).unwrap_or_default(),
+                    track.genre.clone().unwrap_or_default(),
+                ],
+                active_field,
+                cursor_pos: 0,
+                dirty: false,
+                save_result: None,
+                track_list,
+                track_list_idx: new_idx,
+            };
+            self.library.tag_editor = Some(editor);
+            self.library.track_index = new_idx;
+        }
+    }
+
+    fn open_bulk_tag_editor(&mut self) {
+        let filter_query = if self.search.active { self.search.query.clone() } else { String::new() };
+        let visible: Vec<LibraryTrack> = self.library
+            .visible_tracks(&self.collections, &filter_query, &self.stats)
+            .iter().map(|t| (*t).clone()).collect();
+
+        // Collect selected paths that are in the visible list
+        let paths: Vec<PathBuf> = visible.iter()
+            .filter(|t| self.library.selected_tracks.contains(&t.path))
+            .map(|t| t.path.clone())
+            .collect();
+
+        if paths.is_empty() { return; }
+
+        self.library.bulk_tag_editor = Some(BulkTagEditorState {
+            paths,
+            fields: Default::default(),
+            active_field: 0,
+            cursor_pos: 0,
+            dirty: false,
+            save_result: None,
+        });
+    }
+
+    fn do_write_bulk_tags(&mut self) {
+        let editor = match self.library.bulk_tag_editor.take() {
+            Some(e) => e,
+            None => return,
+        };
+
+        let mut ok_count = 0usize;
+        let mut first_error: Option<String> = None;
+
+        for path in &editor.paths {
+            match write_bulk_tag_to_path(path, &editor.fields) {
+                Ok(()) => {
+                    ok_count += 1;
+                    // Update in-memory track
+                    if let Some(t) = self.library.tracks.iter_mut().find(|t| &t.path == path) {
+                        if !editor.fields[0].is_empty() { t.artist = Some(editor.fields[0].clone()); }
+                        if !editor.fields[1].is_empty() { t.album = Some(editor.fields[1].clone()); }
+                        if !editor.fields[2].is_empty() { t.track = editor.fields[2].parse::<u32>().ok(); }
+                        if !editor.fields[3].is_empty() { t.year = editor.fields[3].parse::<u32>().ok(); }
+                        if !editor.fields[4].is_empty() { t.genre = Some(editor.fields[4].clone()); }
+                    }
+                }
+                Err(e) => {
+                    if first_error.is_none() {
+                        let fname = path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("?");
+                        first_error = Some(format!("{}: {}", fname, e));
+                    }
+                }
+            }
+        }
+
+        let err_count = editor.paths.len() - ok_count;
+        let msg = if first_error.is_none() {
+            format!("✓ Saved {} tracks", ok_count)
+        } else if ok_count > 0 {
+            format!("Saved {}/{} — error: {}", ok_count, editor.paths.len(), first_error.unwrap())
+        } else {
+            format!("Failed: {}", first_error.unwrap())
+        };
+
+        if err_count == 0 {
+            self.library.selected_tracks.clear();
+        }
+
+        let mut new_editor = editor;
+        new_editor.save_result = Some(msg);
+        self.library.bulk_tag_editor = Some(new_editor);
     }
 
     fn do_write_tags(&mut self) {
@@ -3873,6 +4143,92 @@ impl App {
                 let q = filter_query;
                 self.library.clamp_track_index(&self.collections, &q, &self.stats);
             }
+        }
+    }
+
+    fn handle_bulk_tag_edit_key(&mut self, key: KeyEvent) {
+        if self.library.bulk_tag_editor.is_none() {
+            self.input_mode = InputMode::Normal;
+            return;
+        }
+        // Ctrl+S saves from anywhere in edit mode
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            self.input_mode = InputMode::Normal;
+            self.do_write_bulk_tags();
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Tab => {
+                if let Some(ref mut ed) = self.library.bulk_tag_editor {
+                    ed.active_field = (ed.active_field + 1) % 5;
+                    ed.cursor_pos = ed.fields[ed.active_field].chars().count();
+                }
+                // Stay in BulkTagEdit mode so typing continues on the next field
+            }
+            KeyCode::BackTab => {
+                if let Some(ref mut ed) = self.library.bulk_tag_editor {
+                    ed.active_field = if ed.active_field == 0 { 4 } else { ed.active_field - 1 };
+                    ed.cursor_pos = ed.fields[ed.active_field].chars().count();
+                }
+                // Stay in BulkTagEdit mode
+            }
+            KeyCode::Left => {
+                if let Some(ref mut ed) = self.library.bulk_tag_editor {
+                    if ed.cursor_pos > 0 { ed.cursor_pos -= 1; }
+                }
+            }
+            KeyCode::Right => {
+                if let Some(ref mut ed) = self.library.bulk_tag_editor {
+                    let len = ed.fields[ed.active_field].chars().count();
+                    if ed.cursor_pos < len { ed.cursor_pos += 1; }
+                }
+            }
+            KeyCode::Home => {
+                if let Some(ref mut ed) = self.library.bulk_tag_editor { ed.cursor_pos = 0; }
+            }
+            KeyCode::End => {
+                if let Some(ref mut ed) = self.library.bulk_tag_editor {
+                    ed.cursor_pos = ed.fields[ed.active_field].chars().count();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(ref mut ed) = self.library.bulk_tag_editor {
+                    let pos = ed.cursor_pos;
+                    if pos > 0 {
+                        let field = &mut ed.fields[ed.active_field];
+                        let byte_pos = field.char_indices().nth(pos - 1).map(|(i, _)| i).unwrap_or(0);
+                        field.remove(byte_pos);
+                        ed.cursor_pos -= 1;
+                        ed.dirty = true;
+                    }
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(ref mut ed) = self.library.bulk_tag_editor {
+                    let pos = ed.cursor_pos;
+                    let field = &mut ed.fields[ed.active_field];
+                    let len = field.chars().count();
+                    if pos < len {
+                        let byte_pos = field.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(field.len());
+                        field.remove(byte_pos);
+                        ed.dirty = true;
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(ref mut ed) = self.library.bulk_tag_editor {
+                    let pos = ed.cursor_pos;
+                    let field = &mut ed.fields[ed.active_field];
+                    let byte_pos = field.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(field.len());
+                    field.insert(byte_pos, c);
+                    ed.cursor_pos += 1;
+                    ed.dirty = true;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3940,6 +4296,14 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input_mode = InputMode::Normal;
+                self.navigate_tag_editor(1);
+            }
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input_mode = InputMode::Normal;
+                self.navigate_tag_editor(-1);
+            }
             KeyCode::Char(c) => {
                 if let Some(ref mut ed) = self.library.tag_editor {
                     let pos = ed.cursor_pos;
@@ -3993,6 +4357,7 @@ impl App {
                     {
                         self.manage_folders_index -= 1;
                     }
+                    self.restart_library_watcher();
                     self.library.start_scan(&self.config.music_folders);
                 }
             }

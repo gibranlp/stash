@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{App, AppScreen, DestBrowserFocus, InputMode};
 use crate::healer::{HealerScreen, HealScanState, HealLookupState, HealStatus, EDIT_FIELD_NAMES};
 use crate::browser::PaneType;
-use crate::library::{LibraryPanel, LibrarySort, LibraryState, ScanState, TAG_FIELD_NAMES, is_smart_playlist, favorite_genre};
+use crate::library::{LibraryPanel, LibrarySort, LibraryState, ScanState, TAG_FIELD_NAMES, BULK_TAG_FIELD_NAMES, is_smart_playlist, favorite_genre};
 use crate::models::{PlaybackStatus, RepeatMode, VisualizerMode};
 use crate::search::{matches_image_extension, matches_text_extension};
 use image::GenericImageView;
@@ -24,7 +24,6 @@ pub fn render(f: &mut Frame, app: &mut App) {
         vec![
             Constraint::Length(0),
             Constraint::Min(5),
-            Constraint::Length(14),
             Constraint::Length(5),
             Constraint::Length(1),
         ]
@@ -66,6 +65,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
 
     f.render_widget(Clear, chunks[1]);
+    let mut vis_rect: Option<Rect> = None;
     match app.screen {
         AppScreen::Browser => {
             // Jalamos todo el estado de audio en un solo lock para no bloquearnos dos veces
@@ -422,6 +422,16 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 ])
                 .split(chunks[1]);
 
+            // Split the left column: queue list on top, visualizer below
+            let left_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(3),
+                    Constraint::Length(14),
+                ])
+                .split(queue_chunks[0]);
+            vis_rect = Some(left_chunks[1]);
+
             let queue_border_style = Style::default().fg(Color::Cyan);
             let filtered_indices = app.get_filtered_queue_indices();
 
@@ -470,7 +480,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 );
 
             // Mismo truco del scroll centrado que en el browser
-            let h = queue_chunks[0].height.saturating_sub(2) as usize;
+            let h = left_chunks[0].height.saturating_sub(2) as usize;
             let total = filtered_indices.len();
             let target_offset = if total <= h {
                 0
@@ -486,7 +496,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             };
             *app.queue_list_state.offset_mut() = target_offset;
             app.queue_list_state.select(Some(app.queue_selected_index));
-            f.render_stateful_widget(queue_list, queue_chunks[0], &mut app.queue_list_state);
+            f.render_stateful_widget(queue_list, left_chunks[0], &mut app.queue_list_state);
 
             let info_block = Block::default()
                 .borders(Borders::ALL)
@@ -699,7 +709,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         } else {
             0.0
         };
-        let bar_width = chunks[3].width.saturating_sub(40) as usize;
+        let bar_width = chunks[2].width.saturating_sub(40) as usize;
         let filled_width = (progress_percentage * bar_width as f32) as usize;
         let progress_bar_str = format!(
             "[{}{}]",
@@ -743,10 +753,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
         let bars = audio_state.visualizer_data.clone();
         let raw_peaks = audio_state.visualizer_peaks.clone();
-        let visualizer_height = 12;
+        let vis_area = vis_rect.unwrap_or_default();
+        let visualizer_height = (vis_area.height.saturating_sub(2) as usize).max(3);
 
         // Interpolamos las barras del visualizador para que llenen el ancho disponible de la terminal
-        let available_width = chunks[2].width.saturating_sub(2);
+        let available_width = vis_area.width.saturating_sub(2);
         let target_bars = (available_width / 2) as usize;
 
         let interpolate = |src: &[f32]| -> Vec<f32> {
@@ -786,7 +797,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 let mut lines = vec![String::new(); visualizer_height];
                 let padding_str = if num_bars > 0 {
                     let bar_width_total = num_bars * 2;
-                    let padding_width = chunks[2].width.saturating_sub(bar_width_total as u16 + 2) / 2;
+                    let padding_width = vis_area.width.saturating_sub(bar_width_total as u16 + 2) / 2;
                     " ".repeat(padding_width as usize)
                 } else {
                     String::new()
@@ -856,7 +867,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 let mut lines = vec![String::new(); visualizer_height];
                 let padding_str = if num_bars > 0 {
                     let bar_width_total = num_bars * 2;
-                    let padding_width = chunks[2].width.saturating_sub(bar_width_total as u16 + 2) / 2;
+                    let padding_width = vis_area.width.saturating_sub(bar_width_total as u16 + 2) / 2;
                     " ".repeat(padding_width as usize)
                 } else {
                     String::new()
@@ -957,7 +968,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 .border_style(Style::default().fg(Color::DarkGray))
                 .title(vis_title),
         );
-        f.render_widget(vis_para, chunks[2]);
+        f.render_widget(vis_para, vis_area);
 
         let player_widget = Paragraph::new(player_text).block(
             Block::default()
@@ -966,7 +977,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 .border_style(Style::default().fg(Color::DarkGray))
                 .title(" Audio Player "),
         );
-        f.render_widget(player_widget, chunks[3]);
+        f.render_widget(player_widget, chunks[2]);
     }
 
     // Active screen tab: bright key + white label.  Inactive: dim number + dim label.
@@ -1032,12 +1043,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     };
 
     let help_bar = Paragraph::new(Line::from(help_bar_spans));
-    let help_chunk = if show_player_and_vis {
-        chunks[4]
-    } else {
-        chunks[3]
-    };
-    f.render_widget(help_bar, help_chunk);
+    f.render_widget(help_bar, chunks[3]);
 
     if !show_player_and_vis {
         let update_state = app.update.lock().unwrap().clone();
@@ -1136,6 +1142,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
         render_confirm_popup(f, " Delete Playlist ", &format!("Delete playlist '{}'? (y/n)", name));
     } else if app.input_mode == InputMode::ManageMusicFolders {
         render_manage_folders_popup(f, app);
+    } else if app.screen == AppScreen::Library && app.library.bulk_tag_editor.is_some() {
+        render_bulk_tag_editor_popup(f, app);
     } else if app.input_mode == InputMode::TagEdit || (app.screen == AppScreen::Library && app.library.tag_editor.is_some()) {
         render_tag_editor_popup(f, app);
     } else if app.show_help {
@@ -1143,14 +1151,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
     } else if app.input_mode == InputMode::Search {
         // La barra de búsqueda es un overlay flotante en la parte de abajo del pane principal
         let search_y = if show_player_and_vis {
-            chunks[3].y + chunks[3].height - 2
+            chunks[2].y + chunks[2].height - 2
         } else {
             chunks[1].y + chunks[1].height - 2
         };
         let search_rect = Rect::new(
-            if show_player_and_vis { chunks[3].x + 2 } else { chunks[1].x + 2 },
+            if show_player_and_vis { chunks[2].x + 2 } else { chunks[1].x + 2 },
             search_y,
-            if show_player_and_vis { chunks[3].width - 4 } else { chunks[1].width - 4 },
+            if show_player_and_vis { chunks[2].width - 4 } else { chunks[1].width - 4 },
             1,
         );
         let search_para = Paragraph::new(Line::from(vec![
@@ -1192,7 +1200,7 @@ fn format_time(secs: u64) -> String {
     let minutes = (secs % 3600) / 60;
     let seconds = secs % 60;
     if hours > 0 {
-        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+        format!("{}:{:02}:{:02}", hours, minutes, seconds)
     } else {
         format!("{:02}:{:02}", minutes, seconds)
     }
@@ -2560,6 +2568,7 @@ fn render_library_tracks(f: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = visible.iter().enumerate().map(|(i, track)| {
         let is_sel = i == app.library.track_index;
         let is_playing = active_track.as_ref().map(|p| p == &track.path).unwrap_or(false);
+        let is_marked = app.library.selected_tracks.contains(&track.path);
 
         let track_num = track.track.map(|n| format!("{:02}", n)).unwrap_or_else(|| "--".to_string());
         let artist = track.artist.as_deref().unwrap_or("Unknown Artist");
@@ -2581,12 +2590,12 @@ fn render_library_tracks(f: &mut Frame, app: &mut App, area: Rect) {
             _ => track.album.as_deref().unwrap_or("").to_string(),
         };
 
-        // Layout: [♪/space][#][artist][title][album/count][dur]
-        let icon = if is_playing { "♪ " } else { "  " };
+        // Layout: [●/♪/space][#][artist][title][album/count][dur]
+        let icon = if is_marked { "● " } else if is_playing { "♪ " } else { "  " };
         let track_col = format!("{:3} ", track_num);
-        let dur_col = format!("{:6}", dur);
+        let dur_col = format!("{:>7}", dur);
         // Remaining space for artist/title/third_col
-        let left = col_w.saturating_sub(2 + 4 + 6 + 2);
+        let left = col_w.saturating_sub(2 + 4 + 7 + 2);
         let artist_w = left / 4;
         let title_w = left / 2;
         let album_w = left.saturating_sub(artist_w + title_w);
@@ -2601,7 +2610,11 @@ fn render_library_tracks(f: &mut Frame, app: &mut App, area: Rect) {
             aw = artist_w, tw = title_w, bw = album_w
         );
 
-        let style = if is_sel && focused {
+        let style = if is_marked && is_sel && focused {
+            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else if is_marked {
+            Style::default().fg(Color::Yellow)
+        } else if is_sel && focused {
             Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else if is_sel {
             Style::default().fg(Color::Cyan)
@@ -2630,7 +2643,13 @@ fn render_library_tracks(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         String::new()
     };
-    let title = format!(" Library — {} tracks{}{}{}  [s] Sort ", app.library.tracks.len(), filter_suffix, sort_label, scan_suffix);
+    let marked_count = app.library.selected_tracks.len();
+    let marked_label = if marked_count > 0 {
+        format!("  [● {} selected — E: bulk edit]", marked_count)
+    } else {
+        String::new()
+    };
+    let title = format!(" Library — {} tracks{}{}{}{}  [s] Sort  [m] Mark ", app.library.tracks.len(), filter_suffix, sort_label, scan_suffix, marked_label);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2750,8 +2769,9 @@ fn render_stats_panel(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, area);
 }
 
-fn render_tag_editor_popup(f: &mut Frame, app: &App) {
-    let editor = match &app.library.tag_editor {
+fn render_bulk_tag_editor_popup(f: &mut Frame, app: &App) {
+    use crate::app::InputMode;
+    let editor = match &app.library.bulk_tag_editor {
         Some(e) => e,
         None => return,
     };
@@ -2762,8 +2782,101 @@ fn render_tag_editor_popup(f: &mut Frame, app: &App) {
     let popup_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(format!(" Bulk Tag Editor — {} tracks ", editor.paths.len()));
+
+    let inner = popup_block.inner(area);
+    f.render_widget(popup_block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "  Empty fields are skipped — only filled fields apply to all selected tracks",
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+    )));
+    for (i, field_name) in BULK_TAG_FIELD_NAMES.iter().enumerate() {
+        let is_active = i == editor.active_field;
+        let is_editing = is_active && app.input_mode == InputMode::BulkTagEdit;
+        let value = &editor.fields[i];
+
+        let label_style = if is_active {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let value_style = if is_editing {
+            Style::default().fg(Color::Yellow)
+        } else if is_active {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let skip_hint = if value.is_empty() && !is_editing {
+            Span::styled(" (skip)", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))
+        } else {
+            Span::raw("")
+        };
+        let prefix = if is_active { "> " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{}  {:<9}: ", prefix, field_name), label_style),
+            Span::styled(value.as_str(), value_style),
+            if is_editing { Span::styled("█", Style::default().fg(Color::Yellow)) } else { Span::raw("") },
+            skip_hint,
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    let status_line = if let Some(ref msg) = editor.save_result {
+        let color = if msg.starts_with('✓') { Color::Green } else { Color::Yellow };
+        Line::from(Span::styled(format!("  {}", msg), Style::default().fg(color)))
+    } else {
+        Line::from(vec![
+            Span::styled("  Enter", Style::default().fg(Color::Yellow)),
+            Span::styled(": edit field  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab", Style::default().fg(Color::Yellow)),
+            Span::styled(": next  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("w", Style::default().fg(Color::Yellow)),
+            Span::styled(" / ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Ctrl+S", Style::default().fg(Color::Yellow)),
+            Span::styled(": save all  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled(": close", Style::default().fg(Color::DarkGray)),
+        ])
+    };
+    lines.push(status_line);
+
+    let para = Paragraph::new(lines);
+    f.render_widget(para, inner);
+
+    // Terminal cursor when editing
+    if app.input_mode == InputMode::BulkTagEdit {
+        let field_line_y = inner.y + 1 + editor.active_field as u16;
+        let prefix_width = 2 + 2 + 9 + 2;
+        let value_before: String = editor.fields[editor.active_field].chars().take(editor.cursor_pos).collect();
+        let cursor_x = (inner.x + prefix_width + value_before.width() as u16)
+            .min(inner.x + inner.width.saturating_sub(2));
+        f.set_cursor(cursor_x, field_line_y);
+    }
+}
+
+fn render_tag_editor_popup(f: &mut Frame, app: &App) {
+    let editor = match &app.library.tag_editor {
+        Some(e) => e,
+        None => return,
+    };
+
+    let area = centered_rect_fixed(72, 16, f.size());
+    f.render_widget(Clear, area);
+
+    let nav_hint = if editor.track_list.len() > 1 {
+        format!(" [{}/{}]", editor.track_list_idx + 1, editor.track_list.len())
+    } else {
+        String::new()
+    };
+    let popup_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(format!(" Tag Editor — {} ", editor.path.file_name().and_then(|n| n.to_str()).unwrap_or("?")));
+        .title(format!(" Tag Editor{} — {} ", nav_hint, editor.path.file_name().and_then(|n| n.to_str()).unwrap_or("?")));
 
     let inner = popup_block.inner(area);
     f.render_widget(popup_block, area);
@@ -2802,7 +2915,7 @@ fn render_tag_editor_popup(f: &mut Frame, app: &App) {
             Err(e) => Line::from(Span::styled(format!("  Error: {}", e), Style::default().fg(Color::Red))),
         }
     } else {
-        Line::from(vec![
+        let mut hint_spans = vec![
             Span::styled("  Enter", Style::default().fg(Color::Cyan)),
             Span::styled(": edit  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Tab", Style::default().fg(Color::Cyan)),
@@ -2811,7 +2924,12 @@ fn render_tag_editor_popup(f: &mut Frame, app: &App) {
             Span::styled(": save  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc", Style::default().fg(Color::Cyan)),
             Span::styled(": close", Style::default().fg(Color::DarkGray)),
-        ])
+        ];
+        if editor.track_list.len() > 1 {
+            hint_spans.push(Span::styled("  n/p", Style::default().fg(Color::Cyan)));
+            hint_spans.push(Span::styled(": next/prev", Style::default().fg(Color::DarkGray)));
+        }
+        Line::from(hint_spans)
     };
     lines.push(status_line);
 

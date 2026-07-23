@@ -13,6 +13,7 @@ pub enum Event {
     MediaPrev,
     MediaSeek(souvlaki::SeekDirection, std::time::Duration),
     MediaSetPosition(std::time::Duration),
+    LibraryChanged,
 }
 
 // Aquí arrancamos dos hilos: uno que jala eventos del teclado/paste y otro

@@ -8,9 +8,11 @@ use lofty::config::{ParseOptions, ParsingMode, WriteOptions};
 use lofty::file::FileType;
 use lofty::tag::TagType;
 use serde::{Deserialize, Serialize};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher, Config as NotifyConfig};
 
 use crate::collections::Collections;
 use crate::config::resolve_path;
+use crate::events::Event;
 use crate::search::matches_audio_extension;
 use crate::stats::ListenStats;
 
@@ -76,6 +78,7 @@ pub fn is_smart_playlist(name: &str) -> bool {
 }
 
 pub const TAG_FIELD_NAMES: [&str; 6] = ["Title", "Artist", "Album", "Track #", "Year", "Genre"];
+pub const BULK_TAG_FIELD_NAMES: [&str; 5] = ["Artist", "Album", "Track #", "Year", "Genre"];
 
 #[derive(Debug, Clone)]
 pub struct LibraryTrack {
@@ -144,6 +147,17 @@ pub struct TagEditorState {
     pub cursor_pos: usize,
     pub dirty: bool,
     pub save_result: Option<Result<(), String>>,
+    pub track_list: Vec<PathBuf>,  // visible track paths for next/prev navigation
+    pub track_list_idx: usize,
+}
+
+pub struct BulkTagEditorState {
+    pub paths: Vec<PathBuf>,
+    pub fields: [String; 5],  // Artist, Album, Track #, Year, Genre (no title)
+    pub active_field: usize,
+    pub cursor_pos: usize,
+    pub dirty: bool,
+    pub save_result: Option<String>,
 }
 
 pub struct LibraryState {
@@ -152,6 +166,8 @@ pub struct LibraryState {
     pub playlist_index: usize,
     pub track_index: usize,
     pub tag_editor: Option<TagEditorState>,
+    pub bulk_tag_editor: Option<BulkTagEditorState>,
+    pub selected_tracks: std::collections::HashSet<PathBuf>,
     pub scan_state: ScanState,
     pub pending_scan: Option<Arc<Mutex<Option<Vec<LibraryTrack>>>>>,
     pub sort: LibrarySort,
@@ -165,6 +181,8 @@ impl LibraryState {
             playlist_index: 0,
             track_index: 0,
             tag_editor: None,
+            bulk_tag_editor: None,
+            selected_tracks: std::collections::HashSet::new(),
             scan_state: ScanState::Idle,
             pending_scan: None,
             sort: LibrarySort::Default,
@@ -393,20 +411,21 @@ impl LibraryState {
         let _ = &playlist_name; // used above
         if !keep_smart_sort && self.sort != LibrarySort::Default {
             result.sort_by(|a, b| {
-                let str_cmp = |x: Option<&str>, y: Option<&str>| {
-                    x.unwrap_or("").to_lowercase().cmp(&y.unwrap_or("").to_lowercase())
-                };
+                // None fields sort after all real values
+                let key = |s: Option<&str>| s.map(|v| v.to_lowercase()).unwrap_or_else(|| "\u{FFFF}".to_string());
                 match self.sort {
-                    LibrarySort::Title => str_cmp(a.title.as_deref(), b.title.as_deref()),
-                    LibrarySort::Artist => str_cmp(a.artist.as_deref(), b.artist.as_deref())
-                        .then(str_cmp(a.album.as_deref(), b.album.as_deref()))
+                    LibrarySort::Title => key(a.title.as_deref()).cmp(&key(b.title.as_deref()))
+                        .then(key(a.artist.as_deref()).cmp(&key(b.artist.as_deref())))
                         .then(a.track.unwrap_or(u32::MAX).cmp(&b.track.unwrap_or(u32::MAX))),
-                    LibrarySort::Album => str_cmp(a.album.as_deref(), b.album.as_deref())
+                    LibrarySort::Artist => key(a.artist.as_deref()).cmp(&key(b.artist.as_deref()))
+                        .then(key(a.album.as_deref()).cmp(&key(b.album.as_deref())))
                         .then(a.track.unwrap_or(u32::MAX).cmp(&b.track.unwrap_or(u32::MAX))),
-                    LibrarySort::Year => a.year.unwrap_or(0).cmp(&b.year.unwrap_or(0))
-                        .then(str_cmp(a.album.as_deref(), b.album.as_deref()))
+                    LibrarySort::Album => key(a.album.as_deref()).cmp(&key(b.album.as_deref()))
                         .then(a.track.unwrap_or(u32::MAX).cmp(&b.track.unwrap_or(u32::MAX))),
-                    LibrarySort::Duration => a.duration_secs.unwrap_or(0).cmp(&b.duration_secs.unwrap_or(0)),
+                    LibrarySort::Year => a.year.unwrap_or(u32::MAX).cmp(&b.year.unwrap_or(u32::MAX))
+                        .then(key(a.album.as_deref()).cmp(&key(b.album.as_deref())))
+                        .then(a.track.unwrap_or(u32::MAX).cmp(&b.track.unwrap_or(u32::MAX))),
+                    LibrarySort::Duration => a.duration_secs.unwrap_or(u64::MAX).cmp(&b.duration_secs.unwrap_or(u64::MAX)),
                     LibrarySort::Default => std::cmp::Ordering::Equal,
                 }
             });
@@ -538,6 +557,67 @@ pub fn write_tags(editor: &mut TagEditorState) {
     editor.dirty = false;
 }
 
+// Applies non-empty bulk fields to a single path. Empty fields are skipped.
+pub fn write_bulk_tag_to_path(path: &Path, fields: &[String; 5]) -> anyhow::Result<()> {
+    let parse_opts = ParseOptions::new()
+        .parsing_mode(ParsingMode::BestAttempt)
+        .read_properties(false);
+    let mut tagged_file = Probe::open(path)
+        .map_err(|e| anyhow::anyhow!("Cannot open: {}", e))?
+        .options(parse_opts)
+        .read()
+        .map_err(|e| anyhow::anyhow!("Cannot read: {}", e))?;
+
+    let has_tag = tagged_file.primary_tag().is_some() || tagged_file.first_tag().is_some();
+    if !has_tag {
+        let tag_type = tagged_file.file_type().primary_tag_type();
+        tagged_file.insert_tag(lofty::tag::Tag::new(tag_type));
+    }
+
+    let modified = 'edit: {
+        if let Some(tag) = tagged_file.primary_tag_mut() {
+            apply_bulk_fields(tag, fields);
+            break 'edit true;
+        }
+        if let Some(tag) = tagged_file.first_tag_mut() {
+            apply_bulk_fields(tag, fields);
+            break 'edit true;
+        }
+        false
+    };
+
+    if !modified {
+        return Err(anyhow::anyhow!("No writable tag found in file"));
+    }
+
+    if let Err(save_err) = tagged_file.save_to_path(path, WriteOptions::default()) {
+        let is_probe_failure = {
+            let s = save_err.to_string();
+            s.contains("does not support") || s.contains("No format could be determined")
+        };
+        let is_mpeg = matches!(FileType::from_path(path), Some(FileType::Mpeg));
+        if is_probe_failure && is_mpeg {
+            write_id3v2_direct(&tagged_file, path)?;
+        } else {
+            return Err(anyhow::anyhow!("Cannot save: {}", save_err));
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_bulk_fields(tag: &mut lofty::tag::Tag, fields: &[String; 5]) {
+    if !fields[0].is_empty() { tag.set_artist(fields[0].clone()); }
+    if !fields[1].is_empty() { tag.set_album(fields[1].clone()); }
+    if !fields[2].is_empty() {
+        if let Ok(n) = fields[2].parse::<u32>() { tag.set_track(n); }
+    }
+    if !fields[3].is_empty() {
+        if let Ok(y) = fields[3].parse::<u32>() { tag.set_year(y); }
+    }
+    if !fields[4].is_empty() { tag.set_genre(fields[4].clone()); }
+}
+
 // Writes an ID3v2 tag to an MPEG file without going through lofty's save path,
 // which re-probes file content and fails on malformed MPEG sync frames.
 // Serialises the tag with dump_to (probe-free), then splices it in place of any
@@ -605,6 +685,52 @@ fn write_id3v2_direct(
         .map_err(|e| anyhow::anyhow!("Cannot write audio: {}", e))?;
 
     Ok(())
+}
+
+/// Starts a filesystem watcher on all configured music folders.
+/// Sends `Event::LibraryChanged` on the event channel when any file changes.
+/// Returns the watcher handle — drop it to stop watching.
+pub fn start_library_watcher(
+    music_folders: &[String],
+    tx: std::sync::mpsc::Sender<Event>,
+) -> Option<RecommendedWatcher> {
+    let folders: Vec<PathBuf> = music_folders
+        .iter()
+        .map(|s| resolve_path(s))
+        .filter(|p| p.is_dir())
+        .collect();
+
+    if folders.is_empty() {
+        return None;
+    }
+
+    let mut watcher = RecommendedWatcher::new(
+        move |result: notify::Result<notify::Event>| {
+            if let Ok(event) = result {
+                use notify::EventKind::*;
+                match event.kind {
+                    Create(_) | Modify(_) | Remove(_) => {
+                        // Only care about audio files or directory-level changes
+                        let relevant = event.paths.iter().any(|p| {
+                            p.is_dir() || matches_audio_extension(p)
+                        });
+                        if relevant {
+                            let _ = tx.send(Event::LibraryChanged);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        },
+        NotifyConfig::default(),
+    )
+    .ok()?;
+
+    for folder in &folders {
+        let _ = watcher.watch(folder, RecursiveMode::Recursive);
+    }
+
+    Some(watcher)
 }
 
 fn apply_tag_fields(tag: &mut lofty::tag::Tag, editor: &TagEditorState) {
