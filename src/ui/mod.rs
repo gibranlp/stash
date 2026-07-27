@@ -1142,6 +1142,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
         render_confirm_popup(f, " Delete Playlist ", &format!("Delete playlist '{}'? (y/n)", name));
     } else if app.input_mode == InputMode::ManageMusicFolders {
         render_manage_folders_popup(f, app);
+    } else if app.input_mode == InputMode::ConfirmUpdate {
+        let version = match &*app.update.lock().unwrap() {
+            crate::updater::UpdateProgress::Available { version, .. } => version.clone(),
+            _ => "?".to_string(),
+        };
+        render_confirm_popup(f, " Update Available ", &format!("Update to {} now? (y/n)", version));
     } else if app.screen == AppScreen::Library && app.library.bulk_tag_editor.is_some() {
         render_bulk_tag_editor_popup(f, app);
     } else if app.input_mode == InputMode::TagEdit || (app.screen == AppScreen::Library && app.library.tag_editor.is_some()) {
