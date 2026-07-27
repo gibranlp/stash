@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use crate::models::FileItem;
@@ -94,13 +96,89 @@ impl SearchState {
 
 pub fn matches_audio_extension(path: &Path) -> bool {
     if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        let ext = ext.to_lowercase();
+        if ext == "mp4" && mp4_contains_video_track(path) {
+            return false;
+        }
         matches!(
-            ext.to_lowercase().as_str(),
+            ext.as_str(),
             "mp3" | "flac" | "wav" | "ogg" | "m4a" | "aac" | "mp4" | "aiff" | "aif"
         )
     } else {
         false
     }
+}
+
+fn mp4_contains_video_track(path: &Path) -> bool {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+
+    let len = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return false,
+    };
+
+    scan_mp4_boxes_for_video(&mut file, 0, len, 0).unwrap_or(false)
+}
+
+fn scan_mp4_boxes_for_video(
+    file: &mut File,
+    start: u64,
+    end: u64,
+    depth: u8,
+) -> std::io::Result<bool> {
+    if depth > 8 {
+        return Ok(false);
+    }
+
+    let mut pos = start;
+    while pos + 8 <= end {
+        file.seek(SeekFrom::Start(pos))?;
+        let mut header = [0u8; 8];
+        file.read_exact(&mut header)?;
+
+        let size32 = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as u64;
+        let box_type = &header[4..8];
+        let mut header_len = 8u64;
+        let box_size = match size32 {
+            0 => end.saturating_sub(pos),
+            1 => {
+                let mut extended = [0u8; 8];
+                file.read_exact(&mut extended)?;
+                header_len = 16;
+                u64::from_be_bytes(extended)
+            }
+            n => n,
+        };
+
+        if box_size < header_len || pos.saturating_add(box_size) > end {
+            break;
+        }
+
+        let payload_start = pos + header_len;
+        let payload_end = pos + box_size;
+
+        if box_type == b"hdlr" {
+            if payload_start + 12 <= payload_end {
+                file.seek(SeekFrom::Start(payload_start + 8))?;
+                let mut handler = [0u8; 4];
+                file.read_exact(&mut handler)?;
+                if &handler == b"vide" {
+                    return Ok(true);
+                }
+            }
+        } else if matches!(box_type, b"moov" | b"trak" | b"mdia") {
+            if scan_mp4_boxes_for_video(file, payload_start, payload_end, depth + 1)? {
+                return Ok(true);
+            }
+        }
+
+        pos += box_size;
+    }
+
+    Ok(false)
 }
 
 pub fn matches_image_extension(path: &Path) -> bool {
@@ -141,5 +219,65 @@ pub fn matches_text_extension(path: &Path) -> bool {
         )
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matches_audio_extension;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_mp4_path(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("stash-{name}-{stamp}.mp4"))
+    }
+
+    fn mp4_box(kind: &[u8; 4], payload: Vec<u8>) -> Vec<u8> {
+        let size = (payload.len() + 8) as u32;
+        let mut data = Vec::with_capacity(size as usize);
+        data.extend_from_slice(&size.to_be_bytes());
+        data.extend_from_slice(kind);
+        data.extend_from_slice(&payload);
+        data
+    }
+
+    fn handler_box(handler: &[u8; 4]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0, 0, 0, 0]);
+        payload.extend_from_slice(&[0, 0, 0, 0]);
+        payload.extend_from_slice(handler);
+        mp4_box(b"hdlr", payload)
+    }
+
+    fn mp4_with_handler(handler: &[u8; 4]) -> Vec<u8> {
+        mp4_box(
+            b"moov",
+            mp4_box(b"trak", mp4_box(b"mdia", handler_box(handler))),
+        )
+    }
+
+    #[test]
+    fn audio_only_mp4_matches_audio_extension() {
+        let path = temp_mp4_path("audio");
+        fs::write(&path, mp4_with_handler(b"soun")).unwrap();
+
+        assert!(matches_audio_extension(&path));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn video_mp4_does_not_match_audio_extension() {
+        let path = temp_mp4_path("video");
+        fs::write(&path, mp4_with_handler(b"vide")).unwrap();
+
+        assert!(!matches_audio_extension(&path));
+
+        let _ = fs::remove_file(path);
     }
 }

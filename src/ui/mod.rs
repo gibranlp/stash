@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
-use crate::app::{App, AppScreen, DestBrowserFocus, InputMode};
+use crate::app::{App, AppScreen, BulkTagProgress, DestBrowserFocus, InputMode};
 use crate::healer::{HealerScreen, HealScanState, HealLookupState, HealStatus, EDIT_FIELD_NAMES};
 use crate::browser::PaneType;
 use crate::library::{LibraryPanel, LibrarySort, LibraryState, ScanState, TAG_FIELD_NAMES, BULK_TAG_FIELD_NAMES, is_smart_playlist, favorite_genre};
@@ -2558,75 +2558,6 @@ fn render_library_tracks(f: &mut Frame, app: &mut App, area: Rect) {
 
     let visible = app.library.visible_tracks(&app.collections, filter_query, &app.stats);
 
-    let active_track = {
-        let state = app.audio.shared_state.lock().unwrap();
-        state.current_track.clone()
-    };
-
-    let col_w = area.width.saturating_sub(2) as usize;
-
-    let items: Vec<ListItem> = visible.iter().enumerate().map(|(i, track)| {
-        let is_sel = i == app.library.track_index;
-        let is_playing = active_track.as_ref().map(|p| p == &track.path).unwrap_or(false);
-        let is_marked = app.library.selected_tracks.contains(&track.path);
-
-        let track_num = track.track.map(|n| format!("{:02}", n)).unwrap_or_else(|| "--".to_string());
-        let artist = track.artist.as_deref().unwrap_or("Unknown Artist");
-        let title = track.title.as_deref().unwrap_or_else(|| {
-            track.path.file_stem().and_then(|s| s.to_str()).unwrap_or("?")
-        });
-        let dur = track.duration_secs.map(format_time).unwrap_or_else(|| "--:--".to_string());
-
-        // For stats-based smart playlists, show play/skip count instead of album
-        let third_col: String = match playlist_name.as_str() {
-            "Most Played" | "Top 100" => {
-                let n = app.stats.tracks.get(&track.path).map(|s| s.play_count).unwrap_or(0);
-                format!("{} plays", n)
-            }
-            "Most Skipped" => {
-                let n = app.stats.tracks.get(&track.path).map(|s| s.skip_count).unwrap_or(0);
-                format!("{} skips", n)
-            }
-            _ => track.album.as_deref().unwrap_or("").to_string(),
-        };
-
-        // Layout: [●/♪/space][#][artist][title][album/count][dur]
-        let icon = if is_marked { "● " } else if is_playing { "♪ " } else { "  " };
-        let track_col = format!("{:3} ", track_num);
-        let dur_col = format!("{:>7}", dur);
-        // Remaining space for artist/title/third_col
-        let left = col_w.saturating_sub(2 + 4 + 7 + 2);
-        let artist_w = left / 4;
-        let title_w = left / 2;
-        let album_w = left.saturating_sub(artist_w + title_w);
-        let artist_str = truncate_str(artist, artist_w);
-        let title_str = truncate_str(title, title_w);
-        let album_str = truncate_str(&third_col, album_w);
-
-        let text = format!("{}{}{:<aw$}{:<tw$}{:<bw$} {}",
-            icon, track_col,
-            artist_str, title_str, album_str,
-            dur_col,
-            aw = artist_w, tw = title_w, bw = album_w
-        );
-
-        let style = if is_marked && is_sel && focused {
-            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else if is_marked {
-            Style::default().fg(Color::Yellow)
-        } else if is_sel && focused {
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
-        } else if is_sel {
-            Style::default().fg(Color::Cyan)
-        } else if is_playing {
-            Style::default().fg(Color::Green)
-        } else {
-            Style::default().fg(Color::White)
-        };
-
-        ListItem::new(Line::from(Span::styled(text, style)))
-    }).collect();
-
     let scan_suffix = match app.library.scan_state {
         ScanState::Scanning => " [Scanning…]",
         ScanState::Done => "",
@@ -2656,6 +2587,8 @@ fn render_library_tracks(f: &mut Frame, app: &mut App, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(border_style)
         .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
     if app.library.tracks.is_empty() && app.library.scan_state == ScanState::Idle {
         let msg = if app.config.music_folders.is_empty() {
@@ -2669,15 +2602,107 @@ fn render_library_tracks(f: &mut Frame, app: &mut App, area: Rect) {
                 format!("  {}", msg),
                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
             )),
-        ]).block(block);
-        f.render_widget(p, area);
+        ]);
+        f.render_widget(p, inner);
         return;
     }
 
-    let list = List::new(items).block(block);
+    let track_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)].as_ref())
+        .split(inner);
+
+    let active_track = {
+        let state = app.audio.shared_state.lock().unwrap();
+        state.current_track.clone()
+    };
+
+    let col_w = inner.width as usize;
+    let third_col_label = match playlist_name.as_str() {
+        "Most Played" | "Top 100" => "Plays",
+        "Most Skipped" => "Skips",
+        _ => "Album",
+    };
+    let (artist_w, title_w, third_w) = library_track_column_widths(col_w);
+    let header_text = format!(
+        "  {:3} {:<aw$}{:<tw$}{:<bw$} {:>7}",
+        "#",
+        truncate_str("Artist", artist_w),
+        truncate_str("Title", title_w),
+        truncate_str(third_col_label, third_w),
+        "Time",
+        aw = artist_w,
+        tw = title_w,
+        bw = third_w,
+    );
+    let header = Paragraph::new(Line::from(Span::styled(
+        header_text,
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+    )));
+    f.render_widget(header, track_chunks[0]);
+
+    let items: Vec<ListItem> = visible.iter().enumerate().map(|(i, track)| {
+        let is_sel = i == app.library.track_index;
+        let is_playing = active_track.as_ref().map(|p| p == &track.path).unwrap_or(false);
+        let is_marked = app.library.selected_tracks.contains(&track.path);
+
+        let track_num = track.track.map(|n| format!("{:02}", n)).unwrap_or_else(|| "--".to_string());
+        let artist = track.artist.as_deref().unwrap_or("Unknown Artist");
+        let title = track.title.as_deref().unwrap_or_else(|| {
+            track.path.file_stem().and_then(|s| s.to_str()).unwrap_or("?")
+        });
+        let dur = track.duration_secs.map(format_time).unwrap_or_else(|| "--:--".to_string());
+
+        // For stats-based smart playlists, show play/skip count instead of album.
+        let third_col: String = match playlist_name.as_str() {
+            "Most Played" | "Top 100" => {
+                let n = app.stats.tracks.get(&track.path).map(|s| s.play_count).unwrap_or(0);
+                format!("{} plays", n)
+            }
+            "Most Skipped" => {
+                let n = app.stats.tracks.get(&track.path).map(|s| s.skip_count).unwrap_or(0);
+                format!("{} skips", n)
+            }
+            _ => track.album.as_deref().unwrap_or("").to_string(),
+        };
+
+        // Layout: [●/♪/space][#][artist][title][album/count][dur]
+        let icon = if is_marked { "● " } else if is_playing { "♪ " } else { "  " };
+        let track_col = format!("{:3} ", track_num);
+        let dur_col = format!("{:>7}", dur);
+        let artist_str = truncate_str(artist, artist_w);
+        let title_str = truncate_str(title, title_w);
+        let album_str = truncate_str(&third_col, third_w);
+
+        let text = format!("{}{}{:<aw$}{:<tw$}{:<bw$} {}",
+            icon, track_col,
+            artist_str, title_str, album_str,
+            dur_col,
+            aw = artist_w, tw = title_w, bw = third_w
+        );
+
+        let style = if is_marked && is_sel && focused {
+            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else if is_marked {
+            Style::default().fg(Color::Yellow)
+        } else if is_sel && focused {
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else if is_sel {
+            Style::default().fg(Color::Cyan)
+        } else if is_playing {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::White)
+        };
+
+        ListItem::new(Line::from(Span::styled(text, style)))
+    }).collect();
+
+    let list = List::new(items);
 
     // Centered scroll: keep selected track in the middle of the visible area
-    let h = area.height.saturating_sub(2) as usize;
+    let list_area = track_chunks[1];
+    let h = list_area.height as usize;
     let total = visible.len();
     let sel = app.library.track_index;
     let target_offset = if total <= h {
@@ -2694,7 +2719,15 @@ fn render_library_tracks(f: &mut Frame, app: &mut App, area: Rect) {
     };
     *app.library_track_list_state.offset_mut() = target_offset;
     app.library_track_list_state.select(Some(sel));
-    f.render_stateful_widget(list, area, &mut app.library_track_list_state);
+    f.render_stateful_widget(list, list_area, &mut app.library_track_list_state);
+}
+
+fn library_track_column_widths(total_width: usize) -> (usize, usize, usize) {
+    let left = total_width.saturating_sub(2 + 4 + 7 + 2);
+    let artist_w = left / 4;
+    let title_w = left / 2;
+    let third_w = left.saturating_sub(artist_w + title_w);
+    (artist_w, title_w, third_w)
 }
 
 fn render_stats_panel(f: &mut Frame, app: &App, area: Rect) {
@@ -2825,10 +2858,17 @@ fn render_bulk_tag_editor_popup(f: &mut Frame, app: &App) {
     }
     lines.push(Line::from(""));
 
-    let status_line = if let Some(ref msg) = editor.save_result {
+    if let Some(progress) = current_bulk_tag_progress(app) {
+        lines.push(render_bulk_tag_progress_line(&progress, inner.width.saturating_sub(4) as usize));
+        lines.push(Line::from(Span::styled(
+            "  Saving tags... keep Stash open",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )));
+    } else {
+        let status_line = if let Some(ref msg) = editor.save_result {
         let color = if msg.starts_with('✓') { Color::Green } else { Color::Yellow };
         Line::from(Span::styled(format!("  {}", msg), Style::default().fg(color)))
-    } else {
+        } else {
         Line::from(vec![
             Span::styled("  Enter", Style::default().fg(Color::Yellow)),
             Span::styled(": edit field  ", Style::default().fg(Color::DarkGray)),
@@ -2841,8 +2881,9 @@ fn render_bulk_tag_editor_popup(f: &mut Frame, app: &App) {
             Span::styled("Esc", Style::default().fg(Color::Yellow)),
             Span::styled(": close", Style::default().fg(Color::DarkGray)),
         ])
-    };
-    lines.push(status_line);
+        };
+        lines.push(status_line);
+    }
 
     let para = Paragraph::new(lines);
     f.render_widget(para, inner);
@@ -2856,6 +2897,34 @@ fn render_bulk_tag_editor_popup(f: &mut Frame, app: &App) {
             .min(inner.x + inner.width.saturating_sub(2));
         f.set_cursor(cursor_x, field_line_y);
     }
+}
+
+fn current_bulk_tag_progress(app: &App) -> Option<BulkTagProgress> {
+    app.bulk_tag_progress
+        .as_ref()
+        .map(|progress| progress.lock().unwrap().clone())
+}
+
+fn render_bulk_tag_progress_line(progress: &BulkTagProgress, width: usize) -> Line<'static> {
+    let pct = if progress.total == 0 {
+        0
+    } else {
+        progress.done.saturating_mul(100) / progress.total
+    };
+    let label = format!("  Saving {}/{} ({}%) ", progress.done, progress.total, pct);
+    let bar_width = width.saturating_sub(label.width()).max(8);
+    let filled = if progress.total == 0 {
+        0
+    } else {
+        bar_width.saturating_mul(progress.done) / progress.total
+    };
+    let empty = bar_width.saturating_sub(filled);
+
+    Line::from(vec![
+        Span::styled(label, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("█".repeat(filled), Style::default().fg(Color::Yellow)),
+        Span::styled("░".repeat(empty), Style::default().fg(Color::DarkGray)),
+    ])
 }
 
 fn render_tag_editor_popup(f: &mut Frame, app: &App) {

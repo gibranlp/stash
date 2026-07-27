@@ -209,6 +209,17 @@ pub struct FileOperationProgress {
     pub skip_all: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct BulkTagProgress {
+    pub total: usize,
+    pub done: usize,
+    pub ok_count: usize,
+    pub first_error: Option<String>,
+    pub succeeded_paths: Vec<PathBuf>,
+    pub fields: [String; 5],
+    pub finished: bool,
+}
+
 pub struct App {
     pub browser: BrowserState,
     pub audio: AudioEngine,
@@ -266,12 +277,14 @@ pub struct App {
     pub manage_folders_index: usize,
     pub notification: Option<(String, u8)>,  // (message, ticks_remaining at 50ms each)
     pub library_track_list_state: ListState,
+    pub bulk_tag_progress: Option<Arc<Mutex<BulkTagProgress>>>,
     pub stats: ListenStats,
     pub stats_tracking: StatsTracking,
     pub healer: HealerState,
     pub healer_backup: BackupStore,
     pub m_hold_start: Option<std::time::Instant>,
     pub m_last_press: Option<std::time::Instant>,
+    pub m_hold_path: Option<PathBuf>,
     pub m_select_all_triggered: bool,
     pub m_clear_all_triggered: bool,
     pub library_rescan_after: Option<std::time::Instant>,
@@ -400,6 +413,14 @@ pub fn scan_external_drives() -> Vec<PathBuf> {
 
     drives.sort();
     drives
+}
+
+fn toggle_path_selection(selected: &mut std::collections::HashSet<PathBuf>, path: PathBuf) {
+    if selected.contains(&path) {
+        selected.remove(&path);
+    } else {
+        selected.insert(path);
+    }
 }
 
 impl App {
@@ -576,12 +597,14 @@ impl App {
             manage_folders_index: 0,
             notification: None,
             library_track_list_state: ListState::default(),
+            bulk_tag_progress: None,
             stats: ListenStats::load(),
             stats_tracking: StatsTracking::default(),
             healer: HealerState::new(),
             healer_backup: BackupStore::load(),
             m_hold_start: None,
             m_last_press: None,
+            m_hold_path: None,
             m_select_all_triggered: false,
             m_clear_all_triggered: false,
             library_rescan_after: None,
@@ -706,29 +729,19 @@ impl App {
             Event::Key(key) => self.handle_key(key),
             Event::Paste(content) => self.handle_paste(content),
             Event::Tick => {
-                // Detect 'm' key release: no 'm' press for 300ms means the key was let go
+                // Detect 'm' key release: no 'm' press for 300ms means the key was let go.
+                // The short-tap mark action happens immediately on key press so moving the
+                // cursor during this window cannot mark a different track.
                 if let Some(last) = self.m_last_press {
                     if last.elapsed() >= std::time::Duration::from_millis(300) {
-                        if !self.m_select_all_triggered && self.m_hold_start.is_some() {
-                            // Short tap — toggle the current track
-                            let filter_query = if self.search.active { self.search.query.clone() } else { String::new() };
-                            let visible: Vec<PathBuf> = self.library
-                                .visible_tracks(&self.collections, &filter_query, &self.stats)
-                                .iter().map(|t| t.path.clone()).collect();
-                            if let Some(path) = visible.get(self.library.track_index).cloned() {
-                                if self.library.selected_tracks.contains(&path) {
-                                    self.library.selected_tracks.remove(&path);
-                                } else {
-                                    self.library.selected_tracks.insert(path);
-                                }
-                            }
-                        }
                         self.m_hold_start = None;
                         self.m_last_press = None;
+                        self.m_hold_path = None;
                         self.m_select_all_triggered = false;
                         self.m_clear_all_triggered = false;
                     }
                 }
+                self.poll_bulk_tag_progress();
                 self.drive_scan_ticks += 1;
                 if self.drive_scan_ticks >= 20 {
                     self.drive_scan_ticks = 0;
@@ -902,9 +915,13 @@ impl App {
                 }
                 if let Some(deadline) = self.library_rescan_after {
                     if std::time::Instant::now() >= deadline {
-                        self.library_rescan_after = None;
                         if self.library.scan_state != ScanState::Scanning {
+                            self.library_rescan_after = None;
                             self.library.start_scan(&self.config.music_folders);
+                        } else {
+                            self.library_rescan_after = Some(
+                                std::time::Instant::now() + std::time::Duration::from_millis(500)
+                            );
                         }
                     }
                 }
@@ -1154,8 +1171,9 @@ impl App {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
-        // U triggers update from any screen when an update is available
-        if key.code == KeyCode::Char('U') && key.modifiers.is_empty() {
+        // u/U triggers update from any screen when an update is available
+        let plain_or_shift = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+        if matches!(key.code, KeyCode::Char('u') | KeyCode::Char('U')) && plain_or_shift {
             let state = self.update.lock().unwrap().clone();
             if let crate::updater::UpdateProgress::Available { version, url } = state {
                 crate::updater::spawn_download(version, url, self.update.clone());
@@ -3586,6 +3604,12 @@ impl App {
     fn handle_library_normal_key(&mut self, key: KeyEvent) {
         // Bulk tag editor intercept
         if self.library.bulk_tag_editor.is_some() {
+            if self.bulk_tag_progress.is_some() {
+                if matches!(key.code, KeyCode::Esc) {
+                    self.notification = Some(("Bulk tag save is still running".to_string(), 40));
+                }
+                return;
+            }
             match key.code {
                 KeyCode::Esc => {
                     self.library.bulk_tag_editor = None;
@@ -3794,10 +3818,22 @@ impl App {
             KeyCode::Char('m') => {
                 if self.library.focused_panel == LibraryPanel::Tracks {
                     let now = std::time::Instant::now();
-                    if self.m_hold_start.is_none() {
-                        // First press — start hold timer, don't act yet
+                    let visible_paths: Vec<PathBuf> = self.library
+                        .visible_tracks(&self.collections, &filter_query, &self.stats)
+                        .iter().map(|t| t.path.clone()).collect();
+                    let current_path = visible_paths.get(self.library.track_index).cloned();
+                    let is_new_mark_press = self.m_hold_start.is_none()
+                        || current_path.as_ref() != self.m_hold_path.as_ref();
+
+                    if is_new_mark_press {
+                        // Toggle immediately. If the cursor moved since the previous m press,
+                        // this starts a fresh hold window for the newly highlighted track.
+                        if let Some(path) = current_path.clone() {
+                            toggle_path_selection(&mut self.library.selected_tracks, path);
+                        }
                         self.m_hold_start = Some(now);
                         self.m_last_press = Some(now);
+                        self.m_hold_path = current_path;
                         self.m_select_all_triggered = false;
                         self.m_clear_all_triggered = false;
                     } else {
@@ -4049,54 +4085,104 @@ impl App {
     }
 
     fn do_write_bulk_tags(&mut self) {
-        let editor = match self.library.bulk_tag_editor.take() {
+        if self.bulk_tag_progress.is_some() {
+            return;
+        }
+
+        let editor = match self.library.bulk_tag_editor.as_mut() {
             Some(e) => e,
             None => return,
         };
+        editor.save_result = None;
 
-        let mut ok_count = 0usize;
-        let mut first_error: Option<String> = None;
+        let paths = editor.paths.clone();
+        let fields = editor.fields.clone();
+        if paths.is_empty() {
+            return;
+        }
 
-        for path in &editor.paths {
-            match write_bulk_tag_to_path(path, &editor.fields) {
+        let progress = Arc::new(Mutex::new(BulkTagProgress {
+            total: paths.len(),
+            done: 0,
+            ok_count: 0,
+            first_error: None,
+            succeeded_paths: Vec::new(),
+            fields: fields.clone(),
+            finished: false,
+        }));
+        self.bulk_tag_progress = Some(progress.clone());
+
+        thread::spawn(move || {
+            for path in paths {
+                match write_bulk_tag_to_path(&path, &fields) {
                 Ok(()) => {
-                    ok_count += 1;
-                    // Update in-memory track
-                    if let Some(t) = self.library.tracks.iter_mut().find(|t| &t.path == path) {
-                        if !editor.fields[0].is_empty() { t.artist = Some(editor.fields[0].clone()); }
-                        if !editor.fields[1].is_empty() { t.album = Some(editor.fields[1].clone()); }
-                        if !editor.fields[2].is_empty() { t.track = editor.fields[2].parse::<u32>().ok(); }
-                        if !editor.fields[3].is_empty() { t.year = editor.fields[3].parse::<u32>().ok(); }
-                        if !editor.fields[4].is_empty() { t.genre = Some(editor.fields[4].clone()); }
-                    }
+                    let mut p = progress.lock().unwrap();
+                    p.ok_count += 1;
+                    p.done += 1;
+                    p.succeeded_paths.push(path);
                 }
                 Err(e) => {
-                    if first_error.is_none() {
+                    let mut p = progress.lock().unwrap();
+                    p.done += 1;
+                    if p.first_error.is_none() {
                         let fname = path.file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("?");
-                        first_error = Some(format!("{}: {}", fname, e));
+                        p.first_error = Some(format!("{}: {}", fname, e));
                     }
                 }
             }
+            }
+            progress.lock().unwrap().finished = true;
+        });
+    }
+
+    fn poll_bulk_tag_progress(&mut self) {
+        let finished = self.bulk_tag_progress.as_ref().and_then(|progress| {
+            let progress = progress.lock().unwrap();
+            if progress.finished {
+                Some(progress.clone())
+            } else {
+                None
+            }
+        });
+
+        let Some(progress) = finished else {
+            return;
+        };
+        self.bulk_tag_progress = None;
+
+        for path in &progress.succeeded_paths {
+            if let Some(t) = self.library.tracks.iter_mut().find(|t| &t.path == path) {
+                if !progress.fields[0].is_empty() { t.artist = Some(progress.fields[0].clone()); }
+                if !progress.fields[1].is_empty() { t.album = Some(progress.fields[1].clone()); }
+                if !progress.fields[2].is_empty() { t.track = progress.fields[2].parse::<u32>().ok(); }
+                if !progress.fields[3].is_empty() { t.year = progress.fields[3].parse::<u32>().ok(); }
+                if !progress.fields[4].is_empty() { t.genre = Some(progress.fields[4].clone()); }
+            }
         }
 
-        let err_count = editor.paths.len() - ok_count;
-        let msg = if first_error.is_none() {
-            format!("✓ Saved {} tracks", ok_count)
-        } else if ok_count > 0 {
-            format!("Saved {}/{} — error: {}", ok_count, editor.paths.len(), first_error.unwrap())
+        let err_count = progress.total - progress.ok_count;
+        let msg = if progress.first_error.is_none() {
+            format!("✓ Saved {} tracks", progress.ok_count)
+        } else if progress.ok_count > 0 {
+            format!(
+                "Saved {}/{} — error: {}",
+                progress.ok_count,
+                progress.total,
+                progress.first_error.unwrap()
+            )
         } else {
-            format!("Failed: {}", first_error.unwrap())
+            format!("Failed: {}", progress.first_error.unwrap())
         };
 
         if err_count == 0 {
             self.library.selected_tracks.clear();
         }
 
-        let mut new_editor = editor;
-        new_editor.save_result = Some(msg);
-        self.library.bulk_tag_editor = Some(new_editor);
+        if let Some(ref mut editor) = self.library.bulk_tag_editor {
+            editor.save_result = Some(msg);
+        }
     }
 
     fn do_write_tags(&mut self) {
@@ -4148,6 +4234,10 @@ impl App {
 
     fn handle_bulk_tag_edit_key(&mut self, key: KeyEvent) {
         if self.library.bulk_tag_editor.is_none() {
+            self.input_mode = InputMode::Normal;
+            return;
+        }
+        if self.bulk_tag_progress.is_some() {
             self.input_mode = InputMode::Normal;
             return;
         }

@@ -227,6 +227,10 @@ impl LibraryState {
                     // Use cached entry if the file hasn't changed
                     if let Some(cached) = cache.remove(&path_buf) {
                         if cached.mtime == mtime {
+                            let cached = fill_cached_title_from_filename(
+                                clean_cached_track(cached),
+                                &path_buf,
+                            );
                             found.push(LibraryTrack {
                                 path:         path_buf.clone(),
                                 title:        cached.title.clone(),
@@ -480,10 +484,10 @@ fn scan_single_track(path: PathBuf) -> LibraryTrack {
 
     if let Ok(tagged_file) = Probe::open(&path).and_then(|p| p.read()) {
         if let Some(tag) = tagged_file.primary_tag().or(tagged_file.first_tag()) {
-            track.title = tag.title().map(|s| s.to_string());
-            track.artist = tag.artist().map(|s| s.to_string());
-            track.album = tag.album().map(|s| s.to_string());
-            track.genre = tag.genre().map(|s| s.to_string());
+            track.title = clean_tag_text(tag.title().as_deref());
+            track.artist = clean_tag_text(tag.artist().as_deref());
+            track.album = clean_tag_text(tag.album().as_deref());
+            track.genre = clean_tag_text(tag.genre().as_deref());
             track.track = tag.track();
             track.year = tag.year();
         }
@@ -493,7 +497,54 @@ fn scan_single_track(path: PathBuf) -> LibraryTrack {
         }
     }
 
+    if track.title.is_none() {
+        track.title = title_from_filename(&path);
+    }
+
     track
+}
+
+fn clean_tag_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn clean_cached_track(mut track: CachedTrack) -> CachedTrack {
+    track.title = clean_owned_tag_text(track.title);
+    track.artist = clean_owned_tag_text(track.artist);
+    track.album = clean_owned_tag_text(track.album);
+    track.genre = clean_owned_tag_text(track.genre);
+    track
+}
+
+fn fill_cached_title_from_filename(mut track: CachedTrack, path: &Path) -> CachedTrack {
+    if track.title.is_none() {
+        track.title = title_from_filename(path);
+    }
+    track
+}
+
+fn title_from_filename(path: &Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn clean_owned_tag_text(value: Option<String>) -> Option<String> {
+    value.and_then(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else if trimmed.len() == s.len() {
+            Some(s)
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
 }
 
 pub fn write_tags(editor: &mut TagEditorState) {
@@ -708,17 +759,10 @@ pub fn start_library_watcher(
         move |result: notify::Result<notify::Event>| {
             if let Ok(event) = result {
                 use notify::EventKind::*;
-                match event.kind {
-                    Create(_) | Modify(_) | Remove(_) => {
-                        // Only care about audio files or directory-level changes
-                        let relevant = event.paths.iter().any(|p| {
-                            p.is_dir() || matches_audio_extension(p)
-                        });
-                        if relevant {
-                            let _ = tx.send(Event::LibraryChanged);
-                        }
-                    }
-                    _ => {}
+                if matches!(event.kind, Any | Create(_) | Modify(_) | Remove(_))
+                    && !event.paths.is_empty()
+                {
+                    let _ = tx.send(Event::LibraryChanged);
                 }
             }
         },

@@ -32,11 +32,50 @@ fn asset_name() -> Option<&'static str> {
 }
 
 fn is_newer(current: &str, remote: &str) -> bool {
-    let remote = remote.trim_start_matches('v');
-    let parse_ver = |s: &str| -> Vec<u32> {
-        s.split('.').filter_map(|p| p.parse().ok()).collect()
-    };
-    parse_ver(remote) > parse_ver(current)
+    fn parse_ver(s: &str) -> Option<Vec<u32>> {
+        let start = s.find(|c: char| c.is_ascii_digit())?;
+        let ver = s[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect::<String>();
+        let parts = ver
+            .split('.')
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        let mut parts = parts;
+        while parts.last() == Some(&0) {
+            parts.pop();
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts)
+        }
+    }
+
+    match (parse_ver(current), parse_ver(remote)) {
+        (Some(current), Some(remote)) => remote > current,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_newer;
+
+    #[test]
+    fn compares_plain_semver_tags() {
+        assert!(is_newer("0.5.0", "v0.6.0"));
+        assert!(!is_newer("0.5.0", "v0.5.0"));
+        assert!(!is_newer("0.5", "v0.5.0"));
+    }
+
+    #[test]
+    fn ignores_release_name_prefixes() {
+        assert!(!is_newer("0.5.0", "stash-v0.5.0"));
+        assert!(is_newer("0.5.0", "stash-v0.5.1"));
+    }
 }
 
 pub fn spawn_check(slot: UpdateSlot) {
