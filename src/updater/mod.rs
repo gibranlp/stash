@@ -60,23 +60,6 @@ fn is_newer(current: &str, remote: &str) -> bool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::is_newer;
-
-    #[test]
-    fn compares_plain_semver_tags() {
-        assert!(is_newer("0.5.0", "v0.6.0"));
-        assert!(!is_newer("0.5.0", "v0.5.0"));
-        assert!(!is_newer("0.5", "v0.5.0"));
-    }
-
-    #[test]
-    fn ignores_release_name_prefixes() {
-        assert!(!is_newer("0.5.0", "stash-v0.5.0"));
-        assert!(is_newer("0.5.0", "stash-v0.5.1"));
-    }
-}
 
 pub fn spawn_check(slot: UpdateSlot) {
     std::thread::spawn(move || {
@@ -176,4 +159,22 @@ pub fn spawn_download(version: String, url: String, slot: UpdateSlot) {
             Err(e) => UpdateProgress::Error(e.to_string()),
         };
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_newer;
+
+    #[test]
+    fn compares_plain_semver_tags() {
+        assert!(is_newer("0.5.0", "v0.6.0"));
+        assert!(!is_newer("0.5.0", "v0.5.0"));
+        assert!(!is_newer("0.5", "v0.5.0"));
+    }
+
+    #[test]
+    fn ignores_release_name_prefixes() {
+        assert!(!is_newer("0.5.0", "stash-v0.5.0"));
+        assert!(is_newer("0.5.0", "stash-v0.5.1"));
+    }
 }

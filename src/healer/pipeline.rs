@@ -28,8 +28,8 @@ pub fn scan_files(
 
 fn scan_single(path: &Path) -> HealerFile {
     let mut snap = TagSnapshot::default();
-    if let Ok(tagged) = Probe::open(path).and_then(|p| p.read()) {
-        if let Some(tag) = tagged.primary_tag().or(tagged.first_tag()) {
+    if let Ok(tagged) = Probe::open(path).and_then(|p| p.read())
+        && let Some(tag) = tagged.primary_tag().or(tagged.first_tag()) {
             snap.title        = tag.title().map(|s| s.to_string());
             snap.artist       = tag.artist().map(|s| s.to_string());
             snap.album        = tag.album().map(|s| s.to_string());
@@ -39,11 +39,10 @@ fn scan_single(path: &Path) -> HealerFile {
             snap.year         = tag.year();
             snap.genre        = tag.genre().map(|s| s.to_string());
         }
-    }
     let issues = detect_issues(&snap);
     let mut matches: Vec<HealMatch> = Vec::new();
-    if !issues.is_empty() {
-        if let Some(parsed) = filename::parse(path) {
+    if !issues.is_empty()
+        && let Some(parsed) = filename::parse(path) {
             let confidence = filename_confidence(&parsed, &snap, &issues);
             matches.push(HealMatch {
                 source: MatchSource::Filename,
@@ -52,7 +51,6 @@ fn scan_single(path: &Path) -> HealerFile {
                 tags: parsed,
             });
         }
-    }
     HealerFile { path: path.to_path_buf(), issues, original: snap, matches, status: HealStatus::Pending }
 }
 
@@ -73,11 +71,10 @@ fn filename_confidence(parsed: &TagSnapshot, current: &TagSnapshot, issues: &[Me
     if parsed.artist.is_some() { score = score.saturating_add(10); }
     if parsed.album.is_some()  { score = score.saturating_add(5); }
     if parsed.track.is_some()  { score = score.saturating_add(8); }
-    if let (Some(pt), Some(ct)) = (&parsed.title, &current.title) {
-        if pt.to_lowercase().contains(&ct.to_lowercase()) || ct.to_lowercase().contains(&pt.to_lowercase()) {
+    if let (Some(pt), Some(ct)) = (&parsed.title, &current.title)
+        && (pt.to_lowercase().contains(&ct.to_lowercase()) || ct.to_lowercase().contains(&pt.to_lowercase())) {
             score = score.saturating_add(10);
         }
-    }
     let fillable = issues.iter().filter(|i| match i {
         MetaIssue::MissingTitle  => parsed.title.is_some(),
         MetaIssue::MissingArtist => parsed.artist.is_some(),

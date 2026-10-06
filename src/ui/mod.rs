@@ -15,7 +15,72 @@ use crate::search::{matches_image_extension, matches_text_extension};
 use image::GenericImageView;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TimedLyricLine {
+    timestamp_ms: u64,
+    text: String,
+}
+
+fn parse_lrc_timestamp(value: &str) -> Option<u64> {
+    let (minutes, seconds) = value.split_once(':')?;
+    let minutes = minutes.trim().parse::<u64>().ok()?;
+    let seconds = seconds.trim().parse::<f64>().ok()?;
+    if !(0.0..60.0).contains(&seconds) {
+        return None;
+    }
+    Some(((minutes as f64 * 60.0 + seconds) * 1000.0).round() as u64)
+}
+
+fn parse_synced_lyrics(lyrics: &str) -> Option<Vec<TimedLyricLine>> {
+    let offset_ms = lyrics
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("[offset:")?
+                .strip_suffix(']')?
+                .trim()
+                .parse::<i64>()
+                .ok()
+        })
+        .unwrap_or(0);
+    let mut timed_lines = Vec::new();
+
+    for line in lyrics.lines() {
+        let mut remainder = line.trim_start();
+        let mut timestamps = Vec::new();
+        while let Some(after_open) = remainder.strip_prefix('[') {
+            let Some(close) = after_open.find(']') else {
+                break;
+            };
+            let tag = &after_open[..close];
+            let Some(timestamp) = parse_lrc_timestamp(tag) else {
+                break;
+            };
+            timestamps.push(timestamp);
+            remainder = &after_open[close + 1..];
+        }
+
+        for timestamp in timestamps {
+            timed_lines.push(TimedLyricLine {
+                timestamp_ms: timestamp.saturating_add_signed(offset_ms),
+                text: remainder.trim().to_string(),
+            });
+        }
+    }
+
+    if timed_lines.is_empty() {
+        return None;
+    }
+    timed_lines.sort_by_key(|line| line.timestamp_ms);
+    Some(timed_lines)
+}
+
+
 pub fn render(f: &mut Frame, app: &mut App) {
+    // Snapshot the active SpectrumOS-derived theme for this frame so every render
+    // helper below (many take no `App` at all — popups, the help screen, ...) can
+    // read it via `crate::theme::current()`.
+    crate::theme::set_current(app.theme);
     let show_player_and_vis = app.screen == AppScreen::Queue;
     let show_header = app.screen == AppScreen::Browser;
 
@@ -53,13 +118,13 @@ pub fn render(f: &mut Frame, app: &mut App) {
         let current_dir_str = app.browser.current_dir.to_string_lossy();
         let header_text = format!(" Stash | Path: {} ", current_dir_str);
         let header = Paragraph::new(Line::from(vec![
-            Span::styled(&header_text, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(&header_text, Style::default().fg(crate::theme::current().warning).add_modifier(Modifier::BOLD)),
         ]))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(crate::theme::current().muted)),
         );
         f.render_widget(header, chunks[0]);
     }
@@ -90,7 +155,6 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 let playing = if active { state.current_track.clone() } else { None };
                 (progress, playing)
             };
-            let browser_progress = browser_progress;
 
             // Si hay algo reproduciéndose, le robamos una línea abajo para la barra de progreso
             let (browser_content_area, browser_progress_area) = if browser_progress.is_some() {
@@ -150,9 +214,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
             let is_files_focused = app.browser.focused_pane == PaneType::Files
                 && app.input_mode == InputMode::Normal;
             let file_border_style = if is_files_focused {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(crate::theme::current().accent)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(crate::theme::current().muted)
             };
             let file_border_type = if is_files_focused {
                 BorderType::Double
@@ -201,24 +265,24 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     // [*] = la carpeta entera está seleccionada
                     // [-] = no está seleccionada pero tiene archivos adentro seleccionados
                     let (select_marker, select_style) = if is_now_playing {
-                        ("[♪] ", Style::default().fg(Color::LightGreen))
+                        ("[♪] ", Style::default().fg(crate::theme::current().success))
                     } else if file.is_dir {
                         if file.is_selected {
-                            ("[*] ", Style::default().fg(Color::Cyan))
+                            ("[*] ", Style::default().fg(crate::theme::current().accent))
                         } else {
                             let has_any = selected_paths
                                 .iter()
                                 .any(|p| p != &file.path && p.starts_with(&file.path));
                             if has_any {
-                                ("[-] ", Style::default().fg(Color::Yellow))
+                                ("[-] ", Style::default().fg(crate::theme::current().warning))
                             } else {
-                                ("[ ] ", Style::default().fg(Color::DarkGray))
+                                ("[ ] ", Style::default().fg(crate::theme::current().muted))
                             }
                         }
                     } else if file.is_selected {
-                        ("[*] ", Style::default().fg(Color::Green))
+                        ("[*] ", Style::default().fg(crate::theme::current().success))
                     } else {
-                        ("[ ] ", Style::default().fg(Color::DarkGray))
+                        ("[ ] ", Style::default().fg(crate::theme::current().muted))
                     };
 
                     let indent = "  ".repeat(file.depth);
@@ -230,17 +294,17 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     let display_name = format!("{}{}{}", indent, expand_icon, file.name);
 
                     let filename_style = if is_now_playing {
-                        Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)
+                        Style::default().fg(crate::theme::current().success).add_modifier(Modifier::BOLD)
                     } else if is_highlighted {
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        Style::default().fg(crate::theme::current().accent).add_modifier(Modifier::BOLD)
                     } else if is_in_range {
-                        Style::default().fg(Color::Cyan)
+                        Style::default().fg(crate::theme::current().accent)
                     } else if file.is_dir {
-                        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+                        Style::default().fg(crate::theme::current().accent_alt).add_modifier(Modifier::BOLD)
                     } else if file.is_selected {
-                        Style::default().fg(Color::Green)
+                        Style::default().fg(crate::theme::current().success)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(crate::theme::current().foreground)
                     };
 
                     let size_str = if file.is_dir {
@@ -250,11 +314,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     };
 
                     ListItem::new(Line::from(vec![
-                        Span::styled(prefix, if is_highlighted || is_in_range { Style::default().fg(Color::Cyan) } else { Style::default() }),
+                        Span::styled(prefix, if is_highlighted || is_in_range { Style::default().fg(crate::theme::current().accent) } else { Style::default() }),
                         Span::styled(select_marker, select_style),
                         Span::styled(display_name.clone(), filename_style),
                         Span::raw(" ".repeat(tree_area.width.saturating_sub(8 + display_name.width() as u16 + size_str.width() as u16) as usize)),
-                        Span::styled(size_str, Style::default().fg(Color::DarkGray)),
+                        Span::styled(size_str, Style::default().fg(crate::theme::current().muted)),
                     ]))
                 })
                 .collect();
@@ -301,7 +365,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     .map(|p| p.file_name().map(|n| n.to_string_lossy().chars().count()).unwrap_or(4))
                     .max().unwrap_or(6);
                 // col_w: 3 chars for " `` " prefix + name + 1 trailing space
-                let col_w = (max_name + 4).max(8).min(32);
+                let col_w = (max_name + 4).clamp(8, 32);
                 let num_cols = (inner_w / col_w).max(1);
 
                 let drive_names: Vec<String> = drives.iter().map(|p| {
@@ -323,8 +387,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     let mut spans: Vec<Span> = Vec::new();
                     for name in row {
                         let padded = format!("{:<width$}", name, width = col_w.saturating_sub(4));
-                        spans.push(Span::styled(" \u{f0a0} ", Style::default().fg(Color::Yellow)));
-                        spans.push(Span::styled(padded, Style::default().fg(Color::White)));
+                        spans.push(Span::styled(" \u{f0a0} ", Style::default().fg(crate::theme::current().warning)));
+                        spans.push(Span::styled(padded, Style::default().fg(crate::theme::current().foreground)));
                     }
                     Line::from(spans)
                 }).collect();
@@ -333,8 +397,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     Block::default()
                         .borders(Borders::ALL)
                         .border_type(BorderType::Plain)
-                        .border_style(Style::default().fg(Color::DarkGray))
-                        .title(Span::styled(" Drives [E] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                        .border_style(Style::default().fg(crate::theme::current().muted))
+                        .title(Span::styled(" Drives [E] ", Style::default().fg(crate::theme::current().warning).add_modifier(Modifier::BOLD))),
                 );
                 f.render_widget(drives_para, panel_area);
             }
@@ -343,9 +407,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 let is_preview_focused = app.browser.focused_pane == PaneType::Preview
                     && app.input_mode == InputMode::Normal;
                 let preview_border_style = if is_preview_focused {
-                    Style::default().fg(Color::Cyan)
+                    Style::default().fg(crate::theme::current().accent)
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(crate::theme::current().muted)
                 };
                 let preview_border_type = if is_preview_focused {
                     BorderType::Double
@@ -401,24 +465,30 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 let max_name_width = pb_area.width.saturating_sub(time_width + bar_width as u16 + 4) as usize;
                 let truncated_name: String = track_name.chars().take(max_name_width).collect();
                 let pb_line = Line::from(vec![
-                    Span::styled(time_str, Style::default().fg(Color::DarkGray)),
-                    Span::styled(bar_str, Style::default().fg(Color::Cyan)),
-                    Span::styled(format!("  {}", truncated_name), Style::default().fg(Color::DarkGray)),
+                    Span::styled(time_str, Style::default().fg(crate::theme::current().muted)),
+                    Span::styled(bar_str, Style::default().fg(crate::theme::current().accent)),
+                    Span::styled(format!("  {}", truncated_name), Style::default().fg(crate::theme::current().muted)),
                 ]);
                 f.render_widget(Paragraph::new(pb_line), pb_area);
             }
         }
         AppScreen::Queue => {
-            let active_track = {
+            let (active_track, metadata, lyrics_state, elapsed_ms) = {
                 let state = app.audio.shared_state.lock().unwrap();
-                state.current_track.clone()
+                (
+                    state.current_track.clone(),
+                    state.metadata.clone(),
+                    state.lyrics_state.clone(),
+                    state.elapsed_millis,
+                )
             };
 
             let queue_chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Percentage(70),
-                    Constraint::Percentage(30),
+                    Constraint::Percentage(50),
+                    Constraint::Percentage(25),
+                    Constraint::Percentage(25),
                 ])
                 .split(chunks[1]);
 
@@ -427,12 +497,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(3),
-                    Constraint::Length(14),
+                    Constraint::Length(7),
                 ])
                 .split(queue_chunks[0]);
             vis_rect = Some(left_chunks[1]);
 
-            let queue_border_style = Style::default().fg(Color::Cyan);
+            let queue_border_style = Style::default().fg(crate::theme::current().accent);
             let filtered_indices = app.get_filtered_queue_indices();
 
             let queue_list_items: Vec<ListItem> = filtered_indices
@@ -448,17 +518,17 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     let playing_marker = if is_playing_track { "=> " } else { "   " };
 
                     let text_style = if is_playing_track {
-                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                        Style::default().fg(crate::theme::current().success).add_modifier(Modifier::BOLD)
                     } else if is_highlighted {
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        Style::default().fg(crate::theme::current().accent).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(crate::theme::current().foreground)
                     };
 
                     ListItem::new(Line::from(vec![
-                        Span::styled(prefix, Style::default().fg(Color::Cyan)),
-                        Span::styled(playing_marker, Style::default().fg(Color::Green)),
-                        Span::styled(format!("{}. ", base_idx + 1), Style::default().fg(Color::DarkGray)),
+                        Span::styled(prefix, Style::default().fg(crate::theme::current().accent)),
+                        Span::styled(playing_marker, Style::default().fg(crate::theme::current().success)),
+                        Span::styled(format!("{}. ", base_idx + 1), Style::default().fg(crate::theme::current().muted)),
                         Span::styled(name, text_style),
                     ]))
                 })
@@ -501,7 +571,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             let info_block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Magenta))
+                .border_style(Style::default().fg(crate::theme::current().accent_alt))
                 .title(" Track Information ");
 
             let info_inner = info_block.inner(queue_chunks[1]);
@@ -522,15 +592,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 } else {
                     let placeholder = Paragraph::new(vec![
                         Line::from(""),
-                        Line::from(Span::styled("  [ No Album Art ]", Style::default().fg(Color::DarkGray))),
+                        Line::from(Span::styled("  [ No Album Art ]", Style::default().fg(crate::theme::current().muted))),
                     ]);
                     f.render_widget(placeholder, info_subchunks[0]);
                 }
-
-                let (metadata, lyrics_state) = {
-                    let state = app.audio.shared_state.lock().unwrap();
-                    (state.metadata.clone(), state.lyrics_state.clone())
-                };
 
                 let mut meta_lines = Vec::new();
                 if let Some(ref meta) = metadata {
@@ -547,132 +612,193 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     let codec = meta.codec.clone().unwrap_or_else(|| "Unknown".to_string());
 
                     meta_lines.push(Line::from(vec![
-                        Span::styled(" Title:       ", Style::default().fg(Color::Cyan)),
-                        Span::styled(title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                        Span::styled(" Title:       ", Style::default().fg(crate::theme::current().accent)),
+                        Span::styled(title, Style::default().fg(crate::theme::current().foreground).add_modifier(Modifier::BOLD)),
                     ]));
                     meta_lines.push(Line::from(vec![
-                        Span::styled(" Artist:      ", Style::default().fg(Color::Cyan)),
-                        Span::styled(artist, Style::default().fg(Color::Yellow)),
+                        Span::styled(" Artist:      ", Style::default().fg(crate::theme::current().accent)),
+                        Span::styled(artist, Style::default().fg(crate::theme::current().warning)),
                     ]));
                     meta_lines.push(Line::from(vec![
-                        Span::styled(" Album:       ", Style::default().fg(Color::Cyan)),
-                        Span::styled(album, Style::default().fg(Color::White)),
+                        Span::styled(" Album:       ", Style::default().fg(crate::theme::current().accent)),
+                        Span::styled(album, Style::default().fg(crate::theme::current().foreground)),
                     ]));
                     meta_lines.push(Line::from(vec![
-                        Span::styled(" Track:       ", Style::default().fg(Color::Cyan)),
-                        Span::styled(track, Style::default().fg(Color::LightGreen)),
+                        Span::styled(" Track:       ", Style::default().fg(crate::theme::current().accent)),
+                        Span::styled(track, Style::default().fg(crate::theme::current().success)),
                     ]));
                     meta_lines.push(Line::from(vec![
-                        Span::styled(" Genre:       ", Style::default().fg(Color::Cyan)),
-                        Span::styled(genre, Style::default().fg(Color::LightBlue)),
+                        Span::styled(" Genre:       ", Style::default().fg(crate::theme::current().accent)),
+                        Span::styled(genre, Style::default().fg(crate::theme::current().accent_alt)),
                     ]));
                     meta_lines.push(Line::from(vec![
-                        Span::styled(" Year:        ", Style::default().fg(Color::Cyan)),
-                        Span::styled(year, Style::default().fg(Color::LightYellow)),
+                        Span::styled(" Year:        ", Style::default().fg(crate::theme::current().accent)),
+                        Span::styled(year, Style::default().fg(crate::theme::current().warning)),
                     ]));
                     meta_lines.push(Line::from(vec![
-                        Span::styled(" Length:      ", Style::default().fg(Color::Cyan)),
-                        Span::styled(length, Style::default().fg(Color::White)),
+                        Span::styled(" Length:      ", Style::default().fg(crate::theme::current().accent)),
+                        Span::styled(length, Style::default().fg(crate::theme::current().foreground)),
                     ]));
                     meta_lines.push(Line::from(vec![
-                        Span::styled(" Bitrate:     ", Style::default().fg(Color::Cyan)),
-                        Span::styled(bitrate, Style::default().fg(Color::LightRed)),
+                        Span::styled(" Bitrate:     ", Style::default().fg(crate::theme::current().accent)),
+                        Span::styled(bitrate, Style::default().fg(crate::theme::current().error)),
                     ]));
                     meta_lines.push(Line::from(vec![
-                        Span::styled(" Sample Rate: ", Style::default().fg(Color::Cyan)),
-                        Span::styled(sample_rate, Style::default().fg(Color::LightMagenta)),
+                        Span::styled(" Sample Rate: ", Style::default().fg(crate::theme::current().accent)),
+                        Span::styled(sample_rate, Style::default().fg(crate::theme::current().accent_alt)),
                     ]));
                     meta_lines.push(Line::from(vec![
-                        Span::styled(" Codec:       ", Style::default().fg(Color::Cyan)),
-                        Span::styled(codec, Style::default().fg(Color::White)),
+                        Span::styled(" Codec:       ", Style::default().fg(crate::theme::current().accent)),
+                        Span::styled(codec, Style::default().fg(crate::theme::current().foreground)),
                     ]));
                 } else {
                     meta_lines.push(Line::from(""));
-                    meta_lines.push(Line::from(Span::styled("  Reading metadata...", Style::default().fg(Color::Yellow))));
+                    meta_lines.push(Line::from(Span::styled("  Reading metadata...", Style::default().fg(crate::theme::current().warning))));
                 }
-
-                let meta_and_lyrics = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(11),
-                        Constraint::Min(5),
-                    ])
-                    .split(info_subchunks[1]);
 
                 let meta_para = Paragraph::new(meta_lines)
                     .wrap(ratatui::widgets::Wrap { trim: false });
-                f.render_widget(meta_para, meta_and_lyrics[0]);
-
-                let lyrics_border_style = if app.lyrics_focused {
-                    Style::default().fg(Color::Magenta)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                let lyrics_title = if app.lyrics_focused {
-                    " Lyrics [Tab to exit] "
-                } else {
-                    " Lyrics [Tab to scroll] "
-                };
-                let lyrics_block = Block::default()
-                    .borders(Borders::TOP)
-                    .border_style(lyrics_border_style)
-                    .title(lyrics_title);
-
-                use crate::models::LyricsState;
-                match &lyrics_state {
-                    LyricsState::Found(text) => {
-                        let lyrics_lines: Vec<Line> = text
-                            .lines()
-                            .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::Gray))))
-                            .collect();
-                        let lyrics_para = Paragraph::new(lyrics_lines)
-                            .block(lyrics_block)
-                            .scroll((app.lyrics_scroll_offset as u16, 0))
-                            .wrap(ratatui::widgets::Wrap { trim: false });
-                        f.render_widget(lyrics_para, meta_and_lyrics[1]);
-                    }
-                    LyricsState::Loading => {
-                        let lyrics_para = Paragraph::new(vec![
-                            Line::from(""),
-                            Line::from(Span::styled("  Loading metadata...", Style::default().fg(Color::Yellow))),
-                        ])
-                        .block(lyrics_block);
-                        f.render_widget(lyrics_para, meta_and_lyrics[1]);
-                    }
-                    LyricsState::Fetching => {
-                        let lyrics_para = Paragraph::new(vec![
-                            Line::from(""),
-                            Line::from(Span::styled("  Fetching lyrics online...", Style::default().fg(Color::Cyan))),
-                        ])
-                        .block(lyrics_block);
-                        f.render_widget(lyrics_para, meta_and_lyrics[1]);
-                    }
-                    LyricsState::NotFound => {
-                        let lyrics_para = Paragraph::new(vec![
-                            Line::from(""),
-                            Line::from(Span::styled("  No lyrics found", Style::default().fg(Color::DarkGray))),
-                        ])
-                        .block(lyrics_block);
-                        f.render_widget(lyrics_para, meta_and_lyrics[1]);
-                    }
-                    LyricsState::Error(msg) => {
-                        let lyrics_para = Paragraph::new(vec![
-                            Line::from(""),
-                            Line::from(Span::styled(format!("  Error fetching lyrics: {}", msg), Style::default().fg(Color::Red))),
-                        ])
-                        .block(lyrics_block)
-                        .wrap(ratatui::widgets::Wrap { trim: false });
-                        f.render_widget(lyrics_para, meta_and_lyrics[1]);
-                    }
-                }
+                f.render_widget(meta_para, info_subchunks[1]);
             } else {
                 let placeholder = Paragraph::new(vec![
                     Line::from(""),
-                    Line::from(Span::styled("  No track loaded", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))),
-                    Line::from(Span::styled("  Select an audio file from the Browser to play.", Style::default().fg(Color::DarkGray))),
+                    Line::from(Span::styled("  No track loaded", Style::default().fg(crate::theme::current().muted).add_modifier(Modifier::ITALIC))),
+                    Line::from(Span::styled("  Select an audio file from the Browser to play.", Style::default().fg(crate::theme::current().muted))),
                 ]);
                 f.render_widget(placeholder, info_inner);
             }
+
+            let lyrics_border_style = if app.lyrics_focused {
+                Style::default().fg(crate::theme::current().accent_alt)
+            } else {
+                Style::default().fg(crate::theme::current().muted)
+            };
+            let lyrics_title = if app.lyrics_focused {
+                " Lyrics [Tab to exit] "
+            } else {
+                " Lyrics [Tab to scroll] "
+            };
+            let lyrics_block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(if app.lyrics_focused {
+                    BorderType::Double
+                } else {
+                    BorderType::Rounded
+                })
+                .border_style(lyrics_border_style)
+                .title(lyrics_title);
+
+            use crate::models::LyricsState;
+            let lyrics_para = if active_track.is_none() {
+                Paragraph::new(vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  No track loaded",
+                        Style::default()
+                            .fg(crate::theme::current().muted)
+                            .add_modifier(Modifier::ITALIC),
+                    )),
+                ])
+                .block(lyrics_block)
+            } else {
+                match &lyrics_state {
+                    LyricsState::Found(text) => {
+                        if let Some(timed_lines) = parse_synced_lyrics(text) {
+                            let active_line = timed_lines
+                                .iter()
+                                .rposition(|line| line.timestamp_ms <= elapsed_ms);
+                            let lyrics_lines: Vec<Line> = timed_lines
+                                .iter()
+                                .enumerate()
+                                .map(|(index, line)| {
+                                    let is_active = active_line == Some(index);
+                                    let prefix = if is_active { "▶ " } else { "  " };
+                                    let style = if is_active {
+                                        Style::default()
+                                            .fg(crate::theme::current().accent)
+                                            .add_modifier(Modifier::BOLD)
+                                    } else if active_line.is_some_and(|active| index < active) {
+                                        Style::default().fg(crate::theme::current().foreground)
+                                    } else {
+                                        Style::default().fg(crate::theme::current().muted)
+                                    };
+                                    Line::from(Span::styled(format!("{prefix}{}", line.text), style))
+                                })
+                                .collect();
+                            let visible_height = queue_chunks[2].height.saturating_sub(2) as usize;
+                            let auto_scroll = active_line
+                                .unwrap_or(0)
+                                .saturating_sub(visible_height / 2);
+                            let scroll = if app.lyrics_focused {
+                                app.lyrics_scroll_offset
+                            } else {
+                                auto_scroll
+                            };
+                            Paragraph::new(lyrics_lines)
+                                .block(lyrics_block)
+                                .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+                                .wrap(ratatui::widgets::Wrap { trim: false })
+                        } else {
+                            let lyrics_lines: Vec<Line> = text
+                                .lines()
+                                .map(|line| {
+                                    Line::from(Span::styled(
+                                        line,
+                                        Style::default().fg(crate::theme::current().foreground),
+                                    ))
+                                })
+                                .collect();
+                            Paragraph::new(lyrics_lines)
+                                .block(lyrics_block)
+                                .scroll((app.lyrics_scroll_offset as u16, 0))
+                                .wrap(ratatui::widgets::Wrap { trim: false })
+                        }
+                    }
+                    LyricsState::Loading => Paragraph::new(vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "  Loading metadata...",
+                            Style::default().fg(crate::theme::current().warning),
+                        )),
+                    ])
+                    .block(lyrics_block),
+                    LyricsState::Fetching => Paragraph::new(vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "  Fetching lyrics online...",
+                            Style::default().fg(crate::theme::current().accent),
+                        )),
+                    ])
+                    .block(lyrics_block),
+                    LyricsState::NotFound => Paragraph::new(vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "  We couldn't find lyrics for this track.",
+                            Style::default().fg(crate::theme::current().muted),
+                        )),
+                        Line::from(Span::styled(
+                            "  Check its title and artist, or add a matching .lrc/.txt file.",
+                            Style::default().fg(crate::theme::current().muted),
+                        )),
+                    ])
+                    .block(lyrics_block)
+                    .wrap(ratatui::widgets::Wrap { trim: false }),
+                    LyricsState::Error(msg) => Paragraph::new(vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "  Lyrics aren't available right now.",
+                            Style::default().fg(crate::theme::current().error),
+                        )),
+                        Line::from(Span::styled(
+                            format!("  {msg}"),
+                            Style::default().fg(crate::theme::current().muted),
+                        )),
+                    ])
+                    .block(lyrics_block)
+                    .wrap(ratatui::widgets::Wrap { trim: false }),
+                }
+            };
+            f.render_widget(lyrics_para, queue_chunks[2]);
         }
         AppScreen::Library => {
             render_library(f, app, chunks[1]);
@@ -683,7 +809,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
 
     if show_player_and_vis {
-        let audio_state = app.audio.shared_state.lock().unwrap();
+        let audio_state = app.audio.shared_state.lock().unwrap().clone();
 
         let now_playing_title = if let Some(ref meta) = audio_state.metadata {
             let title = meta.title.as_deref().unwrap_or("Unknown Track");
@@ -739,14 +865,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
         );
 
         let mut player_lines = vec![
-            Line::from(vec![Span::styled(status_title_line, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))]),
-            Line::from(vec![Span::styled(progress_line, Style::default().fg(Color::Cyan))]),
-            Line::from(vec![Span::styled(info_line, Style::default().fg(Color::Yellow))]),
+            Line::from(vec![Span::styled(status_title_line, Style::default().fg(crate::theme::current().success).add_modifier(Modifier::BOLD))]),
+            Line::from(vec![Span::styled(progress_line, Style::default().fg(crate::theme::current().accent))]),
+            Line::from(vec![Span::styled(info_line, Style::default().fg(crate::theme::current().warning))]),
         ];
 
         if let Some(ref dev_err) = audio_state.device_error {
-            let error_msg = format!(" [Audio Device Error: {}] (Hint: try running with 'sudo -E stash <path>')", dev_err);
-            player_lines.push(Line::from(vec![Span::styled(error_msg, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))]));
+            let error_msg = format!(" [Audio Error: {}]", dev_err);
+            player_lines.push(Line::from(vec![Span::styled(error_msg, Style::default().fg(crate::theme::current().error).add_modifier(Modifier::BOLD))]));
         }
 
         let player_text = player_lines;
@@ -840,20 +966,16 @@ pub fn render(f: &mut Frame, app: &mut App) {
                         .iter()
                         .enumerate()
                         .map(|(row_idx, l)| {
-                            // Cava-style gradient: top rows red, bottom rows cyan
+                            // Cava-style gradient: top rows hot (error), bottom rows cool (accent)
                             let t = row_idx as f32 / (visualizer_height as f32 - 1.0);
-                            let color = if t < 0.17 {
-                                Color::Red
-                            } else if t < 0.33 {
-                                Color::LightRed
+                            let color = if t < 0.33 {
+                                crate::theme::current().error
                             } else if t < 0.5 {
-                                Color::Yellow
-                            } else if t < 0.67 {
-                                Color::LightGreen
+                                crate::theme::current().warning
                             } else if t < 0.83 {
-                                Color::Green
+                                crate::theme::current().success
                             } else {
-                                Color::Cyan
+                                crate::theme::current().accent
                             };
                             Line::from(vec![
                                 Span::raw(padding_str.clone()),
@@ -899,14 +1021,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
                             let center = (visualizer_height as f32 - 1.0) / 2.0;
                             let dist_from_center = (row_idx as f32 - center).abs();
                             let t = dist_from_center / center;
-                            let color = if t > 0.75 {
-                                Color::Red
-                            } else if t > 0.5 {
-                                Color::LightRed
+                            let color = if t > 0.5 {
+                                crate::theme::current().error
                             } else if t > 0.25 {
-                                Color::Yellow
+                                crate::theme::current().warning
                             } else {
-                                Color::Cyan
+                                crate::theme::current().accent
                             };
                             Line::from(vec![
                                 Span::raw(padding_str.clone()),
@@ -928,8 +1048,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 // Closure que arma una línea de VU meter con colores verde/amarillo/rojo según nivel
                 let build_vu_line = |prefix: &'static str, filled: usize| {
                     let mut spans = vec![
-                        Span::styled(prefix, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                        Span::styled(" [", Style::default().fg(Color::DarkGray)),
+                        Span::styled(prefix, Style::default().fg(crate::theme::current().foreground).add_modifier(Modifier::BOLD)),
+                        Span::styled(" [", Style::default().fg(crate::theme::current().muted)),
                     ];
 
                     let green_cutoff = (meter_width * 70) / 100;
@@ -938,18 +1058,18 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     for idx in 0..meter_width {
                         if idx < filled {
                             let color = if idx < green_cutoff {
-                                Color::Green
+                                crate::theme::current().success
                             } else if idx < yellow_cutoff {
-                                Color::Yellow
+                                crate::theme::current().warning
                             } else {
-                                Color::Red
+                                crate::theme::current().error
                             };
                             spans.push(Span::styled("█", Style::default().fg(color)));
                         } else {
-                            spans.push(Span::styled(" ", Style::default().fg(Color::DarkGray)));
+                            spans.push(Span::styled(" ", Style::default().fg(crate::theme::current().muted)));
                         }
                     }
-                    spans.push(Span::styled("]", Style::default().fg(Color::DarkGray)));
+                    spans.push(Span::styled("]", Style::default().fg(crate::theme::current().muted)));
                     Line::from(spans)
                 };
 
@@ -965,7 +1085,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray))
+                .border_style(Style::default().fg(crate::theme::current().muted))
                 .title(vis_title),
         );
         f.render_widget(vis_para, vis_area);
@@ -974,19 +1094,19 @@ pub fn render(f: &mut Frame, app: &mut App) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray))
+                .border_style(Style::default().fg(crate::theme::current().muted))
                 .title(" Audio Player "),
         );
         f.render_widget(player_widget, chunks[2]);
     }
 
     // Active screen tab: bright key + white label.  Inactive: dim number + dim label.
-    let ak  = |s: &'static str| Span::styled(s, Style::default().fg(Color::Black).bg(Color::Cyan));
-    let al  = |s: &'static str| Span::styled(s, Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
-    let ik  = |s: &'static str| Span::styled(s, Style::default().fg(Color::DarkGray));
-    let sep = || Span::styled("  │  ", Style::default().fg(Color::DarkGray));
-    let ck  = |s: &'static str| Span::styled(s, Style::default().fg(Color::Black).bg(Color::Cyan));
-    let cl  = |s: &'static str| Span::styled(s, Style::default().fg(Color::White));
+    let ak  = |s: &'static str| Span::styled(s, Style::default().fg(crate::theme::current().background).bg(crate::theme::current().accent));
+    let al  = |s: &'static str| Span::styled(s, Style::default().fg(crate::theme::current().foreground).add_modifier(Modifier::BOLD));
+    let ik  = |s: &'static str| Span::styled(s, Style::default().fg(crate::theme::current().muted));
+    let sep = || Span::styled("  │  ", Style::default().fg(crate::theme::current().muted));
+    let ck  = |s: &'static str| Span::styled(s, Style::default().fg(crate::theme::current().background).bg(crate::theme::current().accent));
+    let cl  = |s: &'static str| Span::styled(s, Style::default().fg(crate::theme::current().foreground));
 
     let help_bar_spans = match app.screen {
         AppScreen::Browser => vec![
@@ -1049,17 +1169,17 @@ pub fn render(f: &mut Frame, app: &mut App) {
         let update_state = app.update.lock().unwrap().clone();
         let sep_line = match update_state {
             crate::updater::UpdateProgress::Available { ref version, .. } => Line::from(vec![
-                Span::styled("─── ", Style::default().fg(Color::DarkGray)),
+                Span::styled("─── ", Style::default().fg(crate::theme::current().muted)),
                 Span::styled(
                     format!("New version {} available ", version),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(crate::theme::current().warning),
                 ),
-                Span::styled(" U ", Style::default().fg(Color::Black).bg(Color::Yellow)),
-                Span::styled(" Update ", Style::default().fg(Color::Yellow)),
-                Span::styled(" ───", Style::default().fg(Color::DarkGray)),
+                Span::styled(" U ", Style::default().fg(crate::theme::current().background).bg(crate::theme::current().warning)),
+                Span::styled(" Update ", Style::default().fg(crate::theme::current().warning)),
+                Span::styled(" ───", Style::default().fg(crate::theme::current().muted)),
             ]),
             crate::updater::UpdateProgress::Downloading { ref version, downloaded, total } => {
-                let pct = if total > 0 { downloaded * 100 / total } else { 0 };
+                let pct = downloaded.saturating_mul(100).checked_div(total).unwrap_or(0);
                 let bar_width: usize = 20;
                 let filled = (pct as usize * bar_width / 100).min(bar_width);
                 let bar = format!(
@@ -1068,54 +1188,54 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     "░".repeat(bar_width - filled)
                 );
                 Line::from(vec![
-                    Span::styled("─── ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("─── ", Style::default().fg(crate::theme::current().muted)),
                     Span::styled(
                         format!("Downloading {} ", version),
-                        Style::default().fg(Color::Cyan),
+                        Style::default().fg(crate::theme::current().accent),
                     ),
-                    Span::styled(bar, Style::default().fg(Color::Cyan)),
+                    Span::styled(bar, Style::default().fg(crate::theme::current().accent)),
                     Span::styled(
                         format!(" {}% ───", pct),
-                        Style::default().fg(Color::Cyan),
+                        Style::default().fg(crate::theme::current().accent),
                     ),
                 ])
             }
             crate::updater::UpdateProgress::Replacing => Line::from(Span::styled(
                 "─── Replacing binary... ───",
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(crate::theme::current().accent),
             )),
             crate::updater::UpdateProgress::Done { ref version } => Line::from(vec![
-                Span::styled("─── ", Style::default().fg(Color::DarkGray)),
+                Span::styled("─── ", Style::default().fg(crate::theme::current().muted)),
                 Span::styled(
                     format!("Updated to {}! Restart stash to apply. ", version),
-                    Style::default().fg(Color::Green),
+                    Style::default().fg(crate::theme::current().success),
                 ),
-                Span::styled("───", Style::default().fg(Color::DarkGray)),
+                Span::styled("───", Style::default().fg(crate::theme::current().muted)),
             ]),
             crate::updater::UpdateProgress::Error(ref e) => Line::from(vec![
-                Span::styled("─── ", Style::default().fg(Color::DarkGray)),
+                Span::styled("─── ", Style::default().fg(crate::theme::current().muted)),
                 Span::styled(
                     format!("Update failed: {} ", e),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(crate::theme::current().error),
                 ),
-                Span::styled("───", Style::default().fg(Color::DarkGray)),
+                Span::styled("───", Style::default().fg(crate::theme::current().muted)),
             ]),
             _ => {
                 if let Some((ref msg, _)) = app.notification {
                     let (icon, color) = if msg.starts_with("Already") {
-                        ("○ ", Color::Yellow)
+                        ("○ ", crate::theme::current().warning)
                     } else {
-                        ("● ", Color::Green)
+                        ("● ", crate::theme::current().success)
                     };
                     Line::from(vec![
-                        Span::styled("─── ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("─── ", Style::default().fg(crate::theme::current().muted)),
                         Span::styled(icon, Style::default().fg(color)),
                         Span::styled(msg.as_str(), Style::default().fg(color)),
-                        Span::styled(" ───", Style::default().fg(Color::DarkGray)),
+                        Span::styled(" ───", Style::default().fg(crate::theme::current().muted)),
                     ])
                 } else {
                     let sep = "─".repeat(chunks[2].width as usize);
-                    Line::from(Span::styled(sep, Style::default().fg(Color::DarkGray)))
+                    Line::from(Span::styled(sep, Style::default().fg(crate::theme::current().muted)))
                 }
             }
         };
@@ -1168,8 +1288,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
             1,
         );
         let search_para = Paragraph::new(Line::from(vec![
-            Span::styled("Search /: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(&app.search.query, Style::default().fg(Color::White)),
+            Span::styled("Search /: ", Style::default().fg(crate::theme::current().accent).add_modifier(Modifier::BOLD)),
+            Span::styled(&app.search.query, Style::default().fg(crate::theme::current().foreground)),
         ]));
         f.render_widget(search_para, search_rect);
 
@@ -1279,7 +1399,7 @@ fn render_dest_browser_popup(f: &mut Frame, app: &App) {
     let popup_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(Style::default().fg(crate::theme::current().warning))
         .title(title);
 
     let inner = popup_block.inner(area);
@@ -1303,9 +1423,9 @@ fn render_dest_browser_popup(f: &mut Frame, app: &App) {
 
     let left_focused = matches!(db.focus, DestBrowserFocus::Quick);
     let left_border_style = if left_focused {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(crate::theme::current().warning)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(crate::theme::current().muted)
     };
     let left_block = Block::default()
         .borders(Borders::ALL)
@@ -1318,17 +1438,17 @@ fn render_dest_browser_popup(f: &mut Frame, app: &App) {
         if i == db.quick_index && left_focused {
             Line::from(Span::styled(
                 format!(" > {}", label),
-                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default().fg(crate::theme::current().background).bg(crate::theme::current().warning).add_modifier(Modifier::BOLD),
             ))
         } else if i == db.quick_index {
             Line::from(Span::styled(
                 format!(" > {}", label),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::current().warning),
             ))
         } else {
             Line::from(Span::styled(
                 format!("   {}", label),
-                Style::default().fg(Color::White),
+                Style::default().fg(crate::theme::current().foreground),
             ))
         }
     }).collect();
@@ -1342,9 +1462,9 @@ fn render_dest_browser_popup(f: &mut Frame, app: &App) {
 
     let right_focused = matches!(db.focus, DestBrowserFocus::Dirs);
     let right_border_style = if right_focused {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(crate::theme::current().accent)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(crate::theme::current().muted)
     };
     let dir_title = format!(" {} ", db.current_dir.to_string_lossy());
     let right_block = Block::default()
@@ -1358,7 +1478,7 @@ fn render_dest_browser_popup(f: &mut Frame, app: &App) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 " Loading...",
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                Style::default().fg(crate::theme::current().muted).add_modifier(Modifier::ITALIC),
             ))),
             right_inner,
         );
@@ -1372,17 +1492,17 @@ fn render_dest_browser_popup(f: &mut Frame, app: &App) {
         dir_items.push(if copy_here_selected && right_focused {
             Line::from(Span::styled(
                 format!(" ↵  {}", op_label),
-                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default().fg(crate::theme::current().background).bg(crate::theme::current().warning).add_modifier(Modifier::BOLD),
             ))
         } else if copy_here_selected {
             Line::from(Span::styled(
                 format!(" ↵  {}", op_label),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::current().warning),
             ))
         } else {
             Line::from(Span::styled(
                 format!("    {}", op_label),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(crate::theme::current().muted),
             ))
         });
 
@@ -1395,17 +1515,17 @@ fn render_dest_browser_popup(f: &mut Frame, app: &App) {
             if dir_idx == db.dir_index && right_focused {
                 dir_items.push(Line::from(Span::styled(
                     format!(" > {}/", name),
-                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default().fg(crate::theme::current().background).bg(crate::theme::current().accent).add_modifier(Modifier::BOLD),
                 )));
             } else if dir_idx == db.dir_index {
                 dir_items.push(Line::from(Span::styled(
                     format!(" > {}/", name),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(crate::theme::current().accent),
                 )));
             } else {
                 dir_items.push(Line::from(Span::styled(
                     format!("   {}/", name),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(crate::theme::current().foreground),
                 )));
             }
         }
@@ -1413,7 +1533,7 @@ fn render_dest_browser_popup(f: &mut Frame, app: &App) {
         if db.dirs.is_empty() {
             dir_items.push(Line::from(Span::styled(
                 "   (no subdirectories)",
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                Style::default().fg(crate::theme::current().muted).add_modifier(Modifier::ITALIC),
             )));
         }
 
@@ -1427,27 +1547,27 @@ fn render_dest_browser_popup(f: &mut Frame, app: &App) {
     let dest_str = db.current_dir.to_string_lossy().into_owned();
     let bottom_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(crate::theme::current().muted));
     let bottom_inner = bottom_block.inner(vchunks[1]);
     f.render_widget(bottom_block, vchunks[1]);
 
     let hint_line = Line::from(vec![
-        Span::styled(" Dest: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(dest_str, Style::default().fg(Color::White)),
+        Span::styled(" Dest: ", Style::default().fg(crate::theme::current().muted)),
+        Span::styled(dest_str, Style::default().fg(crate::theme::current().foreground)),
     ]);
     let key_line = Line::from(vec![
-        Span::styled(" Tab", Style::default().fg(Color::Black).bg(Color::DarkGray)),
-        Span::styled(":switch  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("j/k", Style::default().fg(Color::Black).bg(Color::DarkGray)),
-        Span::styled(":nav  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("l/Enter", Style::default().fg(Color::Black).bg(Color::DarkGray)),
-        Span::styled(":open  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("h/Bsp", Style::default().fg(Color::Black).bg(Color::DarkGray)),
-        Span::styled(":up  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("c", Style::default().fg(Color::Black).bg(Color::DarkGray)),
-        Span::styled(":copy here  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Esc", Style::default().fg(Color::Black).bg(Color::DarkGray)),
-        Span::styled(":cancel", Style::default().fg(Color::DarkGray)),
+        Span::styled(" Tab", Style::default().fg(crate::theme::current().background).bg(crate::theme::current().muted)),
+        Span::styled(":switch  ", Style::default().fg(crate::theme::current().muted)),
+        Span::styled("j/k", Style::default().fg(crate::theme::current().background).bg(crate::theme::current().muted)),
+        Span::styled(":nav  ", Style::default().fg(crate::theme::current().muted)),
+        Span::styled("l/Enter", Style::default().fg(crate::theme::current().background).bg(crate::theme::current().muted)),
+        Span::styled(":open  ", Style::default().fg(crate::theme::current().muted)),
+        Span::styled("h/Bsp", Style::default().fg(crate::theme::current().background).bg(crate::theme::current().muted)),
+        Span::styled(":up  ", Style::default().fg(crate::theme::current().muted)),
+        Span::styled("c", Style::default().fg(crate::theme::current().background).bg(crate::theme::current().muted)),
+        Span::styled(":copy here  ", Style::default().fg(crate::theme::current().muted)),
+        Span::styled("Esc", Style::default().fg(crate::theme::current().background).bg(crate::theme::current().muted)),
+        Span::styled(":cancel", Style::default().fg(crate::theme::current().muted)),
     ]);
     f.render_widget(Paragraph::new(vec![hint_line, key_line]), bottom_inner);
 }
@@ -1460,7 +1580,7 @@ fn render_conflict_popup(f: &mut Frame, progress: &crate::app::FileOperationProg
     let popup_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(Style::default().fg(Color::Magenta))
+        .border_style(Style::default().fg(crate::theme::current().accent_alt))
         .title(" File Already Exists ");
 
     let src_size = format_size(progress.conflict_src_size);
@@ -1469,21 +1589,21 @@ fn render_conflict_popup(f: &mut Frame, progress: &crate::app::FileOperationProg
     let lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("  File: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(filename, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("  File: ", Style::default().fg(crate::theme::current().muted)),
+            Span::styled(filename, Style::default().fg(crate::theme::current().foreground).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
-            Span::styled("  Incoming: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(src_size, Style::default().fg(Color::Cyan)),
-            Span::styled("   Existing: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(dest_size, Style::default().fg(Color::Yellow)),
+            Span::styled("  Incoming: ", Style::default().fg(crate::theme::current().muted)),
+            Span::styled(src_size, Style::default().fg(crate::theme::current().accent)),
+            Span::styled("   Existing: ", Style::default().fg(crate::theme::current().muted)),
+            Span::styled(dest_size, Style::default().fg(crate::theme::current().warning)),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  [r] Replace  ", Style::default().fg(Color::Green)),
-            Span::styled("[R] Replace All  ", Style::default().fg(Color::LightGreen)),
-            Span::styled("[s] Skip  ", Style::default().fg(Color::Red)),
-            Span::styled("[S] Skip All", Style::default().fg(Color::LightRed)),
+            Span::styled("  [r] Replace  ", Style::default().fg(crate::theme::current().success)),
+            Span::styled("[R] Replace All  ", Style::default().fg(crate::theme::current().success)),
+            Span::styled("[s] Skip  ", Style::default().fg(crate::theme::current().error)),
+            Span::styled("[S] Skip All", Style::default().fg(crate::theme::current().error)),
         ]),
     ];
 
@@ -1498,15 +1618,15 @@ fn render_input_popup(f: &mut Frame, title: &str, label: &str, value: &str, curs
     let popup_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(Style::default().fg(crate::theme::current().warning))
         .title(title);
 
     let input_para = Paragraph::new(vec![
         Line::from(label),
         Line::from(""),
         Line::from(vec![
-            Span::styled("> ", Style::default().fg(Color::Cyan)),
-            Span::styled(value, Style::default().fg(Color::White)),
+            Span::styled("> ", Style::default().fg(crate::theme::current().accent)),
+            Span::styled(value, Style::default().fg(crate::theme::current().foreground)),
         ]),
     ])
     .block(popup_block);
@@ -1528,7 +1648,7 @@ fn render_confirm_popup(f: &mut Frame, title: &str, label: &str) {
     let popup_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(Style::default().fg(Color::Red))
+        .border_style(Style::default().fg(crate::theme::current().error))
         .title(title);
 
     let confirm_para = Paragraph::new(vec![
@@ -1541,14 +1661,14 @@ fn render_confirm_popup(f: &mut Frame, title: &str, label: &str) {
 }
 
 fn render_manage_folders_popup(f: &mut Frame, app: &App) {
-    let height = (app.config.music_folders.len() as u16 + 6).max(8).min(24);
+    let height = (app.config.music_folders.len() as u16 + 6).clamp(8, 24);
     let area = centered_rect_fixed(60, height, f.size());
     f.render_widget(Clear, area);
 
     let popup_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(crate::theme::current().accent))
         .title(" Music Folders  d/x remove  Esc close ");
 
     let inner = popup_block.inner(area);
@@ -1559,12 +1679,12 @@ fn render_manage_folders_popup(f: &mut Frame, app: &App) {
             Line::from(""),
             Line::from(Span::styled(
                 "  No music folders configured.",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(crate::theme::current().muted),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 "  Browse to a folder in the Browser and press m to add it.",
-                Style::default().fg(Color::White),
+                Style::default().fg(crate::theme::current().foreground),
             )),
         ]);
         f.render_widget(msg, inner);
@@ -1580,21 +1700,21 @@ fn render_manage_folders_popup(f: &mut Frame, app: &App) {
             let is_sel = i == app.manage_folders_index;
             let prefix = if is_sel { "> " } else { "  " };
             let style = if is_sel {
-                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default().fg(crate::theme::current().background).bg(crate::theme::current().accent).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(crate::theme::current().foreground)
             };
             ListItem::new(Line::from(vec![
-                Span::styled(prefix, Style::default().fg(Color::Cyan)),
+                Span::styled(prefix, Style::default().fg(crate::theme::current().accent)),
                 Span::styled(folder.as_str(), style),
             ]))
         })
         .collect();
 
     let hint = Line::from(vec![
-        Span::styled("  Browse to a folder in Browser and press ", Style::default().fg(Color::DarkGray)),
-        Span::styled("m", Style::default().fg(Color::Yellow)),
-        Span::styled(" to add it", Style::default().fg(Color::DarkGray)),
+        Span::styled("  Browse to a folder in Browser and press ", Style::default().fg(crate::theme::current().muted)),
+        Span::styled("m", Style::default().fg(crate::theme::current().warning)),
+        Span::styled(" to add it", Style::default().fg(crate::theme::current().muted)),
     ]);
 
     let chunks = ratatui::layout::Layout::default()
@@ -1616,7 +1736,7 @@ fn render_add_to_collection_popup(f: &mut Frame, app: &mut App) {
     let popup_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(Style::default().fg(crate::theme::current().warning))
         .title(" Add to Playlist ");
 
     let inner = popup_block.inner(area);
@@ -1645,14 +1765,14 @@ fn render_add_to_collection_popup(f: &mut Frame, app: &mut App) {
     lines.push(Line::from(vec![
         Span::styled(
             if new_selected { " > " } else { "   " },
-            Style::default().fg(Color::Green),
+            Style::default().fg(crate::theme::current().success),
         ),
         Span::styled(
             "+ New playlist",
             if new_selected {
-                Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)
+                Style::default().fg(crate::theme::current().background).bg(crate::theme::current().success).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Green)
+                Style::default().fg(crate::theme::current().success)
             },
         ),
     ]));
@@ -1664,14 +1784,14 @@ fn render_add_to_collection_popup(f: &mut Frame, app: &mut App) {
         lines.push(Line::from(vec![
             Span::styled(
                 if is_highlighted { " > " } else { "   " },
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(crate::theme::current().accent),
             ),
             Span::styled(
                 name.clone(),
                 if is_highlighted {
-                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    Style::default().fg(crate::theme::current().background).bg(crate::theme::current().accent).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(crate::theme::current().foreground)
                 },
             ),
         ]));
@@ -1689,13 +1809,13 @@ fn render_add_to_collection_popup(f: &mut Frame, app: &mut App) {
     if app.add_coll_creating {
         let input_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Green))
+            .border_style(Style::default().fg(crate::theme::current().success))
             .title(" Playlist name ");
         let input_inner = input_block.inner(vchunks[1]);
         f.render_widget(input_block, vchunks[1]);
         let display = format!("{}_", app.input_value);
         f.render_widget(
-            ratatui::widgets::Paragraph::new(display).style(Style::default().fg(Color::White)),
+            ratatui::widgets::Paragraph::new(display).style(Style::default().fg(crate::theme::current().foreground)),
             input_inner,
         );
     }
@@ -1703,19 +1823,19 @@ fn render_add_to_collection_popup(f: &mut Frame, app: &mut App) {
     // Hint line
     let hint = if app.add_coll_creating {
         Line::from(vec![
-            Span::styled(" Enter", Style::default().fg(Color::Black).bg(Color::DarkGray)),
-            Span::styled(":create  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc", Style::default().fg(Color::Black).bg(Color::DarkGray)),
-            Span::styled(":back", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Enter", Style::default().fg(crate::theme::current().background).bg(crate::theme::current().muted)),
+            Span::styled(":create  ", Style::default().fg(crate::theme::current().muted)),
+            Span::styled("Esc", Style::default().fg(crate::theme::current().background).bg(crate::theme::current().muted)),
+            Span::styled(":back", Style::default().fg(crate::theme::current().muted)),
         ])
     } else {
         Line::from(vec![
-            Span::styled(" j/k", Style::default().fg(Color::Black).bg(Color::DarkGray)),
-            Span::styled(":nav  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Enter", Style::default().fg(Color::Black).bg(Color::DarkGray)),
-            Span::styled(":select  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc", Style::default().fg(Color::Black).bg(Color::DarkGray)),
-            Span::styled(":cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(" j/k", Style::default().fg(crate::theme::current().background).bg(crate::theme::current().muted)),
+            Span::styled(":nav  ", Style::default().fg(crate::theme::current().muted)),
+            Span::styled("Enter", Style::default().fg(crate::theme::current().background).bg(crate::theme::current().muted)),
+            Span::styled(":select  ", Style::default().fg(crate::theme::current().muted)),
+            Span::styled("Esc", Style::default().fg(crate::theme::current().background).bg(crate::theme::current().muted)),
+            Span::styled(":cancel", Style::default().fg(crate::theme::current().muted)),
         ])
     };
     f.render_widget(ratatui::widgets::Paragraph::new(hint), vchunks[2]);
@@ -1725,8 +1845,8 @@ fn render_help_popup(f: &mut Frame, scroll: u16) {
     let area = centered_rect_fixed(70, (f.size().height).saturating_sub(4).min(52), f.size());
     f.render_widget(Clear, area);
 
-    let h = |s: &'static str| Span::styled(s, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-    let k = |s: &'static str| Span::styled(s, Style::default().fg(Color::Yellow));
+    let h = |s: &'static str| Span::styled(s, Style::default().fg(crate::theme::current().accent).add_modifier(Modifier::BOLD));
+    let k = |s: &'static str| Span::styled(s, Style::default().fg(crate::theme::current().warning));
     let d = |s: &'static str| Span::raw(s);
 
     let help_text = vec![
@@ -1825,7 +1945,7 @@ fn render_help_popup(f: &mut Frame, scroll: u16) {
     let popup_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(crate::theme::current().accent))
         .title(" Keyboard Shortcuts — j/k scroll, any other key to close ");
 
     let help_para = Paragraph::new(help_text)
@@ -1839,11 +1959,11 @@ fn render_progress_popup(f: &mut Frame, progress: &crate::app::FileOperationProg
     f.render_widget(Clear, area);
 
     let border_color = if progress.error.is_some() {
-        Color::Red
+        crate::theme::current().error
     } else if progress.canceled {
-        Color::Magenta
+        crate::theme::current().accent_alt
     } else {
-        Color::Yellow
+        crate::theme::current().warning
     };
 
     let popup_block = Block::default()
@@ -1893,30 +2013,30 @@ fn render_progress_popup(f: &mut Frame, progress: &crate::app::FileOperationProg
         Line::from(""),
         Line::from(progress_details_str),
         Line::from(""),
-        Line::from(Span::styled(progress_bar_str, Style::default().fg(Color::Cyan))),
+        Line::from(Span::styled(progress_bar_str, Style::default().fg(crate::theme::current().accent))),
         Line::from(""),
     ];
 
     if let Some(ref err) = progress.error {
         details.push(Line::from(vec![
-            Span::styled(" Error: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            Span::styled(err, Style::default().fg(Color::LightRed)),
+            Span::styled(" Error: ", Style::default().fg(crate::theme::current().error).add_modifier(Modifier::BOLD)),
+            Span::styled(err, Style::default().fg(crate::theme::current().error)),
         ]));
         details.push(Line::from(""));
-        details.push(Line::from(Span::styled(" Press Esc or Enter to acknowledge ", Style::default().fg(Color::DarkGray))));
+        details.push(Line::from(Span::styled(" Press Esc or Enter to acknowledge ", Style::default().fg(crate::theme::current().muted))));
     } else if progress.canceled {
         details.push(Line::from(vec![
-            Span::styled(" Canceled ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::styled(" Canceled ", Style::default().fg(crate::theme::current().accent_alt).add_modifier(Modifier::BOLD)),
         ]));
         details.push(Line::from(""));
-        details.push(Line::from(Span::styled(" Press Esc or Enter to dismiss ", Style::default().fg(Color::DarkGray))));
+        details.push(Line::from(Span::styled(" Press Esc or Enter to dismiss ", Style::default().fg(crate::theme::current().muted))));
     } else {
         details.push(Line::from(vec![
-            Span::styled(" Current: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&progress.current_file, Style::default().fg(Color::White)),
+            Span::styled(" Current: ", Style::default().fg(crate::theme::current().muted)),
+            Span::styled(&progress.current_file, Style::default().fg(crate::theme::current().foreground)),
         ]));
         details.push(Line::from(""));
-        details.push(Line::from(Span::styled(" Press Esc to cancel ", Style::default().fg(Color::DarkGray))));
+        details.push(Line::from(Span::styled(" Press Esc to cancel ", Style::default().fg(crate::theme::current().muted))));
     }
 
     let progress_para = Paragraph::new(details)
@@ -1930,41 +2050,42 @@ fn render_image_preview(f: &mut Frame, app: &mut App, area: Rect, path: &PathBuf
         return;
     }
 
-    // Si el hilo de carga todavía está trabajando en este path, mostramos el indicador y nos vamos
-    let is_loading = app.loading_image.try_lock()
-        .map(|lock| matches!(&*lock, Some((p, None)) if p == path))
-        .unwrap_or(false);
-    if is_loading || app.current_image_data.as_ref().map(|(p, _)| p != path).unwrap_or(true) {
+    if let Some(error) = &app.image_error {
+        f.render_widget(Paragraph::new(format!("Preview unavailable: {error}")), area);
+        return;
+    }
+    if app.current_image_data.as_ref().map(|(p, _)| p != path).unwrap_or(true) {
         f.render_widget(
-            Paragraph::new("Loading preview...").style(Style::default().fg(Color::Yellow)),
+            Paragraph::new("Loading preview...").style(Style::default().fg(crate::theme::current().warning)),
             area,
         );
         return;
     }
 
-    if let Some(picker_fs) = app.picker.as_ref().map(|p| p.font_size) {
-        let cached = app.current_image_protocol.as_ref()
-            .map(|(p, w, h, _)| p == path && *w == area.width && *h == area.height)
-            .unwrap_or(false);
-
-        if !cached
-            && let Some((_, ref img)) = app.current_image_data {
-                // ratatui-image con Resize::Fit solo achica, nunca agranda. Por eso
-                // pre-escalamos al tamaño del pane en píxeles antes de pasárselo al picker,
-                // así imágenes chicas (thumbnails) llenan el área igual que las grandes.
-                let px_w = area.width as u32 * picker_fs.0 as u32;
-                let px_h = area.height as u32 * picker_fs.1 as u32;
-                let sized = img.resize(px_w, px_h, image::imageops::FilterType::CatmullRom);
-                if let Some(picker) = app.picker.as_mut() {
-                    let proto = picker.new_resize_protocol(sized);
-                    app.current_image_protocol = Some((path.clone(), area.width, area.height, proto));
-                }
-            }
-
-        if let Some((_, _, _, ref mut proto)) = app.current_image_protocol {
-            f.render_stateful_widget(ratatui_image::ResizeImage::new(None), area, proto);
-            return;
+    if let Some(picker) = app.picker.filter(|p| p.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks) {
+        let key = (path.clone(), area.width, area.height);
+        if app.image_graphics_request.as_ref() != Some(&key)
+            && let Some((_, image)) = &app.current_image_data {
+                app.image_graphics.request(Some(crate::preview::GraphicsRequest {
+                    path: path.clone(), width: area.width, height: area.height,
+                    image: std::sync::Arc::clone(image), picker, kitty_id: 1,
+                }));
+                app.image_graphics_request = Some(key);
+                app.current_image_protocol = None;
         }
+        if let Some((request, result)) = app.image_graphics.poll() {
+            match result {
+                Ok(protocol) => app.current_image_protocol = Some((request.path, request.width, request.height, protocol)),
+                Err(error) => app.image_error = Some(error),
+            }
+        }
+        if let Some((_, _, _, protocol)) = &mut app.current_image_protocol {
+            // Already resized and encoded by the worker; render without encoding again.
+            protocol.render(area, f.buffer_mut());
+        } else {
+            f.render_widget(Paragraph::new("Preparing preview..."), area);
+        }
+        return;
     }
 
     // Fallback halfblock: si no hay picker (terminal sin soporte gráfico), pintamos con ▄ RGB
@@ -2025,37 +2146,42 @@ fn render_cover_preview(f: &mut Frame, app: &mut App, area: Rect, path: &PathBuf
         return;
     }
 
-    let is_loading = app.loading_cover.try_lock()
-        .map(|lock| matches!(&*lock, Some((p, None)) if p == path))
-        .unwrap_or(false);
-    if is_loading || app.current_cover_data.as_ref().map(|(p, _)| p != path).unwrap_or(true) {
+    if let Some(error) = &app.cover_error {
+        f.render_widget(Paragraph::new(format!("Preview unavailable: {error}")), area);
+        return;
+    }
+    if app.current_cover_data.as_ref().map(|(p, _)| p != path).unwrap_or(true) {
         f.render_widget(
-            Paragraph::new("Loading preview...").style(Style::default().fg(Color::Yellow)),
+            Paragraph::new("Loading preview...").style(Style::default().fg(crate::theme::current().warning)),
             area,
         );
         return;
     }
 
-    if let Some(picker_fs) = app.picker.as_ref().map(|p| p.font_size) {
-        let cached = app.current_cover_protocol.as_ref()
-            .map(|(p, w, h, _)| p == path && *w == area.width && *h == area.height)
-            .unwrap_or(false);
-
-        if !cached
-            && let Some((_, ref img)) = app.current_cover_data {
-                let px_w = area.width as u32 * picker_fs.0 as u32;
-                let px_h = area.height as u32 * picker_fs.1 as u32;
-                let sized = img.resize(px_w, px_h, image::imageops::FilterType::CatmullRom);
-                if let Some(picker) = app.picker.as_mut() {
-                    let proto = picker.new_resize_protocol(sized);
-                    app.current_cover_protocol = Some((path.clone(), area.width, area.height, proto));
-                }
-            }
-
-        if let Some((_, _, _, ref mut proto)) = app.current_cover_protocol {
-            f.render_stateful_widget(ratatui_image::ResizeImage::new(None), area, proto);
-            return;
+    if let Some(picker) = app.picker.filter(|p| p.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks) {
+        let key = (path.clone(), area.width, area.height);
+        if app.cover_graphics_request.as_ref() != Some(&key)
+            && let Some((_, image)) = &app.current_cover_data {
+                app.cover_graphics.request(Some(crate::preview::GraphicsRequest {
+                    path: path.clone(), width: area.width, height: area.height,
+                    image: std::sync::Arc::clone(image), picker, kitty_id: 2,
+                }));
+                app.cover_graphics_request = Some(key);
+                app.current_cover_protocol = None;
         }
+        if let Some((request, result)) = app.cover_graphics.poll() {
+            match result {
+                Ok(protocol) => app.current_cover_protocol = Some((request.path, request.width, request.height, protocol)),
+                Err(error) => app.cover_error = Some(error),
+            }
+        }
+        if let Some((_, _, _, protocol)) = &mut app.current_cover_protocol {
+            // Already resized and encoded by the worker; render without encoding again.
+            protocol.render(area, f.buffer_mut());
+        } else {
+            f.render_widget(Paragraph::new("Preparing preview..."), area);
+        }
+        return;
     }
 
     // Mismo fallback halfblock que render_image_preview
@@ -2149,21 +2275,21 @@ fn render_desktop_preview(f: &mut Frame, _app: &mut App, area: Rect, lines: &[St
     let mut list_items = Vec::new();
 
     list_items.push(Line::from(vec![
-        Span::styled("Desktop Entry Configuration", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("Desktop Entry Configuration", Style::default().fg(crate::theme::current().accent).add_modifier(Modifier::BOLD)),
     ]));
     list_items.push(Line::from(vec![
-        Span::styled("─".repeat(area.width.saturating_sub(2) as usize), Style::default().fg(Color::DarkGray)),
+        Span::styled("─".repeat(area.width.saturating_sub(2) as usize), Style::default().fg(crate::theme::current().muted)),
     ]));
     list_items.push(Line::from(vec![]));
 
-    let label_style = Style::default().fg(Color::DarkGray);
-    let value_style = Style::default().fg(Color::White);
-    let highlight_value_style = Style::default().fg(Color::Yellow);
+    let label_style = Style::default().fg(crate::theme::current().muted);
+    let value_style = Style::default().fg(crate::theme::current().foreground);
+    let highlight_value_style = Style::default().fg(crate::theme::current().warning);
 
     if let Some(n) = name {
         list_items.push(Line::from(vec![
             Span::styled("  Name:         ", label_style),
-            Span::styled(n, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(n, Style::default().fg(crate::theme::current().success).add_modifier(Modifier::BOLD)),
         ]));
     }
     if let Some(gn) = generic_name {
@@ -2214,13 +2340,13 @@ fn render_desktop_preview(f: &mut Frame, _app: &mut App, area: Rect, lines: &[St
             Span::styled("  Comment:", label_style),
         ]));
         list_items.push(Line::from(vec![
-            Span::styled(format!("    {}", comm), Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)),
+            Span::styled(format!("    {}", comm), Style::default().fg(crate::theme::current().muted).add_modifier(Modifier::ITALIC)),
         ]));
     }
 
     list_items.push(Line::from(vec![]));
     list_items.push(Line::from(vec![
-        Span::styled("─".repeat(area.width.saturating_sub(2) as usize), Style::default().fg(Color::DarkGray)),
+        Span::styled("─".repeat(area.width.saturating_sub(2) as usize), Style::default().fg(crate::theme::current().muted)),
     ]));
     list_items.push(Line::from(vec![
         Span::styled("  Raw File Contents (First 5 lines):", label_style),
@@ -2229,7 +2355,7 @@ fn render_desktop_preview(f: &mut Frame, _app: &mut App, area: Rect, lines: &[St
     let raw_preview_lines = lines.iter().take(5);
     for raw_line in raw_preview_lines {
         list_items.push(Line::from(vec![
-            Span::styled(format!("    {}", raw_line), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("    {}", raw_line), Style::default().fg(crate::theme::current().muted)),
         ]));
     }
 
@@ -2242,6 +2368,11 @@ fn render_text_preview(f: &mut Frame, app: &mut App, area: Rect, path: &PathBuf)
         return;
     }
 
+    if let Some(error) = &app.text_error {
+        f.render_widget(Paragraph::new(format!("Preview unavailable: {error}")), area);
+        return;
+    }
+
     let cached = app.current_text_data.as_ref()
         .map(|(p, _)| p == path)
         .unwrap_or(false);
@@ -2250,7 +2381,7 @@ fn render_text_preview(f: &mut Frame, app: &mut App, area: Rect, path: &PathBuf)
         f.render_widget(
             Paragraph::new(vec![
                 Line::from(""),
-                Line::from(Span::styled("  Loading preview...", Style::default().fg(Color::Yellow))),
+                Line::from(Span::styled("  Loading preview...", Style::default().fg(crate::theme::current().warning))),
             ]),
             area,
         );
@@ -2286,7 +2417,7 @@ fn render_text_preview(f: &mut Frame, app: &mut App, area: Rect, path: &PathBuf)
                 let line_num = start_idx + i + 1;
                 let num_span = Span::styled(
                     format!("{:>4} │ ", line_num),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(crate::theme::current().muted),
                 );
                 let mut spans = vec![num_span];
                 spans.extend(highlight_line(line_content, &ext));
@@ -2318,19 +2449,19 @@ fn highlight_line(line: &str, ext: &str) -> Vec<Span<'static>> {
     while i < len {
         if comment_char == Some(chars[i]) {
             let comment_text: String = chars[i..].iter().collect();
-            spans.push(Span::styled(comment_text, Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)));
+            spans.push(Span::styled(comment_text, Style::default().fg(crate::theme::current().muted).add_modifier(Modifier::ITALIC)));
             break;
         }
 
         if i + 1 < len && chars[i] == '/' && chars[i+1] == '/' && !matches!(ext, "py" | "sh" | "toml" | "yaml" | "yml" | "md") {
             let comment_text: String = chars[i..].iter().collect();
-            spans.push(Span::styled(comment_text, Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)));
+            spans.push(Span::styled(comment_text, Style::default().fg(crate::theme::current().muted).add_modifier(Modifier::ITALIC)));
             break;
         }
 
         if i + 1 < len && chars[i] == '-' && chars[i+1] == '-' && ext == "sql" {
             let comment_text: String = chars[i..].iter().collect();
-            spans.push(Span::styled(comment_text, Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)));
+            spans.push(Span::styled(comment_text, Style::default().fg(crate::theme::current().muted).add_modifier(Modifier::ITALIC)));
             break;
         }
 
@@ -2353,7 +2484,7 @@ fn highlight_line(line: &str, ext: &str) -> Vec<Span<'static>> {
                 }
                 i += 1;
             }
-            spans.push(Span::styled(string_val, Style::default().fg(Color::Green)));
+            spans.push(Span::styled(string_val, Style::default().fg(crate::theme::current().success)));
             continue;
         }
 
@@ -2365,13 +2496,13 @@ fn highlight_line(line: &str, ext: &str) -> Vec<Span<'static>> {
             }
 
             let style = if is_keyword(&word, ext) {
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+                Style::default().fg(crate::theme::current().accent_alt).add_modifier(Modifier::BOLD)
             } else if is_type_or_builtin(&word) {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(crate::theme::current().warning)
             } else if word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
-                Style::default().fg(Color::Blue)
+                Style::default().fg(crate::theme::current().accent_alt)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(crate::theme::current().foreground)
             };
             spans.push(Span::styled(word, style));
             continue;
@@ -2383,16 +2514,16 @@ fn highlight_line(line: &str, ext: &str) -> Vec<Span<'static>> {
                 num_str.push(chars[i]);
                 i += 1;
             }
-            spans.push(Span::styled(num_str, Style::default().fg(Color::Cyan)));
+            spans.push(Span::styled(num_str, Style::default().fg(crate::theme::current().accent)));
             continue;
         }
 
         let c = chars[i];
         let c_str = c.to_string();
         let style = if "{}[Option]().,;+-*/%&|^!~=<>:?".contains(c) {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(crate::theme::current().muted)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(crate::theme::current().foreground)
         };
         spans.push(Span::styled(c_str, style));
         i += 1;
@@ -2484,9 +2615,9 @@ fn render_library(f: &mut Frame, app: &mut App, area: Rect) {
 fn render_library_playlists(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.library.focused_panel == LibraryPanel::Playlists;
     let border_style = if focused {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(crate::theme::current().accent)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(crate::theme::current().muted)
     };
 
     let names = LibraryState::playlist_names(&app.collections);
@@ -2515,13 +2646,13 @@ fn render_library_playlists(f: &mut Frame, app: &App, area: Rect) {
         };
 
         let style = if is_sel && focused {
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default().fg(crate::theme::current().background).bg(crate::theme::current().accent).add_modifier(Modifier::BOLD)
         } else if is_sel {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(crate::theme::current().accent)
         } else if smart {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(crate::theme::current().warning)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(crate::theme::current().foreground)
         };
         ListItem::new(Line::from(Span::styled(label, style)))
     }).collect();
@@ -2545,9 +2676,9 @@ fn render_library_playlists(f: &mut Frame, app: &App, area: Rect) {
 fn render_library_tracks(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.library.focused_panel == LibraryPanel::Tracks;
     let border_style = if focused {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(crate::theme::current().accent)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(crate::theme::current().muted)
     };
 
     let filter_query = if app.search.active { app.search.query.as_str() } else { "" };
@@ -2606,7 +2737,7 @@ fn render_library_tracks(f: &mut Frame, app: &mut App, area: Rect) {
             Line::from(""),
             Line::from(Span::styled(
                 format!("  {}", msg),
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                Style::default().fg(crate::theme::current().muted).add_modifier(Modifier::ITALIC),
             )),
         ]);
         f.render_widget(p, inner);
@@ -2643,7 +2774,7 @@ fn render_library_tracks(f: &mut Frame, app: &mut App, area: Rect) {
     );
     let header = Paragraph::new(Line::from(Span::styled(
         header_text,
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        Style::default().fg(crate::theme::current().muted).add_modifier(Modifier::BOLD),
     )));
     f.render_widget(header, track_chunks[0]);
 
@@ -2688,17 +2819,17 @@ fn render_library_tracks(f: &mut Frame, app: &mut App, area: Rect) {
         );
 
         let style = if is_marked && is_sel && focused {
-            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default().fg(crate::theme::current().background).bg(crate::theme::current().warning).add_modifier(Modifier::BOLD)
         } else if is_marked {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(crate::theme::current().warning)
         } else if is_sel && focused {
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default().fg(crate::theme::current().background).bg(crate::theme::current().accent).add_modifier(Modifier::BOLD)
         } else if is_sel {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(crate::theme::current().accent)
         } else if is_playing {
-            Style::default().fg(Color::Green)
+            Style::default().fg(crate::theme::current().success)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(crate::theme::current().foreground)
         };
 
         ListItem::new(Line::from(Span::styled(text, style)))
@@ -2739,9 +2870,9 @@ fn library_track_column_widths(total_width: usize) -> (usize, usize, usize) {
 fn render_stats_panel(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.library.focused_panel == LibraryPanel::Tracks;
     let border_style = if focused {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(crate::theme::current().accent)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(crate::theme::current().muted)
     };
 
     let block = Block::default()
@@ -2785,9 +2916,9 @@ fn render_stats_panel(f: &mut Frame, app: &App, area: Rect) {
 
     let fav_genre = favorite_genre(stats, tracks).unwrap_or_else(|| "—".to_string());
 
-    let label = |s: &str| Span::styled(format!("  {:22}", s), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-    let value = |s: String| Span::styled(s, Style::default().fg(Color::White));
-    let dim_value = |s: String| Span::styled(s, Style::default().fg(Color::Gray));
+    let label = |s: &str| Span::styled(format!("  {:22}", s), Style::default().fg(crate::theme::current().accent).add_modifier(Modifier::BOLD));
+    let value = |s: String| Span::styled(s, Style::default().fg(crate::theme::current().foreground));
+    let dim_value = |s: String| Span::styled(s, Style::default().fg(crate::theme::current().muted));
 
     let lines: Vec<Line> = vec![
         Line::from(""),
@@ -2799,9 +2930,9 @@ fn render_stats_panel(f: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![label("Avg Session:"), if avg_secs == 0 { dim_value("—".to_string()) } else { value(if avg_h > 0 { format!("{}h {}m", avg_h, avg_m) } else { format!("{}m", avg_m) }) }]),
         Line::from(vec![label("Longest Session:"), if longest == 0 { dim_value("—".to_string()) } else { value(if long_h > 0 { format!("{}h {}m", long_h, long_m) } else { format!("{}m", long_m) }) }]),
         Line::from(""),
-        Line::from(vec![label("Most Played:"), Span::styled(most_played, Style::default().fg(Color::Green))]),
-        Line::from(vec![label("Most Skipped:"), Span::styled(most_skipped, Style::default().fg(Color::Yellow))]),
-        Line::from(vec![label("Favorite Genre:"), Span::styled(fav_genre, Style::default().fg(Color::Magenta))]),
+        Line::from(vec![label("Most Played:"), Span::styled(most_played, Style::default().fg(crate::theme::current().success))]),
+        Line::from(vec![label("Most Skipped:"), Span::styled(most_skipped, Style::default().fg(crate::theme::current().warning))]),
+        Line::from(vec![label("Favorite Genre:"), Span::styled(fav_genre, Style::default().fg(crate::theme::current().accent_alt))]),
     ];
 
     let para = Paragraph::new(lines).block(block);
@@ -2821,7 +2952,7 @@ fn render_bulk_tag_editor_popup(f: &mut Frame, app: &App) {
     let popup_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(Style::default().fg(crate::theme::current().warning))
         .title(format!(" Bulk Tag Editor — {} tracks ", editor.paths.len()));
 
     let inner = popup_block.inner(area);
@@ -2830,7 +2961,7 @@ fn render_bulk_tag_editor_popup(f: &mut Frame, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
         "  Empty fields are skipped — only filled fields apply to all selected tracks",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        Style::default().fg(crate::theme::current().muted).add_modifier(Modifier::ITALIC),
     )));
     for (i, field_name) in BULK_TAG_FIELD_NAMES.iter().enumerate() {
         let is_active = i == editor.active_field;
@@ -2838,19 +2969,17 @@ fn render_bulk_tag_editor_popup(f: &mut Frame, app: &App) {
         let value = &editor.fields[i];
 
         let label_style = if is_active {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default().fg(crate::theme::current().warning).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(crate::theme::current().muted)
         };
         let value_style = if is_editing {
-            Style::default().fg(Color::Yellow)
-        } else if is_active {
-            Style::default().fg(Color::White)
+            Style::default().fg(crate::theme::current().warning)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(crate::theme::current().foreground)
         };
         let skip_hint = if value.is_empty() && !is_editing {
-            Span::styled(" (skip)", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))
+            Span::styled(" (skip)", Style::default().fg(crate::theme::current().muted).add_modifier(Modifier::ITALIC))
         } else {
             Span::raw("")
         };
@@ -2858,7 +2987,7 @@ fn render_bulk_tag_editor_popup(f: &mut Frame, app: &App) {
         lines.push(Line::from(vec![
             Span::styled(format!("{}  {:<9}: ", prefix, field_name), label_style),
             Span::styled(value.as_str(), value_style),
-            if is_editing { Span::styled("█", Style::default().fg(Color::Yellow)) } else { Span::raw("") },
+            if is_editing { Span::styled("█", Style::default().fg(crate::theme::current().warning)) } else { Span::raw("") },
             skip_hint,
         ]));
     }
@@ -2868,24 +2997,24 @@ fn render_bulk_tag_editor_popup(f: &mut Frame, app: &App) {
         lines.push(render_bulk_tag_progress_line(&progress, inner.width.saturating_sub(4) as usize));
         lines.push(Line::from(Span::styled(
             "  Saving tags... keep Stash open",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default().fg(crate::theme::current().muted).add_modifier(Modifier::ITALIC),
         )));
     } else {
         let status_line = if let Some(ref msg) = editor.save_result {
-        let color = if msg.starts_with('✓') { Color::Green } else { Color::Yellow };
+        let color = if msg.starts_with('✓') { crate::theme::current().success } else { crate::theme::current().warning };
         Line::from(Span::styled(format!("  {}", msg), Style::default().fg(color)))
         } else {
         Line::from(vec![
-            Span::styled("  Enter", Style::default().fg(Color::Yellow)),
-            Span::styled(": edit field  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Tab", Style::default().fg(Color::Yellow)),
-            Span::styled(": next  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("w", Style::default().fg(Color::Yellow)),
-            Span::styled(" / ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Ctrl+S", Style::default().fg(Color::Yellow)),
-            Span::styled(": save all  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
-            Span::styled(": close", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Enter", Style::default().fg(crate::theme::current().warning)),
+            Span::styled(": edit field  ", Style::default().fg(crate::theme::current().muted)),
+            Span::styled("Tab", Style::default().fg(crate::theme::current().warning)),
+            Span::styled(": next  ", Style::default().fg(crate::theme::current().muted)),
+            Span::styled("w", Style::default().fg(crate::theme::current().warning)),
+            Span::styled(" / ", Style::default().fg(crate::theme::current().muted)),
+            Span::styled("Ctrl+S", Style::default().fg(crate::theme::current().warning)),
+            Span::styled(": save all  ", Style::default().fg(crate::theme::current().muted)),
+            Span::styled("Esc", Style::default().fg(crate::theme::current().warning)),
+            Span::styled(": close", Style::default().fg(crate::theme::current().muted)),
         ])
         };
         lines.push(status_line);
@@ -2912,24 +3041,16 @@ fn current_bulk_tag_progress(app: &App) -> Option<BulkTagProgress> {
 }
 
 fn render_bulk_tag_progress_line(progress: &BulkTagProgress, width: usize) -> Line<'static> {
-    let pct = if progress.total == 0 {
-        0
-    } else {
-        progress.done.saturating_mul(100) / progress.total
-    };
+    let pct = progress.done.saturating_mul(100).checked_div(progress.total).unwrap_or(0);
     let label = format!("  Saving {}/{} ({}%) ", progress.done, progress.total, pct);
     let bar_width = width.saturating_sub(label.width()).max(8);
-    let filled = if progress.total == 0 {
-        0
-    } else {
-        bar_width.saturating_mul(progress.done) / progress.total
-    };
+    let filled = bar_width.saturating_mul(progress.done).checked_div(progress.total).unwrap_or(0).min(bar_width);
     let empty = bar_width.saturating_sub(filled);
 
     Line::from(vec![
-        Span::styled(label, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled("█".repeat(filled), Style::default().fg(Color::Yellow)),
-        Span::styled("░".repeat(empty), Style::default().fg(Color::DarkGray)),
+        Span::styled(label, Style::default().fg(crate::theme::current().warning).add_modifier(Modifier::BOLD)),
+        Span::styled("█".repeat(filled), Style::default().fg(crate::theme::current().warning)),
+        Span::styled("░".repeat(empty), Style::default().fg(crate::theme::current().muted)),
     ])
 }
 
@@ -2950,7 +3071,7 @@ fn render_tag_editor_popup(f: &mut Frame, app: &App) {
     let popup_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(crate::theme::current().accent))
         .title(format!(" Tag Editor{} — {} ", nav_hint, editor.path.file_name().and_then(|n| n.to_str()).unwrap_or("?")));
 
     let inner = popup_block.inner(area);
@@ -2964,45 +3085,43 @@ fn render_tag_editor_popup(f: &mut Frame, app: &App) {
         let value = &editor.fields[i];
 
         let label_style = if is_active {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default().fg(crate::theme::current().accent).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(crate::theme::current().muted)
         };
         let value_style = if is_editing {
-            Style::default().fg(Color::Yellow)
-        } else if is_active {
-            Style::default().fg(Color::White)
+            Style::default().fg(crate::theme::current().warning)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(crate::theme::current().foreground)
         };
         let prefix = if is_active { "> " } else { "  " };
         lines.push(Line::from(vec![
             Span::styled(format!("{}  {:<9}: ", prefix, field_name), label_style),
             Span::styled(value.as_str(), value_style),
-            if is_editing { Span::styled("█", Style::default().fg(Color::Yellow)) } else { Span::raw("") },
+            if is_editing { Span::styled("█", Style::default().fg(crate::theme::current().warning)) } else { Span::raw("") },
         ]));
     }
     lines.push(Line::from(""));
 
     let status_line = if let Some(ref result) = editor.save_result {
         match result {
-            Ok(()) => Line::from(Span::styled("  Saved successfully!", Style::default().fg(Color::Green))),
-            Err(e) => Line::from(Span::styled(format!("  Error: {}", e), Style::default().fg(Color::Red))),
+            Ok(()) => Line::from(Span::styled("  Saved successfully!", Style::default().fg(crate::theme::current().success))),
+            Err(e) => Line::from(Span::styled(format!("  Error: {}", e), Style::default().fg(crate::theme::current().error))),
         }
     } else {
         let mut hint_spans = vec![
-            Span::styled("  Enter", Style::default().fg(Color::Cyan)),
-            Span::styled(": edit  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Tab", Style::default().fg(Color::Cyan)),
-            Span::styled(": next field  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("w", Style::default().fg(Color::Cyan)),
-            Span::styled(": save  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc", Style::default().fg(Color::Cyan)),
-            Span::styled(": close", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Enter", Style::default().fg(crate::theme::current().accent)),
+            Span::styled(": edit  ", Style::default().fg(crate::theme::current().muted)),
+            Span::styled("Tab", Style::default().fg(crate::theme::current().accent)),
+            Span::styled(": next field  ", Style::default().fg(crate::theme::current().muted)),
+            Span::styled("w", Style::default().fg(crate::theme::current().accent)),
+            Span::styled(": save  ", Style::default().fg(crate::theme::current().muted)),
+            Span::styled("Esc", Style::default().fg(crate::theme::current().accent)),
+            Span::styled(": close", Style::default().fg(crate::theme::current().muted)),
         ];
         if editor.track_list.len() > 1 {
-            hint_spans.push(Span::styled("  n/p", Style::default().fg(Color::Cyan)));
-            hint_spans.push(Span::styled(": next/prev", Style::default().fg(Color::DarkGray)));
+            hint_spans.push(Span::styled("  n/p", Style::default().fg(crate::theme::current().accent)));
+            hint_spans.push(Span::styled(": next/prev", Style::default().fg(crate::theme::current().muted)));
         }
         Line::from(hint_spans)
     };
@@ -3052,7 +3171,7 @@ fn render_healer_menu(f: &mut Frame, app: &App, area: Rect) {
         .title(" Library Healer ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(crate::theme::current().accent));
 
     let scan_status = match app.healer.scan_state {
         HealScanState::Idle     => "Not scanned yet",
@@ -3063,23 +3182,23 @@ fn render_healer_menu(f: &mut Frame, app: &App, area: Rect) {
 
     let lines = vec![
         Line::from(""),
-        Line::from(Span::styled("  Library Healer scans your music files for missing metadata", Style::default().fg(Color::Gray))),
-        Line::from(Span::styled("  and suggests fixes using filename patterns and MusicBrainz.", Style::default().fg(Color::Gray))),
+        Line::from(Span::styled("  Library Healer scans your music files for missing metadata", Style::default().fg(crate::theme::current().muted))),
+        Line::from(Span::styled("  and suggests fixes using filename patterns and MusicBrainz.", Style::default().fg(crate::theme::current().muted))),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Status: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(scan_status, Style::default().fg(Color::Yellow)),
+            Span::styled("  Status: ", Style::default().fg(crate::theme::current().muted)),
+            Span::styled(scan_status, Style::default().fg(crate::theme::current().warning)),
         ]),
         Line::from(vec![
-            Span::styled("  Files with issues: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(file_count.to_string(), Style::default().fg(Color::Red)),
+            Span::styled("  Files with issues: ", Style::default().fg(crate::theme::current().muted)),
+            Span::styled(file_count.to_string(), Style::default().fg(crate::theme::current().error)),
         ]),
         Line::from(""),
-        Line::from(Span::styled("  [s/Enter]  Scan library", Style::default().fg(Color::Cyan))),
-        Line::from(Span::styled("  [r]        View report", Style::default().fg(Color::Cyan))),
-        Line::from(Span::styled("  [f]        Browse files with issues", Style::default().fg(Color::Cyan))),
+        Line::from(Span::styled("  [s/Enter]  Scan library", Style::default().fg(crate::theme::current().accent))),
+        Line::from(Span::styled("  [r]        View report", Style::default().fg(crate::theme::current().accent))),
+        Line::from(Span::styled("  [f]        Browse files with issues", Style::default().fg(crate::theme::current().accent))),
         Line::from(""),
-        Line::from(Span::styled("  [1] Browser  [2] Queue  [3] Library  [Esc] Back", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("  [1] Browser  [2] Queue  [3] Library  [Esc] Back", Style::default().fg(crate::theme::current().muted))),
     ];
 
     let para = Paragraph::new(lines).block(block);
@@ -3096,22 +3215,22 @@ fn render_healer_scanning(f: &mut Frame, app: &App, area: Rect) {
         .title(" Scanning Library... ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_style(Style::default().fg(crate::theme::current().warning));
 
-    let progress_pct = if total > 0 { done * 100 / total } else { 0 };
+    let progress_pct = done.saturating_mul(100).checked_div(total).unwrap_or(0);
     let bar_width = area.width.saturating_sub(10) as usize;
     let filled = bar_width * progress_pct / 100;
     let bar = format!("[{}{}]", "=".repeat(filled), " ".repeat(bar_width.saturating_sub(filled)));
 
     let lines = vec![
         Line::from(""),
-        Line::from(Span::styled(format!("  Scanning: {}/{}", done, total), Style::default().fg(Color::White))),
+        Line::from(Span::styled(format!("  Scanning: {}/{}", done, total), Style::default().fg(crate::theme::current().foreground))),
         Line::from(""),
-        Line::from(Span::styled(format!("  {}", bar), Style::default().fg(Color::Green))),
+        Line::from(Span::styled(format!("  {}", bar), Style::default().fg(crate::theme::current().success))),
         Line::from(""),
-        Line::from(Span::styled(format!("  {}", current_file), Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(format!("  {}", current_file), Style::default().fg(crate::theme::current().muted))),
         Line::from(""),
-        Line::from(Span::styled("  [Esc] Cancel", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("  [Esc] Cancel", Style::default().fg(crate::theme::current().muted))),
     ];
 
     f.render_widget(Paragraph::new(lines).block(block), area);
@@ -3122,56 +3241,56 @@ fn render_healer_report(f: &mut Frame, app: &App, area: Rect) {
         .title(" Health Report ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(crate::theme::current().accent));
 
     if let Some(ref r) = app.healer.report {
         let sick = r.total.saturating_sub(r.healthy);
         let lines = vec![
             Line::from(""),
             Line::from(vec![
-                Span::styled("  Total scanned:     ", Style::default().fg(Color::DarkGray)),
-                Span::styled(r.total.to_string(), Style::default().fg(Color::White)),
+                Span::styled("  Total scanned:     ", Style::default().fg(crate::theme::current().muted)),
+                Span::styled(r.total.to_string(), Style::default().fg(crate::theme::current().foreground)),
             ]),
             Line::from(vec![
-                Span::styled("  Healthy:           ", Style::default().fg(Color::DarkGray)),
-                Span::styled(r.healthy.to_string(), Style::default().fg(Color::Green)),
+                Span::styled("  Healthy:           ", Style::default().fg(crate::theme::current().muted)),
+                Span::styled(r.healthy.to_string(), Style::default().fg(crate::theme::current().success)),
             ]),
             Line::from(vec![
-                Span::styled("  Files with issues: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(sick.to_string(), Style::default().fg(Color::Red)),
+                Span::styled("  Files with issues: ", Style::default().fg(crate::theme::current().muted)),
+                Span::styled(sick.to_string(), Style::default().fg(crate::theme::current().error)),
             ]),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  Missing Title:     ", Style::default().fg(Color::DarkGray)),
-                Span::styled(r.missing_title.to_string(), Style::default().fg(Color::Yellow)),
+                Span::styled("  Missing Title:     ", Style::default().fg(crate::theme::current().muted)),
+                Span::styled(r.missing_title.to_string(), Style::default().fg(crate::theme::current().warning)),
             ]),
             Line::from(vec![
-                Span::styled("  Missing Artist:    ", Style::default().fg(Color::DarkGray)),
-                Span::styled(r.missing_artist.to_string(), Style::default().fg(Color::Yellow)),
+                Span::styled("  Missing Artist:    ", Style::default().fg(crate::theme::current().muted)),
+                Span::styled(r.missing_artist.to_string(), Style::default().fg(crate::theme::current().warning)),
             ]),
             Line::from(vec![
-                Span::styled("  Missing Album:     ", Style::default().fg(Color::DarkGray)),
-                Span::styled(r.missing_album.to_string(), Style::default().fg(Color::Yellow)),
+                Span::styled("  Missing Album:     ", Style::default().fg(crate::theme::current().muted)),
+                Span::styled(r.missing_album.to_string(), Style::default().fg(crate::theme::current().warning)),
             ]),
             Line::from(vec![
-                Span::styled("  Missing Year:      ", Style::default().fg(Color::DarkGray)),
-                Span::styled(r.missing_year.to_string(), Style::default().fg(Color::Yellow)),
+                Span::styled("  Missing Year:      ", Style::default().fg(crate::theme::current().muted)),
+                Span::styled(r.missing_year.to_string(), Style::default().fg(crate::theme::current().warning)),
             ]),
             Line::from(vec![
-                Span::styled("  Missing Track#:    ", Style::default().fg(Color::DarkGray)),
-                Span::styled(r.missing_track.to_string(), Style::default().fg(Color::Yellow)),
+                Span::styled("  Missing Track#:    ", Style::default().fg(crate::theme::current().muted)),
+                Span::styled(r.missing_track.to_string(), Style::default().fg(crate::theme::current().warning)),
             ]),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  Have matches:      ", Style::default().fg(Color::DarkGray)),
-                Span::styled(r.has_matches.to_string(), Style::default().fg(Color::Cyan)),
+                Span::styled("  Have matches:      ", Style::default().fg(crate::theme::current().muted)),
+                Span::styled(r.has_matches.to_string(), Style::default().fg(crate::theme::current().accent)),
             ]),
             Line::from(vec![
-                Span::styled("  No match found:    ", Style::default().fg(Color::DarkGray)),
-                Span::styled(r.no_match.to_string(), Style::default().fg(Color::Red)),
+                Span::styled("  No match found:    ", Style::default().fg(crate::theme::current().muted)),
+                Span::styled(r.no_match.to_string(), Style::default().fg(crate::theme::current().error)),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  [Enter/f] Browse files  [s] Re-scan  [Esc] Menu", Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled("  [Enter/f] Browse files  [s] Re-scan  [Esc] Menu", Style::default().fg(crate::theme::current().muted))),
         ];
         f.render_widget(Paragraph::new(lines).block(block), area);
     } else {
@@ -3189,7 +3308,7 @@ fn render_healer_filelist(f: &mut Frame, app: &mut App, area: Rect) {
         .title(search_hint)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(crate::theme::current().accent));
 
     let indices = app.healer.filtered_indices();
     let items: Vec<ListItem> = indices.iter().enumerate().map(|(display_i, &file_i)| {
@@ -3210,12 +3329,12 @@ fn render_healer_filelist(f: &mut Frame, app: &mut App, area: Rect) {
         };
         let label = format!(" [{}] {}{} | {}", status_char, fname, match_hint, issues_str.join(", "));
         let style = if display_i == app.healer.list_idx {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
+            Style::default().fg(crate::theme::current().background).bg(crate::theme::current().accent)
         } else {
             match hf.status {
-                HealStatus::Skipped => Style::default().fg(Color::DarkGray),
-                HealStatus::NoMatch => Style::default().fg(Color::Red),
-                HealStatus::Pending => Style::default().fg(Color::White),
+                HealStatus::Skipped => Style::default().fg(crate::theme::current().muted),
+                HealStatus::NoMatch => Style::default().fg(crate::theme::current().error),
+                HealStatus::Pending => Style::default().fg(crate::theme::current().foreground),
             }
         };
         ListItem::new(Line::from(Span::styled(label, style)))
@@ -3230,8 +3349,8 @@ fn render_healer_filelist(f: &mut Frame, app: &mut App, area: Rect) {
         let bar_y = inner.y + inner.height.saturating_sub(1);
         let bar = Rect::new(inner.x, bar_y, inner.width, 1);
         let search_para = Paragraph::new(Line::from(vec![
-            Span::styled("Search /: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(&app.healer.search_query, Style::default().fg(Color::White)),
+            Span::styled("Search /: ", Style::default().fg(crate::theme::current().accent).add_modifier(Modifier::BOLD)),
+            Span::styled(&app.healer.search_query, Style::default().fg(crate::theme::current().foreground)),
         ]));
         f.render_widget(Clear, bar);
         f.render_widget(search_para, bar);
@@ -3250,7 +3369,7 @@ fn render_healer_preview(f: &mut Frame, app: &App, area: Rect) {
         .title(" Preview Match ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(crate::theme::current().accent));
 
     let hf = match app.healer.current_file() {
         Some(f) => f,
@@ -3265,17 +3384,17 @@ fn render_healer_preview(f: &mut Frame, app: &App, area: Rect) {
 
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("  File: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  File: ", Style::default().fg(crate::theme::current().muted)),
             Span::styled(
                 hf.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                Style::default().fg(Color::White),
+                Style::default().fg(crate::theme::current().foreground),
             ),
         ]),
         Line::from(vec![
-            Span::styled("  Issues: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Issues: ", Style::default().fg(crate::theme::current().muted)),
             Span::styled(
                 hf.issues.iter().map(|i| i.label()).collect::<Vec<_>>().join(", "),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::current().warning),
             ),
         ]),
         Line::from(""),
@@ -3285,14 +3404,14 @@ fn render_healer_preview(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(vec![
             Span::styled(
                 format!("  Match {}/{} | ", app.healer.match_idx + 1, match_count),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(crate::theme::current().muted),
             ),
-            Span::styled(m.source.label(), Style::default().fg(Color::Cyan)),
-            Span::styled(format!(" ({}%)", m.confidence), Style::default().fg(Color::Green)),
+            Span::styled(m.source.label(), Style::default().fg(crate::theme::current().accent)),
+            Span::styled(format!(" ({}%)", m.confidence), Style::default().fg(crate::theme::current().success)),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("  Note: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(m.note.clone(), Style::default().fg(Color::Gray)),
+            Span::styled("  Note: ", Style::default().fg(crate::theme::current().muted)),
+            Span::styled(m.note.clone(), Style::default().fg(crate::theme::current().muted)),
         ]));
         lines.push(Line::from(""));
 
@@ -3312,16 +3431,16 @@ fn render_healer_preview(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  [Enter/a] Apply  [e] Edit  [h/m] Prev/Next Match  [L] Lookup Online  [s] Skip  [Esc] Back",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(crate::theme::current().muted),
         )));
     } else if match_count == 0 {
         lines.push(Line::from(Span::styled(
             "  No matches found. Press [L] to search online.",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(crate::theme::current().warning),
         )));
         lines.push(Line::from(Span::styled(
             "  [e] Manually edit tags  [s] Skip  [Esc] Back",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(crate::theme::current().muted),
         )));
     }
 
@@ -3332,7 +3451,7 @@ fn render_healer_preview(f: &mut Frame, app: &App, area: Rect) {
         HealLookupState::Failed    => "  Search failed.",
     };
     if !lookup_status.is_empty() {
-        lines.push(Line::from(Span::styled(lookup_status, Style::default().fg(Color::Yellow))));
+        lines.push(Line::from(Span::styled(lookup_status, Style::default().fg(crate::theme::current().warning))));
     }
 
     f.render_widget(Paragraph::new(lines).block(block), area);
@@ -3341,12 +3460,12 @@ fn render_healer_preview(f: &mut Frame, app: &App, area: Rect) {
 fn make_healer_diff_line(label: &str, orig: Option<&String>, new: Option<&String>) -> Line<'static> {
     let orig_s   = orig.map(|s| s.as_str()).unwrap_or("—").to_string();
     let new_s    = new.map(|s| s.as_str()).unwrap_or("—").to_string();
-    let changed  = orig.as_deref() != new.as_deref();
+    let changed  = orig != new;
     Line::from(vec![
-        Span::styled(format!("  {:<14} ", label), Style::default().fg(Color::DarkGray)),
-        Span::styled(orig_s, Style::default().fg(Color::White)),
-        Span::styled(" -> ".to_string(), Style::default().fg(Color::DarkGray)),
-        Span::styled(new_s, Style::default().fg(if changed { Color::Green } else { Color::White })),
+        Span::styled(format!("  {:<14} ", label), Style::default().fg(crate::theme::current().muted)),
+        Span::styled(orig_s, Style::default().fg(crate::theme::current().foreground)),
+        Span::styled(" -> ".to_string(), Style::default().fg(crate::theme::current().muted)),
+        Span::styled(new_s, Style::default().fg(if changed { crate::theme::current().success } else { crate::theme::current().foreground })),
     ])
 }
 
@@ -3355,7 +3474,7 @@ fn render_healer_editor(f: &mut Frame, app: &App, area: Rect) {
         .title(" Tag Editor ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(crate::theme::current().accent));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -3363,7 +3482,7 @@ fn render_healer_editor(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = vec![
         Line::from(Span::styled(
             "  Edit tags manually. [Enter] to type, [Tab/j/k] navigate, [w] save.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(crate::theme::current().muted),
         )),
         Line::from(""),
     ];
@@ -3375,14 +3494,14 @@ fn render_healer_editor(f: &mut Frame, app: &App, area: Rect) {
         let value  = &app.healer.edit_fields[i];
 
         let field_style = if is_active {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
+            Style::default().fg(crate::theme::current().background).bg(crate::theme::current().accent)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(crate::theme::current().foreground)
         };
         let label_style = if is_active {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default().fg(crate::theme::current().accent).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(crate::theme::current().muted)
         };
 
         lines.push(Line::from(vec![
@@ -3397,8 +3516,30 @@ fn render_healer_editor(f: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  [Tab/j/k] Navigate  [Enter] Edit  [w] Save & Apply  [Esc] Cancel",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(crate::theme::current().muted),
     )));
 
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod synced_lyrics_tests {
+    use super::*;
+
+    #[test]
+    fn parses_and_sorts_lrc_lines() {
+        let lyrics = "[00:10.50]Second\n[00:02.25]First";
+        let parsed = parse_synced_lyrics(lyrics).unwrap();
+        assert_eq!(parsed[0].timestamp_ms, 2_250);
+        assert_eq!(parsed[0].text, "First");
+        assert_eq!(parsed[1].timestamp_ms, 10_500);
+    }
+
+    #[test]
+    fn applies_lrc_offset_and_multiple_timestamps() {
+        let lyrics = "[offset:-250]\n[00:01.00][00:03.00]Again";
+        let parsed = parse_synced_lyrics(lyrics).unwrap();
+        assert_eq!(parsed[0].timestamp_ms, 750);
+        assert_eq!(parsed[1].timestamp_ms, 2_750);
+    }
 }

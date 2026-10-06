@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TrackStats {
@@ -49,14 +49,14 @@ impl ListenStats {
         dirs::config_dir().map(|p| p.join("stash").join("stats.json"))
     }
 
-    pub fn record_play(&mut self, path: &PathBuf, listen_secs: u64) {
-        let entry = self.tracks.entry(path.clone()).or_default();
+    pub fn record_play(&mut self, path: &Path, listen_secs: u64) {
+        let entry = self.tracks.entry(path.to_path_buf()).or_default();
         entry.play_count += 1;
         entry.total_listen_secs += listen_secs;
     }
 
-    pub fn record_skip(&mut self, path: &PathBuf, listen_secs: u64) {
-        let entry = self.tracks.entry(path.clone()).or_default();
+    pub fn record_skip(&mut self, path: &Path, listen_secs: u64) {
+        let entry = self.tracks.entry(path.to_path_buf()).or_default();
         entry.skip_count += 1;
         entry.total_listen_secs += listen_secs;
     }
@@ -96,7 +96,7 @@ impl ListenStats {
             .filter(|(_, s)| s.play_count > 0)
             .map(|(p, s)| (p.clone(), s.play_count))
             .collect();
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by_key(|a| std::cmp::Reverse(a.1));
         entries.into_iter().take(n).collect()
     }
 
@@ -105,7 +105,7 @@ impl ListenStats {
             .filter(|(_, s)| s.skip_count > 0)
             .map(|(p, s)| (p.clone(), s.skip_count))
             .collect();
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by_key(|a| std::cmp::Reverse(a.1));
         entries.into_iter().take(n).collect()
     }
 }

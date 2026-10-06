@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 use rodio::{Decoder, OutputStream, Sink, Source};
@@ -22,15 +22,17 @@ pub enum AudioCommand {
 
 #[derive(Clone)]
 pub struct VisualizerFrame {
-    pub samples: Vec<f32>,
+    pub samples: [f32; 512],
     pub left_peak: f32,
     pub right_peak: f32,
 }
 
+#[derive(Clone)]
 pub struct AudioSharedState {
     pub current_track: Option<PathBuf>,
     pub status: PlaybackStatus,
     pub elapsed_secs: u64,
+    pub elapsed_millis: u64,
     pub duration_secs: u64,
     pub volume: u32,
     pub repeat: RepeatMode,
@@ -57,6 +59,7 @@ impl AudioEngine {
             current_track: None,
             status: PlaybackStatus::Stopped,
             elapsed_secs: 0,
+            elapsed_millis: 0,
             duration_secs: 0,
             volume: default_volume,
             repeat: default_repeat,
@@ -98,169 +101,198 @@ impl AudioEngine {
 
             let mut last_tick = Instant::now();
             let mut elapsed_millis: u128 = 0;
-            let (visualizer_tx, visualizer_rx) = channel::<VisualizerFrame>();
+            let (visualizer_tx, visualizer_rx) = sync_channel::<VisualizerFrame>(2);
             let mut sliding_buffer = vec![0.0; 512];
 
             loop {
-                while let Ok(cmd) = command_rx.try_recv() {
+                loop {
+                    let cmd = match command_rx.try_recv() {
+                        Ok(cmd) => cmd,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                    };
                     match cmd {
                         AudioCommand::Play(path) => {
                             if let Some(ref s) = sink {
                                 s.stop();
                             }
                             elapsed_millis = 0;
+                            while visualizer_rx.try_recv().is_ok() {}
 
-                            // Creamos un sink nuevo pa limpiar los buffers anteriores
-                            // sin esto quedan restos del track previo
-                            if let Some(ref handle) = stream_handle
-                                && let Ok(s) = Sink::try_new(handle) {
-                                    sink = Some(s);
+                            let prepared = (|| -> Result<_, String> {
+                                let handle = stream_handle.as_ref()
+                                    .ok_or_else(|| "No audio output device is available".to_string())?;
+                                let new_sink = Sink::try_new(handle).map_err(|e| e.to_string())?;
+                                let file = File::open(&path).map_err(|e| e.to_string())?;
+                                let source = Decoder::new(BufReader::new(file)).map_err(|e| e.to_string())?;
+                                Ok((new_sink, source))
+                            })();
+                            let source = match prepared {
+                                Ok((new_sink, source)) => {
+                                    sink = Some(new_sink);
+                                    source
+                                }
+                                Err(error) => {
+                                    let mut st = state_clone.lock().unwrap();
+                                    st.current_track = None;
+                                    st.status = PlaybackStatus::Stopped;
+                                    st.elapsed_secs = 0;
+                                    st.elapsed_millis = 0;
+                                    st.duration_secs = 0;
+                                    st.metadata = None;
+                                    st.lyrics_state = LyricsState::NotFound;
+                                    st.device_error = Some(format!("Cannot play {}: {error}", path.display()));
+                                    st.visualizer_data.fill(0.0);
+                                    st.visualizer_peaks.fill(0.0);
+                                    st.left_level = 0.0;
+                                    st.right_level = 0.0;
+                                    continue;
+                                }
+                            };
+                            let decoder_duration = source.total_duration()
+                                .map(|d| d.as_secs())
+                                .filter(|&s| s > 0);
+
+                            let current_vol = {
+                                let st = state_clone.lock().unwrap();
+                                st.volume
+                            };
+
+                            // Arrancamos la reproducción de volada, sin esperar
+                            // tags ni letras — eso lo jalamos en otro hilo
+                            if let Some(ref s) = sink {
+                                s.set_volume(current_vol as f32 / 100.0);
+                                let vis_source = VisualizerSource::new(source.convert_samples::<f32>(), visualizer_tx.clone());
+                                s.append(vis_source);
+                            }
+
+                            {
+                                let mut st = state_clone.lock().unwrap();
+                                st.device_error = None;
+                                st.current_track = Some(path.clone());
+                                st.status = PlaybackStatus::Playing;
+                                st.elapsed_secs = 0;
+                                st.elapsed_millis = 0;
+                                st.duration_secs = decoder_duration.unwrap_or(0);
+                                st.metadata = None;
+                                st.lyrics_state = LyricsState::Loading;
+                            }
+                            last_tick = Instant::now();
+
+                            // Hilo aparte pa leer los tags y buscar letras
+                            // sin bloquear el loop principal de audio
+                            let bg_state = Arc::clone(&state_clone);
+                            let bg_path = path.clone();
+                            thread::spawn(move || {
+                                let mut title = None;
+                                let mut artist = None;
+                                let mut album = None;
+                                let mut duration_secs: Option<u64> = None;
+                                let mut track = None;
+                                let mut genre = None;
+                                let mut year = None;
+                                let mut bitrate = None;
+                                let mut sample_rate = None;
+                                let mut codec = None;
+                                let mut lyrics = load_lyrics(&bg_path);
+
+                                if let Ok(tagged_file) = Probe::open(&bg_path).and_then(|p| p.read()) {
+                                    if let Some(tag) = tagged_file.primary_tag().or(tagged_file.first_tag()) {
+                                        title = tag.title().map(|s| s.to_string());
+                                        artist = tag.artist().map(|s| s.to_string());
+                                        album = tag.album().map(|s| s.to_string());
+                                        genre = tag.genre().map(|s| s.to_string());
+                                        track = tag.track();
+                                        year = tag.year();
+
+                                        // Si no encontramos letra en disco, checamos si viene
+                                        // embebida en el tag del archivo
+                                        if lyrics.is_none()
+                                            && let Some(embedded) = tag.get_string(&lofty::tag::ItemKey::Lyrics) {
+                                                lyrics = non_empty_lyrics(embedded);
+                                            }
+                                    }
+                                    let properties = tagged_file.properties();
+                                    let lofty_dur = properties.duration().as_secs();
+                                    if lofty_dur > 0 {
+                                        duration_secs = Some(lofty_dur);
+                                    }
+                                    bitrate = properties.audio_bitrate();
+                                    sample_rate = properties.sample_rate();
+                                    codec = Some(format!("{:?}", tagged_file.file_type()));
                                 }
 
-                            if let Ok(file) = File::open(&path) {
-                                let reader = BufReader::new(file);
-                                if let Ok(source) = Decoder::new(reader) {
-                                    let decoder_duration = source.total_duration()
-                                        .map(|d| d.as_secs())
-                                        .filter(|&s| s > 0);
+                                // Si no hay título en el tag, usamos el nombre del archivo
+                                let resolved_title = title.clone().or_else(|| {
+                                    bg_path
+                                        .file_stem()
+                                        .map(|f| clean_filename_title(&f.to_string_lossy()))
+                                        .filter(|title| !title.is_empty())
+                                });
 
-                                    let current_vol = {
-                                        let st = state_clone.lock().unwrap();
-                                        st.volume
-                                    };
-
-                                    // Arrancamos la reproducción de volada, sin esperar
-                                    // tags ni letras — eso lo jalamos en otro hilo
-                                    if let Some(ref s) = sink {
-                                        s.set_volume(current_vol as f32 / 100.0);
-                                        let vis_source = VisualizerSource::new(source.convert_samples::<f32>(), visualizer_tx.clone());
-                                        s.append(vis_source);
-                                    }
-
-                                    {
-                                        let mut st = state_clone.lock().unwrap();
-                                        st.current_track = Some(path.clone());
-                                        st.status = PlaybackStatus::Playing;
-                                        st.elapsed_secs = 0;
-                                        st.duration_secs = decoder_duration.unwrap_or(0);
-                                        st.metadata = None;
-                                        st.lyrics_state = LyricsState::Loading;
-                                    }
-                                    last_tick = Instant::now();
-
-                                    // Hilo aparte pa leer los tags y buscar letras
-                                    // sin bloquear el loop principal de audio
-                                    let bg_state = Arc::clone(&state_clone);
-                                    let bg_path = path.clone();
-                                    thread::spawn(move || {
-                                        let mut title = None;
-                                        let mut artist = None;
-                                        let mut album = None;
-                                        let mut duration_secs: Option<u64> = None;
-                                        let mut track = None;
-                                        let mut genre = None;
-                                        let mut year = None;
-                                        let mut bitrate = None;
-                                        let mut sample_rate = None;
-                                        let mut codec = None;
-                                        let mut lyrics = load_lyrics(&bg_path);
-
-                                        if let Ok(tagged_file) = Probe::open(&bg_path).and_then(|p| p.read()) {
-                                            if let Some(tag) = tagged_file.primary_tag().or(tagged_file.first_tag()) {
-                                                title = tag.title().map(|s| s.to_string());
-                                                artist = tag.artist().map(|s| s.to_string());
-                                                album = tag.album().map(|s| s.to_string());
-                                                genre = tag.genre().map(|s| s.to_string());
-                                                track = tag.track();
-                                                year = tag.year();
-
-                                                // Si no encontramos letra en disco, checamos si viene
-                                                // embebida en el tag del archivo
-                                                if lyrics.is_none()
-                                                    && let Some(embedded) = tag.get_string(&lofty::tag::ItemKey::Lyrics) {
-                                                        lyrics = Some(embedded.to_string());
-                                                    }
-                                            }
-                                            let properties = tagged_file.properties();
-                                            let lofty_dur = properties.duration().as_secs();
-                                            if lofty_dur > 0 {
-                                                duration_secs = Some(lofty_dur);
-                                            }
-                                            bitrate = properties.audio_bitrate();
-                                            sample_rate = properties.sample_rate();
-                                            codec = Some(format!("{:?}", tagged_file.file_type()));
+                                // Ojo: verificamos que la rola siga siendo la misma
+                                // antes de escribir, no vaya a ser que ya cambiaron de track
+                                {
+                                    let mut st = bg_state.lock().unwrap();
+                                    if st.current_track.as_deref() == Some(&bg_path) {
+                                        if let Some(d) = duration_secs {
+                                            st.duration_secs = d;
                                         }
-
-                                        // Si no hay título en el tag, usamos el nombre del archivo
-                                        let resolved_title = title.clone().or_else(|| {
-                                            bg_path.file_name().map(|f| f.to_string_lossy().into_owned())
+                                        st.metadata = Some(AudioMetadata {
+                                            title: resolved_title.clone(),
+                                            artist: artist.clone(),
+                                            album: album.clone(),
+                                            duration_secs,
+                                            track,
+                                            genre,
+                                            year,
+                                            bitrate,
+                                            sample_rate,
+                                            codec,
+                                            lyrics: lyrics.clone(),
                                         });
+                                        st.lyrics_state = if lyrics.is_some() {
+                                            LyricsState::Found(lyrics.clone().unwrap())
+                                        } else {
+                                            LyricsState::Fetching
+                                        };
+                                    }
+                                }
 
-                                        // Ojo: verificamos que la rola siga siendo la misma
-                                        // antes de escribir, no vaya a ser que ya cambiaron de track
-                                        {
-                                            let mut st = bg_state.lock().unwrap();
-                                            if st.current_track.as_deref() == Some(&bg_path) {
-                                                if let Some(d) = duration_secs {
-                                                    st.duration_secs = d;
-                                                }
-                                                st.metadata = Some(AudioMetadata {
-                                                    title: resolved_title.clone(),
-                                                    artist: artist.clone(),
-                                                    album: album.clone(),
-                                                    duration_secs,
-                                                    track,
-                                                    genre,
-                                                    year,
-                                                    bitrate,
-                                                    sample_rate,
-                                                    codec,
-                                                    lyrics: lyrics.clone(),
-                                                });
-                                                st.lyrics_state = if lyrics.is_some() {
-                                                    LyricsState::Found(lyrics.clone().unwrap())
-                                                } else {
-                                                    LyricsState::Fetching
-                                                };
-                                            }
-                                        }
-
-                                        // Si no encontramos letra local ni embebida, jalamos de internet
-                                        if lyrics.is_none() {
-                                            if let Some(ref t) = resolved_title {
-                                                let result = fetch_lyrics_online(
-                                                    t,
-                                                    artist.as_deref(),
-                                                    album.as_deref(),
-                                                    duration_secs,
-                                                );
-                                                let mut st = bg_state.lock().unwrap();
-                                                if st.current_track.as_deref() == Some(&bg_path) {
-                                                    match result {
-                                                        Ok(Some(text)) => {
-                                                            if let Some(ref mut m) = st.metadata {
-                                                                m.lyrics = Some(text.clone());
-                                                            }
-                                                            st.lyrics_state = LyricsState::Found(text);
-                                                        }
-                                                        Ok(None) => {
-                                                            st.lyrics_state = LyricsState::NotFound;
-                                                        }
-                                                        Err(e) => {
-                                                            st.lyrics_state = LyricsState::Error(e);
-                                                        }
+                                // Si no encontramos letra local ni embebida, jalamos de internet
+                                if lyrics.is_none() {
+                                    if let Some(ref t) = resolved_title {
+                                        let result = fetch_lyrics_online(
+                                            t,
+                                            artist.as_deref(),
+                                            album.as_deref(),
+                                            duration_secs,
+                                        );
+                                        let mut st = bg_state.lock().unwrap();
+                                        if st.current_track.as_deref() == Some(&bg_path) {
+                                            match result {
+                                                Ok(Some(text)) => {
+                                                    if let Some(ref mut m) = st.metadata {
+                                                        m.lyrics = Some(text.clone());
                                                     }
+                                                    st.lyrics_state = LyricsState::Found(text);
                                                 }
-                                            } else {
-                                                let mut st = bg_state.lock().unwrap();
-                                                if st.current_track.as_deref() == Some(&bg_path) {
+                                                Ok(None) => {
                                                     st.lyrics_state = LyricsState::NotFound;
                                                 }
+                                                Err(e) => {
+                                                    st.lyrics_state = LyricsState::Error(e);
+                                                }
                                             }
                                         }
-                                    });
+                                    } else {
+                                        let mut st = bg_state.lock().unwrap();
+                                        if st.current_track.as_deref() == Some(&bg_path) {
+                                            st.lyrics_state = LyricsState::NotFound;
+                                        }
+                                    }
                                 }
-                            }
+                            });
                         }
                         AudioCommand::Pause => {
                             if let Some(ref s) = sink {
@@ -285,6 +317,7 @@ impl AudioEngine {
                             st.current_track = None;
                             st.status = PlaybackStatus::Stopped;
                             st.elapsed_secs = 0;
+                            st.elapsed_millis = 0;
                             st.duration_secs = 0;
                             st.metadata = None;
                             st.lyrics_state = LyricsState::NotFound;
@@ -305,6 +338,7 @@ impl AudioEngine {
                                     elapsed_millis = pos.as_millis();
                                     let mut st = state_clone.lock().unwrap();
                                     st.elapsed_secs = pos.as_secs();
+                                    st.elapsed_millis = pos.as_millis().min(u64::MAX as u128) as u64;
                                     last_tick = Instant::now();
                                 }
                         }
@@ -319,39 +353,27 @@ impl AudioEngine {
                 let dt_frames = (delta.as_secs_f32() * 60.0).clamp(0.5, 4.0);
 
                 // Jalamos todos los frames del visualizador que hayan llegado en este tick
-                let mut new_samples = Vec::new();
+                let mut latest_frame = None;
                 let mut last_left_peak = 0.0f32;
                 let mut last_right_peak = 0.0f32;
                 while let Ok(frame) = visualizer_rx.try_recv() {
-                    let mut samples = frame.samples;
-                    new_samples.append(&mut samples);
                     last_left_peak = last_left_peak.max(frame.left_peak);
                     last_right_peak = last_right_peak.max(frame.right_peak);
+                    latest_frame = Some(frame);
                 }
 
-                if !new_samples.is_empty() {
-                    let take_len = new_samples.len().min(512);
-                    let start_idx = new_samples.len() - take_len;
-                    let latest_chunk = &new_samples[start_idx..];
-
-                    // Buffer deslizante: tiramos los más viejos y metemos los nuevos
-                    let shift = latest_chunk.len();
-                    if shift >= 512 {
-                        sliding_buffer = latest_chunk.to_vec();
-                    } else {
-                        sliding_buffer.drain(0..shift);
-                        sliding_buffer.extend_from_slice(latest_chunk);
-                    }
+                if let Some(frame) = latest_frame {
+                    sliding_buffer.copy_from_slice(&frame.samples);
 
                     // Ventana de Hanning pa reducir el spectral leakage antes del FFT
-                    let mut fft_input = vec![Complex::new(0.0, 0.0); 512];
+                    let mut fft_input = [Complex::new(0.0, 0.0); 512];
                     for i in 0..512 {
                         let multiplier = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / 511.0).cos());
                         fft_input[i] = Complex::new(sliding_buffer[i] * multiplier, 0.0);
                     }
                     fft(&mut fft_input);
 
-                    let mut magnitudes = vec![0.0; 256];
+                    let mut magnitudes = [0.0; 256];
                     for i in 0..256 {
                         let c = fft_input[i];
                         magnitudes[i] = (c.re * c.re + c.im * c.im).sqrt();
@@ -360,7 +382,7 @@ impl AudioEngine {
                     // Agrupamos en 160 bandas con escala logarítmica (exp 1.8)
                     // pa que los graves no se coman todo el espacio visual
                     let num_bars = 160;
-                    let mut new_bars = vec![0.0; num_bars];
+                    let mut new_bars = [0.0; 160];
                     for (i, bar) in new_bars.iter_mut().enumerate() {
                         let start = (256.0 * (i as f32 / num_bars as f32).powf(1.8)) as usize;
                         let end = (256.0 * ((i + 1) as f32 / num_bars as f32).powf(1.8)) as usize;
@@ -431,6 +453,7 @@ impl AudioEngine {
                     if st.status == PlaybackStatus::Playing {
                         elapsed_millis += delta.as_millis();
                         st.elapsed_secs = (elapsed_millis / 1000) as u64;
+                        st.elapsed_millis = elapsed_millis.min(u64::MAX as u128) as u64;
 
                         let mut empty = true;
                         if let Some(ref s) = sink {
@@ -440,6 +463,7 @@ impl AudioEngine {
                         if empty {
                             st.status = PlaybackStatus::Stopped;
                             st.elapsed_secs = 0;
+                            st.elapsed_millis = 0;
                             st.current_track = None;
                             st.metadata = None;
                             st.visualizer_data.fill(0.0);
@@ -501,8 +525,11 @@ where
     I: Source<Item = f32>,
 {
     input: I,
-    sender: Sender<VisualizerFrame>,
-    buffer: Vec<f32>,
+    sender: SyncSender<VisualizerFrame>,
+    frame: VisualizerFrame,
+    frame_index: usize,
+    channel_index: u16,
+    sample_sum: f32,
     channels: u16,
 }
 
@@ -510,12 +537,15 @@ impl<I> VisualizerSource<I>
 where
     I: Source<Item = f32>,
 {
-    pub fn new(input: I, sender: Sender<VisualizerFrame>) -> Self {
-        let channels = input.channels();
+    pub fn new(input: I, sender: SyncSender<VisualizerFrame>) -> Self {
+        let channels = input.channels().max(1);
         Self {
             input,
             sender,
-            buffer: Vec::with_capacity(512 * channels as usize),
+            frame: VisualizerFrame { samples: [0.0; 512], left_peak: 0.0, right_peak: 0.0 },
+            frame_index: 0,
+            channel_index: 0,
+            sample_sum: 0.0,
             channels,
         }
     }
@@ -530,38 +560,26 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         let item = self.input.next();
         if let Some(sample) = item {
-            self.buffer.push(sample);
-            let chunk_size = 512 * self.channels as usize;
-            if self.buffer.len() >= chunk_size {
-                let chunk = std::mem::replace(&mut self.buffer, Vec::with_capacity(chunk_size));
-                let mut mono = Vec::with_capacity(chunk.len() / self.channels as usize);
-                let step = self.channels as usize;
-
-                let mut left_peak = 0.0f32;
-                let mut right_peak = 0.0f32;
-
-                // Si es stereo o más canales, mezclamos a mono y medimos picos por lado
-                // Si es mono, el pico derecho es igual al izquierdo
-                if self.channels >= 2 {
-                    for chunk_slice in chunk.chunks_exact(step) {
-                        left_peak = left_peak.max(chunk_slice[0].abs());
-                        right_peak = right_peak.max(chunk_slice[1].abs());
-                        let sum: f32 = chunk_slice.iter().sum();
-                        mono.push(sum / self.channels as f32);
-                    }
-                } else {
-                    for &s in &chunk {
-                        left_peak = left_peak.max(s.abs());
-                        mono.push(s);
-                    }
-                    right_peak = left_peak;
+            self.sample_sum += sample;
+            if self.channel_index == 0 {
+                self.frame.left_peak = self.frame.left_peak.max(sample.abs());
+            }
+            if self.channel_index == 1 || self.channels == 1 {
+                self.frame.right_peak = self.frame.right_peak.max(sample.abs());
+            }
+            self.channel_index += 1;
+            if self.channel_index == self.channels {
+                self.frame.samples[self.frame_index] = self.sample_sum / self.channels as f32;
+                self.sample_sum = 0.0;
+                self.channel_index = 0;
+                self.frame_index += 1;
+                if self.frame_index == 512 {
+                    // Never wait on visualization from the device callback; drop frames if busy.
+                    let _ = self.sender.try_send(self.frame.clone());
+                    self.frame_index = 0;
+                    self.frame.left_peak = 0.0;
+                    self.frame.right_peak = 0.0;
                 }
-
-                let _ = self.sender.send(VisualizerFrame {
-                    samples: mono,
-                    left_peak,
-                    right_peak,
-                });
             }
         }
         item
@@ -588,7 +606,11 @@ where
         let res = self.input.try_seek(pos);
         // Al hacer seek limpiamos el buffer pa no mandar samples viejos al visualizador
         if res.is_ok() {
-            self.buffer.clear();
+            self.frame_index = 0;
+            self.channel_index = 0;
+            self.sample_sum = 0.0;
+            self.frame.left_peak = 0.0;
+            self.frame.right_peak = 0.0;
         }
         res
     }
@@ -626,42 +648,204 @@ fn fft(input: &mut [Complex]) {
         return;
     }
 
-    let mut even = vec![Complex::new(0.0, 0.0); n / 2];
-    let mut odd = vec![Complex::new(0.0, 0.0); n / 2];
-    for i in 0..n / 2 {
-        even[i] = input[2 * i];
-        odd[i] = input[2 * i + 1];
+    // Iterative radix-2 transform: no recursive heap allocations per visualizer frame.
+    debug_assert!(n.is_power_of_two());
+    let mut j = 0;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 { j ^= bit; bit >>= 1; }
+        j ^= bit;
+        if i < j { input.swap(i, j); }
     }
-
-    fft(&mut even);
-    fft(&mut odd);
-
-    for k in 0..n / 2 {
-        let t = std::f32::consts::PI * 2.0 * (k as f32) / (n as f32);
-        let w = Complex::new(t.cos(), -t.sin());
-        let odd_w = odd[k].mul(w);
-        input[k] = even[k].add(odd_w);
-        input[k + n / 2] = even[k].sub(odd_w);
+    let mut width = 2;
+    while width <= n {
+        let angle = -2.0 * std::f32::consts::PI / width as f32;
+        let step = Complex::new(angle.cos(), angle.sin());
+        for block in input.chunks_exact_mut(width) {
+            let mut rotation = Complex::new(1.0, 0.0);
+            for k in 0..width / 2 {
+                let even = block[k];
+                let odd = block[k + width / 2].mul(rotation);
+                block[k] = even.add(odd);
+                block[k + width / 2] = even.sub(odd);
+                rotation = rotation.mul(step);
+            }
+        }
+        width *= 2;
     }
 }
 
 // Busca letra en disco junto al archivo de audio — primero .lrc, luego .txt
 fn load_lyrics(path: &std::path::Path) -> Option<String> {
-    let lrc_path = path.with_extension("lrc");
-    if lrc_path.exists()
-        && let Ok(content) = std::fs::read_to_string(&lrc_path) {
+    for extension in ["lrc", "LRC", "txt", "TXT"] {
+        let lyrics_path = path.with_extension(extension);
+        if let Ok(content) = std::fs::read_to_string(&lyrics_path)
+            && let Some(content) = non_empty_lyrics(&content)
+        {
             return Some(content);
         }
-    let txt_path = path.with_extension("txt");
-    if txt_path.exists()
-        && let Ok(content) = std::fs::read_to_string(&txt_path) {
-            return Some(content);
-        }
+    }
     None
 }
 
-// Consulta lrclib.net pa traer letra; regresa Ok(None) si la rola no está en la base,
-// Err si hubo bronca de red o parseo
+fn clean_filename_title(filename: &str) -> String {
+    let trimmed = filename.trim();
+    let without_track_number = trimmed
+        .find(|c: char| !c.is_ascii_digit() && !matches!(c, ' ' | '-' | '_' | '.'))
+        .filter(|&index| index > 0 && index <= 5)
+        .map(|index| &trimmed[index..])
+        .unwrap_or(trimmed);
+    without_track_number
+        .trim_start_matches([' ', '-', '_', '.'])
+        .trim()
+        .to_string()
+}
+
+fn non_empty_lyrics(lyrics: &str) -> Option<String> {
+    let lyrics = lyrics.trim_start_matches('\u{feff}').trim();
+    (!lyrics.is_empty()).then(|| lyrics.to_string())
+}
+
+fn lyrics_from_value(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("syncedLyrics")
+        .and_then(|value| value.as_str())
+        .and_then(non_empty_lyrics)
+        .or_else(|| {
+            value
+                .get("plainLyrics")
+                .and_then(|value| value.as_str())
+                .and_then(non_empty_lyrics)
+        })
+}
+
+fn normalized_track_name(value: &str) -> String {
+    let base = value
+        .split(['(', '['])
+        .next()
+        .unwrap_or(value)
+        .to_lowercase();
+    base.chars()
+        .filter(|character| character.is_alphanumeric())
+        .collect()
+}
+
+fn best_search_result(
+    results: &serde_json::Value,
+    title: &str,
+    artist: Option<&str>,
+    duration: Option<u64>,
+) -> Option<String> {
+    let expected_title = normalized_track_name(title);
+    let expected_artist = artist.map(normalized_track_name);
+    if expected_title.is_empty() {
+        return None;
+    }
+
+    results
+        .as_array()?
+        .iter()
+        .filter_map(|result| {
+            let lyrics = lyrics_from_value(result)?;
+            let candidate_title = result
+                .get("trackName")
+                .and_then(|value| value.as_str())
+                .map(normalized_track_name)?;
+
+            let mut score = if candidate_title == expected_title {
+                100
+            } else if candidate_title.contains(&expected_title)
+                || expected_title.contains(&candidate_title)
+            {
+                40
+            } else {
+                return None;
+            };
+
+            if let Some(ref expected_artist) = expected_artist {
+                let candidate_artist = result
+                    .get("artistName")
+                    .and_then(|value| value.as_str())
+                    .map(normalized_track_name)
+                    .unwrap_or_default();
+                if candidate_artist == *expected_artist {
+                    score += 50;
+                } else if !candidate_artist.is_empty()
+                    && (candidate_artist.contains(expected_artist)
+                        || expected_artist.contains(&candidate_artist))
+                {
+                    score += 20;
+                } else {
+                    score -= 30;
+                }
+            }
+
+            if let (Some(expected), Some(candidate)) = (
+                duration,
+                result.get("duration").and_then(|value| value.as_f64()),
+            ) {
+                let difference = (candidate - expected as f64).abs();
+                score += if difference <= 3.0 {
+                    30
+                } else if difference <= 10.0 {
+                    10
+                } else if difference > 30.0 {
+                    -15
+                } else {
+                    0
+                };
+            }
+
+            Some((score, lyrics))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, lyrics)| lyrics)
+}
+
+fn friendly_request_error(error: ureq::Error) -> String {
+    match error {
+        ureq::Error::Status(429, _) => {
+            "The lyrics service is busy right now. Please try again in a moment.".to_string()
+        }
+        ureq::Error::Status(code, _) if code >= 500 => {
+            "The lyrics service is temporarily unavailable. Please try again later.".to_string()
+        }
+        ureq::Error::Status(_, _) => {
+            "The lyrics service couldn't complete this request.".to_string()
+        }
+        ureq::Error::Transport(transport) => match transport.kind() {
+            ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed => {
+                "You're offline, so online lyrics couldn't be loaded.".to_string()
+            }
+            ureq::ErrorKind::Io => {
+                "The lyrics lookup timed out. Please try again in a moment.".to_string()
+            }
+            _ => "Online lyrics couldn't be reached right now.".to_string(),
+        },
+    }
+}
+
+fn get_json(agent: &ureq::Agent, url: &str) -> Result<Option<serde_json::Value>, String> {
+    let response = match agent
+        .get(url)
+        .set(
+            "User-Agent",
+            concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")),
+        )
+        .call()
+    {
+        Ok(response) => response,
+        Err(ureq::Error::Status(404, _)) => return Ok(None),
+        Err(error) => return Err(friendly_request_error(error)),
+    };
+
+    response.into_json().map(Some).map_err(|_| {
+        "The lyrics service sent an unexpected response. Please try again later.".to_string()
+    })
+}
+
+// Consulta primero el endpoint exacto de LRCLIB y, si no encuentra la rola,
+// usa búsqueda para tolerar álbumes, duraciones o sufijos de título distintos.
 fn fetch_lyrics_online(
     title: &str,
     artist: Option<&str>,
@@ -687,32 +871,115 @@ fn fetch_lyrics_online(
         url.push_str(&format!("&duration={}", d));
     }
 
-    let resp = agent.get(&url).call().map_err(|e| match e {
-        ureq::Error::Status(code, _) => format!("HTTP {code}"),
-        ureq::Error::Transport(t) => match t.kind() {
-            ureq::ErrorKind::Dns => "DNS lookup failed (offline?)".to_string(),
-            ureq::ErrorKind::ConnectionFailed => "Connection refused".to_string(),
-            ureq::ErrorKind::Io => "Network I/O error (timed out?)".to_string(),
-            _ => "Network error".to_string(),
-        },
-    })?;
+    // LRCLIB requires artist_name for exact lookups. Files without an artist tag
+    // can still use the more forgiving search endpoint below.
+    if artist.is_some()
+        && let Some(exact_match) = get_json(&agent, &url)?
+        && let Some(lyrics) = lyrics_from_value(&exact_match)
+    {
+        return Ok(Some(lyrics));
+    }
 
-    if resp.status() == 404 {
+    let mut search_url = format!(
+        "https://lrclib.net/api/search?track_name={}",
+        urlencoding::encode(title)
+    );
+    if let Some(artist) = artist {
+        search_url.push_str(&format!(
+            "&artist_name={}",
+            urlencoding::encode(artist)
+        ));
+    }
+
+    let Some(search_results) = get_json(&agent, &search_url)? else {
         return Ok(None);
+    };
+    Ok(best_search_result(&search_results, title, artist, duration))
+}
+
+#[cfg(test)]
+mod lyrics_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn cleans_track_number_from_filename_title() {
+        assert_eq!(clean_filename_title("01 - A Great Song"), "A Great Song");
+        assert_eq!(clean_filename_title("12_song title"), "song title");
+        assert_eq!(clean_filename_title("1985"), "1985");
     }
 
-    let json: serde_json::Value = resp.into_json().map_err(|e| format!("Bad response: {e}"))?;
+    #[test]
+    fn ignores_empty_local_or_remote_lyrics() {
+        assert_eq!(non_empty_lyrics(" \n\t"), None);
+        assert_eq!(non_empty_lyrics("\u{feff}Words\n"), Some("Words".to_string()));
+        assert_eq!(lyrics_from_value(&json!({ "plainLyrics": "" })), None);
+    }
 
-    // Preferimos la letra plana; si no hay, jalamos la sincronizada
-    if let Some(plain) = json.get("plainLyrics").and_then(|v| v.as_str()) {
-        if !plain.is_empty() {
-            return Ok(Some(plain.to_string()));
+    #[test]
+    fn search_fallback_prefers_matching_artist_and_duration() {
+        let results = json!([
+            {
+                "trackName": "Home",
+                "artistName": "Someone Else",
+                "duration": 180.0,
+                "plainLyrics": "wrong"
+            },
+            {
+                "trackName": "Home (Remastered)",
+                "artistName": "The Band",
+                "duration": 201.5,
+                "plainLyrics": "right"
+            }
+        ]);
+
+        assert_eq!(
+            best_search_result(&results, "Home", Some("The Band"), Some(202)),
+            Some("right".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod performance_tests {
+    use super::*;
+    use rodio::buffer::SamplesBuffer;
+
+    #[test]
+    fn full_visualizer_queue_preserves_every_audio_sample() {
+        let samples: Vec<f32> = (0..8192).map(|i| (i as f32 * 0.01).sin()).collect();
+        let (tx, rx) = sync_channel(2);
+        let source = SamplesBuffer::new(2, 44100, samples.clone());
+        let output: Vec<_> = VisualizerSource::new(source, tx).collect();
+        assert_eq!(output, samples);
+        assert_eq!(rx.try_iter().count(), 2);
+    }
+
+    #[test]
+    fn visualizer_mixes_channels_and_measures_peaks() {
+        let samples = [0.5f32, -0.25].repeat(512);
+        let (tx, rx) = sync_channel(2);
+        let source = SamplesBuffer::new(2, 44100, samples);
+        let _ = VisualizerSource::new(source, tx).count();
+        let frame = rx.try_recv().unwrap();
+        assert_eq!(frame.samples, [0.125; 512]);
+        assert_eq!(frame.left_peak, 0.5);
+        assert_eq!(frame.right_peak, 0.25);
+    }
+
+    #[test]
+    fn fft_matches_direct_transform() {
+        let input: Vec<_> = (0..64).map(|i| Complex::new((i as f32 * 0.7).sin(), 0.0)).collect();
+        let mut actual = input.clone();
+        fft(&mut actual);
+        for (k, result) in actual.iter().enumerate() {
+            let mut expected = Complex::new(0.0, 0.0);
+            for (i, sample) in input.iter().enumerate() {
+                let angle = -2.0 * std::f32::consts::PI * k as f32 * i as f32 / input.len() as f32;
+                expected = expected.add(sample.mul(Complex::new(angle.cos(), angle.sin())));
+            }
+            assert!((result.re - expected.re).abs() < 0.001);
+            assert!((result.im - expected.im).abs() < 0.001);
         }
     }
-    if let Some(synced) = json.get("syncedLyrics").and_then(|v| v.as_str()) {
-        if !synced.is_empty() {
-            return Ok(Some(synced.to_string()));
-        }
-    }
-    Ok(None)
 }

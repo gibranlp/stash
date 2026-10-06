@@ -77,7 +77,7 @@ impl BrowserState {
                     }
                 }
             }
-            injected.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+            injected.sort_by_key(|a| a.0.to_lowercase());
             for (name, drive_path) in injected {
                 let is_selected = self.selected_paths.contains(&drive_path);
                 let is_expanded = self.expanded_paths.contains(&drive_path);
@@ -374,7 +374,8 @@ mod tests {
         assert_eq!(browser.files[0].depth, 0);
 
         browser.file_index = 0;
-        browser.toggle_expand_highlighted();
+        browser.expanded_paths.insert(subdir_a.clone());
+        browser.refresh();
 
         assert_eq!(browser.files.len(), 4);
         assert_eq!(browser.files[1].name, "file1.mp3");

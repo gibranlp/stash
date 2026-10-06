@@ -20,11 +20,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact: stash-linux-x86_64
 
-          - os: macos-latest
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             artifact: stash-macos-x86_64
 
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
             artifact: stash-macos-arm64
 
@@ -53,8 +53,12 @@ jobs:
         if: matrix.os == 'ubuntu-22.04'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libdbus-1-dev pkg-config
 
+      - name: Test before publishing
+        if: matrix.os == 'ubuntu-22.04'
+        run: cargo test --locked
+
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Strip binary (Linux / macOS)
         if: matrix.os != 'windows-latest'
@@ -83,6 +87,9 @@ jobs:
         with:
           merge-multiple: true
 
+      - name: Generate release checksums
+        run: sha256sum stash-linux-x86_64 stash-macos-x86_64 stash-macos-arm64 stash-windows-x86_64.exe > SHA256SUMS
+
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
@@ -91,3 +98,4 @@ jobs:
             stash-macos-x86_64
             stash-macos-arm64
             stash-windows-x86_64.exe
+            SHA256SUMS

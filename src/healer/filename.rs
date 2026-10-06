@@ -8,20 +8,16 @@ pub fn parse(path: &Path) -> Option<TagSnapshot> {
 
     let mut result = try_patterns(&stem);
     if let Some(ref mut t) = result {
-        if t.album.is_none() {
-            if let Some(ref parent) = parent_name {
-                if !is_generic_dir(parent) {
+        if t.album.is_none()
+            && let Some(ref parent) = parent_name
+                && !is_generic_dir(parent) {
                     t.album = Some(parent.clone());
                 }
-            }
-        }
-        if t.artist.is_none() {
-            if let Some(ref gp) = grandparent_name {
-                if !is_generic_dir(gp) {
+        if t.artist.is_none()
+            && let Some(ref gp) = grandparent_name
+                && !is_generic_dir(gp) {
                     t.artist = Some(gp.clone());
                 }
-            }
-        }
     }
     result
 }

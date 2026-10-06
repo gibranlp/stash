@@ -9,8 +9,10 @@ mod healer;
 mod library;
 mod models;
 mod queue;
+mod preview;
 mod search;
 mod stats;
+mod theme;
 mod ui;
 mod updater;
 
@@ -96,8 +98,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App::new(tx, initial_path, picker);
 
-    // Loop principal: esperamos maximo 50ms por un evento, procesamos todos los que haya
-    // acumulados, y luego pintamos. Así no se traba con rafagas de teclas
+    // Draw on events, with a 30 FPS fallback during playback. Bound event batches
+    // so an input burst cannot starve rendering.
     while !app.should_quit {
         // souvlaki's macOS backend (MPRemoteCommandCenter/MPNowPlayingInfoCenter) talks to
         // mediaremoted/nowplayingd over an XPC connection scheduled on this thread's run
@@ -111,14 +113,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             true,
         );
 
-        match rx.recv_timeout(Duration::from_millis(16)) {
-            Ok(event) => {
-                app.handle_event(event);
-                while let Ok(e) = rx.try_recv() {
-                    app.handle_event(e);
-                }
+        if let Ok(event) = rx.recv_timeout(Duration::from_millis(33)) {
+            app.handle_event(event);
+            for e in rx.try_iter().take(255) {
+                app.handle_event(e);
             }
-            Err(_) => {}
+        } else if app.audio.shared_state.lock().unwrap().status != models::PlaybackStatus::Playing {
+            continue;
         }
         terminal.draw(|f| ui::render(f, &mut app))?;
     }

@@ -21,6 +21,7 @@ pub struct TagSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)] // Each variant describes a specific missing metadata field.
 pub enum MetaIssue {
     MissingTitle,
     MissingArtist,
@@ -194,7 +195,7 @@ impl HealerState {
                         file.matches.push(m.clone());
                     }
                 }
-                file.matches.sort_by(|a, b| b.confidence.cmp(&a.confidence));
+                file.matches.sort_by_key(|a| std::cmp::Reverse(a.confidence));
                 if matches.is_empty() && file.matches.is_empty() {
                     file.status = HealStatus::NoMatch;
                 }

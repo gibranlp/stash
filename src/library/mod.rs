@@ -225,8 +225,8 @@ impl LibraryState {
                     let mtime = file_mtime(path);
 
                     // Use cached entry if the file hasn't changed
-                    if let Some(cached) = cache.remove(&path_buf) {
-                        if cached.mtime == mtime {
+                    if let Some(cached) = cache.remove(&path_buf)
+                        && cached.mtime == mtime {
                             let cached = fill_cached_title_from_filename(
                                 clean_cached_track(cached),
                                 &path_buf,
@@ -244,7 +244,6 @@ impl LibraryState {
                             new_cache.insert(path_buf, cached);
                             continue;
                         }
-                    }
 
                     // Cache miss or stale — read tags from disk
                     let track = scan_single_track(path_buf.clone());
@@ -300,7 +299,7 @@ impl LibraryState {
     // Returns "All Tracks" at index 0, then user playlists, then smart playlists.
     pub fn playlist_names(collections: &Collections) -> Vec<String> {
         let mut names: Vec<String> = collections.collections.keys().cloned().collect();
-        names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        names.sort_by_key(|a| a.to_lowercase());
         let mut result = vec!["All Tracks".to_string()];
         result.extend(names);
         for smart in SMART_PLAYLISTS {
@@ -660,12 +659,10 @@ pub fn write_bulk_tag_to_path(path: &Path, fields: &[String; 5]) -> anyhow::Resu
 fn apply_bulk_fields(tag: &mut lofty::tag::Tag, fields: &[String; 5]) {
     if !fields[0].is_empty() { tag.set_artist(fields[0].clone()); }
     if !fields[1].is_empty() { tag.set_album(fields[1].clone()); }
-    if !fields[2].is_empty() {
-        if let Ok(n) = fields[2].parse::<u32>() { tag.set_track(n); }
-    }
-    if !fields[3].is_empty() {
-        if let Ok(y) = fields[3].parse::<u32>() { tag.set_year(y); }
-    }
+    if !fields[2].is_empty()
+        && let Ok(n) = fields[2].parse::<u32>() { tag.set_track(n); }
+    if !fields[3].is_empty()
+        && let Ok(y) = fields[3].parse::<u32>() { tag.set_year(y); }
     if !fields[4].is_empty() { tag.set_genre(fields[4].clone()); }
 }
 

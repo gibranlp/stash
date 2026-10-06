@@ -169,11 +169,10 @@ fn scan_mp4_boxes_for_video(
                     return Ok(true);
                 }
             }
-        } else if matches!(box_type, b"moov" | b"trak" | b"mdia") {
-            if scan_mp4_boxes_for_video(file, payload_start, payload_end, depth + 1)? {
+        } else if matches!(box_type, b"moov" | b"trak" | b"mdia")
+            && scan_mp4_boxes_for_video(file, payload_start, payload_end, depth + 1)? {
                 return Ok(true);
             }
-        }
 
         pos += box_size;
     }

@@ -23,8 +23,7 @@ use lofty::prelude::*;
 use lofty::probe::Probe;
 use notify::RecommendedWatcher;
 
-type LoadingImageSlot = Arc<Mutex<Option<(PathBuf, Option<image::DynamicImage>)>>>;
-type LoadingTextSlot  = Arc<Mutex<Option<(PathBuf, Option<Vec<String>>)>>>;
+use crate::preview::{PreviewLoader, LatestLoader, GraphicsRequest, GraphicsProtocol};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppScreen {
@@ -243,24 +242,35 @@ pub struct App {
     pub last_media_status: Option<PlaybackStatus>,
     pub last_media_track: Option<PathBuf>,
     pub last_media_elapsed: u64,
+    last_media_metadata: Option<crate::models::AudioMetadata>,
+    last_media_cover: Option<PathBuf>,
     pub discord: DiscordPresence,
     pub last_discord_track: Option<PathBuf>,
     pub last_discord_status: Option<PlaybackStatus>,
     pub rename_target: Option<PathBuf>,
     pub last_previewed_file: Option<PathBuf>,
-    pub current_image_data: Option<(PathBuf, image::DynamicImage)>,
-    pub loading_image: LoadingImageSlot,
+    pub current_image_data: Option<(PathBuf, Arc<image::DynamicImage>)>,
+    pub image_graphics: LatestLoader<GraphicsRequest, GraphicsProtocol>,
+    pub image_graphics_request: Option<(PathBuf, u16, u16)>,
+    pub loading_image: PreviewLoader<image::DynamicImage>,
+    pub image_error: Option<String>,
     pub current_image_protocol: Option<(PathBuf, u16, u16, Box<dyn ratatui_image::protocol::ResizeProtocol>)>,
     pub current_image_lines: Option<(PathBuf, u16, u16, Vec<ratatui::text::Line<'static>>)>,
     pub current_cover_path: Option<PathBuf>,
-    pub current_cover_data: Option<(PathBuf, image::DynamicImage)>,
-    pub loading_cover: LoadingImageSlot,
+    pub current_cover_data: Option<(PathBuf, Arc<image::DynamicImage>)>,
+    pub cover_graphics: LatestLoader<GraphicsRequest, GraphicsProtocol>,
+    pub cover_graphics_request: Option<(PathBuf, u16, u16)>,
+    pub loading_cover: PreviewLoader<image::DynamicImage>,
+    pub cover_error: Option<String>,
+    cover_lookup: PreviewLoader<Option<String>>,
+    cover_track: Option<PathBuf>,
     pub current_cover_protocol: Option<(PathBuf, u16, u16, Box<dyn ratatui_image::protocol::ResizeProtocol>)>,
     pub current_cover_lines: Option<(PathBuf, u16, u16, Vec<ratatui::text::Line<'static>>)>,
     pub last_cover_file: Option<PathBuf>,
     pub text_scroll_offset: usize,
     pub current_text_data: Option<(PathBuf, Vec<String>)>,
-    pub loading_text: LoadingTextSlot,
+    pub loading_text: PreviewLoader<Vec<String>>,
+    pub text_error: Option<String>,
     pub lyrics_scroll_offset: usize,
     pub lyrics_focused: bool,
     pub config: AppConfig,
@@ -290,6 +300,8 @@ pub struct App {
     pub m_clear_all_triggered: bool,
     pub library_rescan_after: Option<std::time::Instant>,
     _library_watcher: Option<RecommendedWatcher>,
+    pub theme: crate::theme::Theme,
+    _theme_watcher: Option<RecommendedWatcher>,
     event_tx: std::sync::mpsc::Sender<Event>,
 }
 
@@ -536,6 +548,8 @@ impl App {
         };
 
         let library_watcher = start_library_watcher(&config.music_folders, event_tx.clone());
+        let theme = crate::theme::Theme::load();
+        let theme_watcher = crate::theme::Theme::start_watcher(event_tx.clone());
 
         Self {
             browser,
@@ -559,24 +573,35 @@ impl App {
             last_media_status: None,
             last_media_track: None,
             last_media_elapsed: 0,
+            last_media_metadata: None,
+            last_media_cover: None,
             discord,
             last_discord_track: None,
             last_discord_status: None,
             rename_target: None,
             last_previewed_file: None,
             current_image_data: None,
-            loading_image: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            loading_image: PreviewLoader::new(|p| crate::preview::load_image(p)),
+            image_graphics: LatestLoader::new(crate::preview::prepare_graphics),
+            image_graphics_request: None,
+            image_error: None,
             current_image_protocol: None,
             current_image_lines: None,
             current_cover_path: None,
             current_cover_data: None,
-            loading_cover: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            loading_cover: PreviewLoader::new(|p| crate::preview::load_image(p)),
+            cover_graphics: LatestLoader::new(crate::preview::prepare_graphics),
+            cover_graphics_request: None,
+            cover_error: None,
+            cover_lookup: PreviewLoader::new(|path| Ok(Self::find_cover_art(path))),
+            cover_track: None,
             current_cover_protocol: None,
             current_cover_lines: None,
             last_cover_file: None,
             text_scroll_offset: 0,
             current_text_data: None,
-            loading_text: Arc::new(Mutex::new(None)),
+            loading_text: PreviewLoader::new(|p| crate::preview::load_text(p)),
+            text_error: None,
             lyrics_scroll_offset: 0,
             lyrics_focused: false,
             config,
@@ -610,6 +635,8 @@ impl App {
             m_clear_all_triggered: false,
             library_rescan_after: None,
             _library_watcher: library_watcher,
+            theme,
+            _theme_watcher: theme_watcher,
             event_tx,
         }
     }
@@ -733,15 +760,14 @@ impl App {
                 // Detect 'm' key release: no 'm' press for 300ms means the key was let go.
                 // The short-tap mark action happens immediately on key press so moving the
                 // cursor during this window cannot mark a different track.
-                if let Some(last) = self.m_last_press {
-                    if last.elapsed() >= std::time::Duration::from_millis(300) {
+                if let Some(last) = self.m_last_press
+                    && last.elapsed() >= std::time::Duration::from_millis(300) {
                         self.m_hold_start = None;
                         self.m_last_press = None;
                         self.m_hold_path = None;
                         self.m_select_all_triggered = false;
                         self.m_clear_all_triggered = false;
                     }
-                }
                 self.poll_bulk_tag_progress();
                 self.drive_scan_ticks += 1;
                 if self.drive_scan_ticks >= 20 {
@@ -798,115 +824,57 @@ impl App {
                 if current_preview_path != self.last_previewed_file {
                     self.current_image_data = None;
                     self.current_image_protocol = None;
+                    self.image_graphics_request = None;
+                    self.image_graphics.request(None);
                     self.current_image_lines = None;
                     self.current_text_data = None;
                     self.last_previewed_file = current_preview_path.clone();
                     self.text_scroll_offset = 0;
 
-                    if let Some(ref new_path) = self.last_previewed_file
-                        && matches_text_extension(new_path) {
-                            let mut lock = self.loading_text.lock().unwrap();
-                            *lock = Some((new_path.clone(), None));
-                            let loading_clone = self.loading_text.clone();
-                            let path_clone = new_path.clone();
-                            thread::spawn(move || {
-                                let lines = std::fs::read_to_string(&path_clone)
-                                    .map(|c| c.lines().map(|l| l.to_string()).collect::<Vec<_>>())
-                                    .unwrap_or_default();
-                                let mut lock = loading_clone.lock().unwrap();
-                                if let Some((ref cur, _)) = *lock
-                                    && *cur == path_clone {
-                                        *lock = Some((path_clone, Some(lines)));
-                                    }
-                            });
-                        }
-
-                    if let Some(ref new_path) = self.last_previewed_file
-                        && matches_image_extension(new_path) {
-                            let mut lock = self.loading_image.lock().unwrap();
-                            *lock = Some((new_path.clone(), None));
-                            let loading_clone = self.loading_image.clone();
-                            let path_clone = new_path.clone();
-                            thread::spawn(move || {
-                                if let Ok(img) = image::open(&path_clone) {
-                                    // Reducimos imágenes enormes para no comernos la RAM
-                                    let img = {
-                                        let max_dim = 1024u32;
-                                        if img.width() > max_dim || img.height() > max_dim {
-                                            img.resize(max_dim, max_dim, image::imageops::FilterType::CatmullRom)
-                                        } else {
-                                            img
-                                        }
-                                    };
-                                    let mut lock = loading_clone.lock().unwrap();
-                                    if let Some((ref cur_path, _)) = *lock
-                                        && cur_path == &path_clone {
-                                            *lock = Some((path_clone, Some(img)));
-                                        }
-                                }
-                            });
-                        }
+                    self.image_error = None;
+                    self.text_error = None;
+                    self.loading_text.request(current_preview_path.clone().filter(|p| matches_text_extension(p)));
+                    self.loading_image.request(current_preview_path.filter(|p| matches_image_extension(p)));
                 }
 
-                // Promueve imagen cargada en background al estado activo
-                let completed = {
-                    let mut lock = self.loading_image.lock().unwrap();
-                    if matches!(&*lock, Some((_, Some(_)))) { lock.take() } else { None }
-                };
-                if let Some((loaded_path, Some(loaded_img))) = completed {
-                    self.current_image_data = Some((loaded_path, loaded_img));
-                    self.current_image_protocol = None;
-                    self.current_image_lines = None;
+                if let Some((path, result)) = self.loading_image.poll() {
+                    match result {
+                        Ok(img) => self.current_image_data = Some((path, Arc::new(img))),
+                        Err(error) => self.image_error = Some(error),
+                    }
                 }
-
-                let completed_text = {
-                    let mut lock = self.loading_text.lock().unwrap();
-                    if matches!(&*lock, Some((_, Some(_)))) { lock.take() } else { None }
-                };
-                if let Some((loaded_path, Some(lines))) = completed_text {
-                    self.current_text_data = Some((loaded_path, lines));
-                }
-
-                // Mismo patrón para la carátula del track en reproducción
-                if self.current_cover_path != self.last_cover_file {
-                    self.current_cover_data = None;
-                    self.current_cover_protocol = None;
-                    self.current_cover_lines = None;
-                    self.last_cover_file = self.current_cover_path.clone();
-
-                    if let Some(ref new_path) = self.last_cover_file {
-                        let mut lock = self.loading_cover.lock().unwrap();
-                        *lock = Some((new_path.clone(), None));
-                        let loading_clone = self.loading_cover.clone();
-                        let path_clone = new_path.clone();
-                        thread::spawn(move || {
-                            if let Ok(img) = image::open(&path_clone) {
-                                let img = {
-                                    let max_dim = 1024u32;
-                                    if img.width() > max_dim || img.height() > max_dim {
-                                        img.resize(max_dim, max_dim, image::imageops::FilterType::CatmullRom)
-                                    } else {
-                                        img
-                                    }
-                                };
-                                let mut lock = loading_clone.lock().unwrap();
-                                if let Some((ref cur_path, _)) = *lock
-                                    && cur_path == &path_clone {
-                                        *lock = Some((path_clone, Some(img)));
-                                    }
-                            }
-                        });
+                if let Some((path, result)) = self.loading_text.poll() {
+                    match result {
+                        Ok(lines) => self.current_text_data = Some((path, lines)),
+                        Err(error) => self.text_error = Some(error),
                     }
                 }
 
-                let completed_cover = {
-                    let mut lock = self.loading_cover.lock().unwrap();
-                    if matches!(&*lock, Some((_, Some(_)))) { lock.take() } else { None }
-                };
-                if let Some((loaded_path, Some(loaded_img))) = completed_cover {
-                    self.current_cover_data = Some((loaded_path, loaded_img));
+                // Reading embedded art may scan a whole audio file; keep it off the UI thread.
+                let track = self.audio.shared_state.lock().unwrap().current_track.clone();
+                if track != self.cover_track {
+                    self.cover_track = track.clone();
+                    self.current_cover_path = None;
+                    self.cover_lookup.request(track);
+                }
+                if let Some((_, Ok(url))) = self.cover_lookup.poll() {
+                    self.current_cover_path = url.and_then(|url| url.strip_prefix("file://").map(PathBuf::from));
+                }
+                if self.current_cover_path != self.last_cover_file {
+                    self.current_cover_data = None;
                     self.current_cover_protocol = None;
+                    self.cover_graphics_request = None;
+                    self.cover_graphics.request(None);
                     self.current_cover_lines = None;
+                    self.cover_error = None;
+                    self.last_cover_file = self.current_cover_path.clone();
+                    self.loading_cover.request(self.current_cover_path.clone());
+                }
+                if let Some((path, result)) = self.loading_cover.poll() {
+                    match result {
+                        Ok(img) => self.current_cover_data = Some((path, Arc::new(img))),
+                        Err(error) => self.cover_error = Some(error),
+                    }
                 }
 
                 self.update_media_controls();
@@ -914,8 +882,8 @@ impl App {
                 if self.library.scan_state == ScanState::Scanning {
                     self.library.poll_scan();
                 }
-                if let Some(deadline) = self.library_rescan_after {
-                    if std::time::Instant::now() >= deadline {
+                if let Some(deadline) = self.library_rescan_after
+                    && std::time::Instant::now() >= deadline {
                         if self.library.scan_state != ScanState::Scanning {
                             self.library_rescan_after = None;
                             self.library.start_scan(&self.config.music_folders);
@@ -925,7 +893,6 @@ impl App {
                             );
                         }
                     }
-                }
                 if self.healer.scan_state == HealScanState::Scanning {
                     self.healer.poll_scan();
                 }
@@ -1018,6 +985,9 @@ impl App {
                 self.library_rescan_after = Some(
                     std::time::Instant::now() + std::time::Duration::from_secs(2)
                 );
+            }
+            Event::ThemeChanged => {
+                self.theme = crate::theme::Theme::load();
             }
         }
     }
@@ -1844,9 +1814,9 @@ impl App {
                 }
             }
             KeyCode::Char('m') => {
-                if self.screen == AppScreen::Browser {
-                    if let Some(item) = self.browser.files.get(self.browser.file_index) {
-                        if item.is_dir {
+                if self.screen == AppScreen::Browser
+                    && let Some(item) = self.browser.files.get(self.browser.file_index)
+                        && item.is_dir {
                             let path = item.path.clone();
                             if self.config.add_music_folder(&path) {
                                 self.library.start_scan(&self.config.music_folders);
@@ -1855,8 +1825,6 @@ impl App {
                                 self.notification = Some(("Already in Library".to_string(), 50));
                             }
                         }
-                    }
-                }
             }
             KeyCode::Char('M') => {
                 if self.screen == AppScreen::Browser {
@@ -2293,11 +2261,10 @@ impl App {
                         self.input_mode = InputMode::Normal;
                         self.start_file_operation(dest, is_move);
                     }
-                } else if let Some(ref mut db) = self.dest_browser {
-                    if !db.dirs.is_empty() && !db.loading {
+                } else if let Some(ref mut db) = self.dest_browser
+                    && !db.dirs.is_empty() && !db.loading {
                         db.enter_highlighted();
                     }
-                }
             }
             KeyCode::Right | KeyCode::Char('l') => {
                 if let Some(ref mut db) = self.dest_browser
@@ -2419,72 +2386,66 @@ impl App {
     }
 
     fn navigate_left(&mut self) {
-        match self.screen {
-            AppScreen::Browser => {
-                match self.browser.focused_pane {
-                    PaneType::Preview => {
-                        self.browser.focused_pane = PaneType::Files;
-                    }
-                    PaneType::Files | PaneType::Directories => {
-                        if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
-                            let item = self.browser.files[self.browser.file_index].clone();
-                            if item.is_dir && item.is_expanded {
-                                self.browser.expanded_paths.remove(&item.path);
-                                self.browser.refresh();
-                            } else {
-                                // Si el item tiene profundidad, saltamos al padre visible en la lista
-                                let mut found_parent = false;
-                                if item.depth > 0 {
-                                    for i in (0..self.browser.file_index).rev() {
-                                        if self.browser.files[i].is_dir && self.browser.files[i].depth < item.depth {
-                                            self.browser.file_index = i;
-                                            found_parent = true;
-                                            break;
-                                        }
+        if self.screen == AppScreen::Browser {
+            match self.browser.focused_pane {
+                PaneType::Preview => {
+                    self.browser.focused_pane = PaneType::Files;
+                }
+                PaneType::Files | PaneType::Directories => {
+                    if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
+                        let item = self.browser.files[self.browser.file_index].clone();
+                        if item.is_dir && item.is_expanded {
+                            self.browser.expanded_paths.remove(&item.path);
+                            self.browser.refresh();
+                        } else {
+                            // Si el item tiene profundidad, saltamos al padre visible en la lista
+                            let mut found_parent = false;
+                            if item.depth > 0 {
+                                for i in (0..self.browser.file_index).rev() {
+                                    if self.browser.files[i].is_dir && self.browser.files[i].depth < item.depth {
+                                        self.browser.file_index = i;
+                                        found_parent = true;
+                                        break;
                                     }
                                 }
-                                if !found_parent {
-                                    self.browser.go_to_parent();
-                                }
                             }
-                        } else {
-                            self.browser.go_to_parent();
+                            if !found_parent {
+                                self.browser.go_to_parent();
+                            }
                         }
+                    } else {
+                        self.browser.go_to_parent();
                     }
                 }
-                self.browser.refresh();
             }
-            _ => {}
+            self.browser.refresh();
         }
     }
 
     fn navigate_right(&mut self) {
-        match self.screen {
-            AppScreen::Browser => {
-                match self.browser.focused_pane {
-                    PaneType::Directories => {
-                        self.browser.focused_pane = PaneType::Files;
-                    }
-                    PaneType::Files => {
-                        if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
-                            let item = self.browser.files[self.browser.file_index].clone();
-                            if item.is_dir {
-                                if !item.is_expanded {
-                                    self.browser.expanded_paths.insert(item.path.clone());
-                                    self.browser.refresh();
-                                } else if self.browser.file_index + 1 < self.browser.files.len() {
-                                    self.browser.file_index += 1;
-                                }
-                            } else if self.has_preview() {
-                                self.browser.focused_pane = PaneType::Preview;
+        if self.screen == AppScreen::Browser {
+            match self.browser.focused_pane {
+                PaneType::Directories => {
+                    self.browser.focused_pane = PaneType::Files;
+                }
+                PaneType::Files => {
+                    if !self.browser.files.is_empty() && self.browser.file_index < self.browser.files.len() {
+                        let item = self.browser.files[self.browser.file_index].clone();
+                        if item.is_dir {
+                            if !item.is_expanded {
+                                self.browser.expanded_paths.insert(item.path.clone());
+                                self.browser.refresh();
+                            } else if self.browser.file_index + 1 < self.browser.files.len() {
+                                self.browser.file_index += 1;
                             }
+                        } else if self.has_preview() {
+                            self.browser.focused_pane = PaneType::Preview;
                         }
                     }
-                    PaneType::Preview => {}
                 }
-                self.browser.refresh();
+                PaneType::Preview => {}
             }
-            _ => {}
+            self.browser.refresh();
         }
     }
 
@@ -2616,13 +2577,14 @@ impl App {
             let track_changed = current_track != self.last_media_track;
             let elapsed_changed = elapsed != self.last_media_elapsed;
 
-            if status_changed || track_changed || elapsed_changed {
-                if track_changed {
-                    self.lyrics_scroll_offset = 0;
-                    let cover_url = current_track.as_ref().and_then(|p| Self::find_cover_art(p));
-                    self.current_cover_path = cover_url.as_ref()
-                        .and_then(|url| url.strip_prefix("file://"))
-                        .map(PathBuf::from);
+            let metadata_changed = metadata != self.last_media_metadata
+                || self.current_cover_path != self.last_media_cover;
+            if status_changed || track_changed || elapsed_changed || metadata_changed {
+                if track_changed { self.lyrics_scroll_offset = 0; }
+                if track_changed || metadata_changed {
+                    self.last_media_metadata = metadata.clone();
+                    self.last_media_cover = self.current_cover_path.clone();
+                    let cover_url = self.current_cover_path.as_ref().map(|path| format!("file://{}", path.to_string_lossy()));
 
                     if let Some(meta) = metadata {
                         let title = meta.title.as_deref();
@@ -2815,8 +2777,8 @@ impl App {
         if filtered.is_empty() {
             return None;
         }
-        if let Some(curr) = self.queue.current_index {
-            if let Some(pos) = filtered.iter().position(|(_, orig)| *orig == curr) {
+        if let Some(curr) = self.queue.current_index
+            && let Some(pos) = filtered.iter().position(|(_, orig)| *orig == curr) {
                 let next_pos = pos + 1;
                 if next_pos < filtered.len() {
                     let next_orig = filtered[next_pos].1;
@@ -2825,7 +2787,6 @@ impl App {
                 }
                 return None;
             }
-        }
         let first_orig = filtered[0].1;
         self.queue.current_index = Some(first_orig);
         Some(self.queue.items[first_orig].clone())
@@ -2836,8 +2797,8 @@ impl App {
         if filtered.is_empty() {
             return None;
         }
-        if let Some(curr) = self.queue.current_index {
-            if let Some(pos) = filtered.iter().position(|(_, orig)| *orig == curr) {
+        if let Some(curr) = self.queue.current_index
+            && let Some(pos) = filtered.iter().position(|(_, orig)| *orig == curr) {
                 if pos > 0 {
                     let prev_orig = filtered[pos - 1].1;
                     self.queue.current_index = Some(prev_orig);
@@ -2845,7 +2806,6 @@ impl App {
                 }
                 return None;
             }
-        }
         let last_orig = filtered[filtered.len() - 1].1;
         self.queue.current_index = Some(last_orig);
         Some(self.queue.items[last_orig].clone())
@@ -3816,11 +3776,10 @@ impl App {
                     let visible_paths: Vec<PathBuf> = self.library
                         .visible_tracks(&self.collections, &filter_query, &self.stats)
                         .iter().map(|t| t.path.clone()).collect();
-                    if let Some(path) = visible_paths.get(self.library.track_index).cloned() {
-                        if matches_audio_extension(&path) {
+                    if let Some(path) = visible_paths.get(self.library.track_index).cloned()
+                        && matches_audio_extension(&path) {
                             self.queue.add(path);
                         }
-                    }
                 } else {
                     self.toggle_playback();
                 }
@@ -3908,14 +3867,12 @@ impl App {
             KeyCode::Char('D') => {
                 if self.library.focused_panel == LibraryPanel::Playlists {
                     let names = LibraryState::playlist_names(&self.collections);
-                    if self.library.playlist_index > 0 {
-                        if let Some(name) = names.get(self.library.playlist_index).cloned() {
-                            if !is_smart_playlist(&name) {
+                    if self.library.playlist_index > 0
+                        && let Some(name) = names.get(self.library.playlist_index).cloned()
+                            && !is_smart_playlist(&name) {
                                 self.pending_delete_playlist = Some(name);
                                 self.input_mode = InputMode::ConfirmDeletePlaylist;
                             }
-                        }
-                    }
                 }
             }
             KeyCode::Char('x') => {
@@ -4182,17 +4139,17 @@ impl App {
         }
 
         let err_count = progress.total - progress.ok_count;
-        let msg = if progress.first_error.is_none() {
-            format!("✓ Saved {} tracks", progress.ok_count)
-        } else if progress.ok_count > 0 {
-            format!(
-                "Saved {}/{} — error: {}",
-                progress.ok_count,
-                progress.total,
-                progress.first_error.unwrap()
-            )
+        let msg = if let Some(ref first_error) = progress.first_error {
+            if progress.ok_count > 0 {
+                format!(
+                    "Saved {}/{} — error: {}",
+                    progress.ok_count, progress.total, first_error
+                )
+            } else {
+                format!("Failed: {}", first_error)
+            }
         } else {
-            format!("Failed: {}", progress.first_error.unwrap())
+            format!("✓ Saved {} tracks", progress.ok_count)
         };
 
         if err_count == 0 {
@@ -4209,8 +4166,8 @@ impl App {
             write_tags(editor);
         }
         // Update in-memory track on success
-        if let Some(ref editor) = self.library.tag_editor {
-            if matches!(&editor.save_result, Some(Ok(()))) {
+        if let Some(ref editor) = self.library.tag_editor
+            && matches!(&editor.save_result, Some(Ok(()))) {
                 let path = editor.path.clone();
                 let new_title = editor.fields[0].clone();
                 let new_artist = editor.fields[1].clone();
@@ -4227,7 +4184,6 @@ impl App {
                     t.genre = if new_genre.is_empty() { None } else { Some(new_genre) };
                 }
             }
-        }
     }
 
     fn library_remove_from_playlist(&mut self) {
@@ -4285,9 +4241,8 @@ impl App {
                 // Stay in BulkTagEdit mode
             }
             KeyCode::Left => {
-                if let Some(ref mut ed) = self.library.bulk_tag_editor {
-                    if ed.cursor_pos > 0 { ed.cursor_pos -= 1; }
-                }
+                if let Some(ref mut ed) = self.library.bulk_tag_editor
+                    && ed.cursor_pos > 0 { ed.cursor_pos -= 1; }
             }
             KeyCode::Right => {
                 if let Some(ref mut ed) = self.library.bulk_tag_editor {
@@ -4363,9 +4318,8 @@ impl App {
                 }
             }
             KeyCode::Left => {
-                if let Some(ref mut ed) = self.library.tag_editor {
-                    if ed.cursor_pos > 0 { ed.cursor_pos -= 1; }
-                }
+                if let Some(ref mut ed) = self.library.tag_editor
+                    && ed.cursor_pos > 0 { ed.cursor_pos -= 1; }
             }
             KeyCode::Right => {
                 if let Some(ref mut ed) = self.library.tag_editor {
@@ -4516,12 +4470,11 @@ impl App {
                     self.healer.screen = HealerScreen::Report;
                 }
             }
-            KeyCode::Char('f') => {
-                if !self.healer.files.is_empty() {
+            KeyCode::Char('f')
+                if !self.healer.files.is_empty() => {
                     self.healer.list_idx = 0;
                     self.healer.screen = HealerScreen::FileList;
                 }
-            }
             _ => {}
         }
     }
@@ -4778,12 +4731,11 @@ impl App {
             let mut all_matches = Vec::new();
             let mb = musicbrainz::search_recording(&title, &artist);
             all_matches.extend(mb);
-            if !api_key.is_empty() {
-                if let Some(fp) = fingerprint::compute(&path) {
+            if !api_key.is_empty()
+                && let Some(fp) = fingerprint::compute(&path) {
                     all_matches.extend(fingerprint::lookup(&fp, &api_key));
                 }
-            }
-            all_matches.sort_by(|a, b| b.confidence.cmp(&a.confidence));
+            all_matches.sort_by_key(|a| std::cmp::Reverse(a.confidence));
             *slot.lock().unwrap() = Some(all_matches);
         });
     }
@@ -5059,7 +5011,7 @@ mod tests {
     }
 
     #[test]
-    fn test_autocomplete_and_folder_operations() {
+    fn test_folder_operations() {
         let (tx, _rx) = channel();
         let test_root = std::env::current_dir()
             .unwrap()
@@ -5075,11 +5027,6 @@ mod tests {
         let dest_dir = test_root.join("dest_folder");
         std::fs::create_dir_all(&src_dir).unwrap();
         std::fs::write(src_dir.join("file.txt"), "hello").unwrap();
-
-        let completed = App::autocomplete_path(&test_root.join("src_fo").to_string_lossy());
-        assert!(completed.is_some());
-        let val = completed.unwrap();
-        assert!(val.contains("src_folder"));
 
         let mut app = App::new(tx, Some(test_root.clone()), None);
         app.browser.selected_paths.insert(src_dir.clone());

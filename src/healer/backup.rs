@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use super::TagSnapshot;
 
@@ -37,8 +37,8 @@ impl BackupStore {
         Ok(())
     }
 
-    pub fn record(&mut self, path: &PathBuf, snap: &TagSnapshot) {
-        self.entries.entry(path.clone()).or_insert_with(|| TagBackup {
+    pub fn record(&mut self, path: &Path, snap: &TagSnapshot) {
+        self.entries.entry(path.to_path_buf()).or_insert_with(|| TagBackup {
             title:        snap.title.clone(),
             artist:       snap.artist.clone(),
             album:        snap.album.clone(),

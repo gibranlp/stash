@@ -44,6 +44,10 @@ stash /media/Music  # open in a specific folder
 
 Press `?` inside STASH for the full keyboard shortcuts guide.
 
+Previews load in background workers. Text previews show up to 256 KiB / 5,000 lines; images use decoder limits of 8,192 pixels per dimension and a 128 MiB allocation budget, then display a thumbnail. Files that cannot be previewed show an error.
+
+See [the performance and release review](PERFORMANCE_REVIEW.md) for validation results and remaining release checks.
+
 ---
 
 ## Author
