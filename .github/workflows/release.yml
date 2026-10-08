@@ -51,11 +51,15 @@ jobs:
 
       - name: Install Linux system dependencies
         if: matrix.os == 'ubuntu-22.04'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libdbus-1-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libdbus-1-dev pkg-config playerctl
 
       - name: Test before publishing
         if: matrix.os == 'ubuntu-22.04'
         run: cargo test --locked
+
+      - name: Test MPRIS metadata delivery
+        if: matrix.os == 'ubuntu-22.04'
+        run: dbus-run-session -- cargo test --locked --test mpris -- --ignored
 
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}

@@ -4,10 +4,12 @@ STASH is a fast, keyboard-driven terminal music browser, player, and file organi
 
 ---
 
+See [the changelog](CHANGELOG.md) for release notes.
+
 ## Features
 
 - **File Browser**: Dual-pane navigation with file previews. Copy, move, and delete files in the background with a live progress bar. Select multiple files, search by name, and jump pages with `PageUp` / `PageDown`.
-- **Music Player**: Play any track with `Enter`, queue up songs, skip, seek, adjust volume, and toggle shuffle/repeat. Shows embedded lyrics with an automatic online fallback.
+- **Music Player**: Play any track with `Enter`, queue up songs, skip, seek, adjust volume, and toggle shuffle/repeat. Shows embedded lyrics with an automatic online fallback. Timestamped lyrics follow playback automatically and highlight the current line; `PageUp` / `PageDown` scroll plain lyrics. Publishes track metadata and album artwork to desktop MPRIS clients.
 - **Library**: Scans your music folders into one searchable, sortable list. Organize tracks into playlists and edit tags inline.
 - **Library Healer**: Finds tracks with missing or broken metadata and proposes fixes from the filename or online lookups, so you can review and apply them with one key.
 

@@ -244,6 +244,7 @@ pub struct App {
     pub last_media_elapsed: u64,
     last_media_metadata: Option<crate::models::AudioMetadata>,
     last_media_cover: Option<PathBuf>,
+    last_media_duration: u64,
     pub discord: DiscordPresence,
     pub last_discord_track: Option<PathBuf>,
     pub last_discord_status: Option<PlaybackStatus>,
@@ -262,7 +263,7 @@ pub struct App {
     pub cover_graphics_request: Option<(PathBuf, u16, u16)>,
     pub loading_cover: PreviewLoader<image::DynamicImage>,
     pub cover_error: Option<String>,
-    cover_lookup: PreviewLoader<Option<String>>,
+    cover_lookup: PreviewLoader<Option<PathBuf>>,
     cover_track: Option<PathBuf>,
     pub current_cover_protocol: Option<(PathBuf, u16, u16, Box<dyn ratatui_image::protocol::ResizeProtocol>)>,
     pub current_cover_lines: Option<(PathBuf, u16, u16, Vec<ratatui::text::Line<'static>>)>,
@@ -272,7 +273,6 @@ pub struct App {
     pub loading_text: PreviewLoader<Vec<String>>,
     pub text_error: Option<String>,
     pub lyrics_scroll_offset: usize,
-    pub lyrics_focused: bool,
     pub config: AppConfig,
     pub last_operation_dest: String,
     pub picker: Option<ratatui_image::picker::Picker>,
@@ -535,10 +535,11 @@ impl App {
                         }
                     }) {
                         let _ = std::fs::write("debug_mpris.log", format!("Attach failed: {:?}", e));
+                        None
                     } else {
                         let _ = std::fs::write("debug_mpris.log", "MPRIS successfully initialized and attached.");
+                        Some(controls)
                     }
-                    Some(controls)
                 }
                 Err(e) => {
                     let _ = std::fs::write("debug_mpris.log", format!("MPRIS Initialization failed: {:?}", e));
@@ -573,6 +574,7 @@ impl App {
             last_media_status: None,
             last_media_track: None,
             last_media_elapsed: 0,
+            last_media_duration: 0,
             last_media_metadata: None,
             last_media_cover: None,
             discord,
@@ -603,7 +605,6 @@ impl App {
             loading_text: PreviewLoader::new(|p| crate::preview::load_text(p)),
             text_error: None,
             lyrics_scroll_offset: 0,
-            lyrics_focused: false,
             config,
             last_operation_dest: String::new(),
             picker,
@@ -857,8 +858,8 @@ impl App {
                     self.current_cover_path = None;
                     self.cover_lookup.request(track);
                 }
-                if let Some((_, Ok(url))) = self.cover_lookup.poll() {
-                    self.current_cover_path = url.and_then(|url| url.strip_prefix("file://").map(PathBuf::from));
+                if let Some((_, Ok(path))) = self.cover_lookup.poll() {
+                    self.current_cover_path = path;
                 }
                 if self.current_cover_path != self.last_cover_file {
                     self.current_cover_data = None;
@@ -1273,8 +1274,6 @@ impl App {
                         }
                         PaneType::Preview => PaneType::Directories,
                     };
-                } else if self.screen == AppScreen::Queue {
-                    self.lyrics_focused = !self.lyrics_focused;
                 }
             }
             KeyCode::BackTab => {
@@ -1323,9 +1322,7 @@ impl App {
                 self.search.query.clear();
             }
             KeyCode::Up => {
-                if self.screen == AppScreen::Queue && self.lyrics_focused {
-                    self.lyrics_scroll_offset = self.lyrics_scroll_offset.saturating_sub(1);
-                } else if key.modifiers.contains(KeyModifiers::CONTROL) && self.screen == AppScreen::Queue {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && self.screen == AppScreen::Queue {
                     self.move_highlighted_queue_item(true);
                 } else if key.modifiers.contains(KeyModifiers::SHIFT) && self.screen == AppScreen::Browser {
                     self.browser_shift_navigate(true);
@@ -1337,14 +1334,10 @@ impl App {
                 }
             }
             KeyCode::Char('k') => {
-                if self.screen == AppScreen::Queue && self.lyrics_focused {
-                    self.lyrics_scroll_offset = self.lyrics_scroll_offset.saturating_sub(1);
-                } else {
-                    if self.screen == AppScreen::Browser {
-                        self.browser.shift_start = None;
-                    }
-                    self.navigate_up();
+                if self.screen == AppScreen::Browser {
+                    self.browser.shift_start = None;
                 }
+                self.navigate_up();
             }
             KeyCode::Char('K') => {
                 if self.screen == AppScreen::Queue {
@@ -1354,9 +1347,7 @@ impl App {
                 }
             }
             KeyCode::Down => {
-                if self.screen == AppScreen::Queue && self.lyrics_focused {
-                    self.lyrics_scroll_offset += 1;
-                } else if key.modifiers.contains(KeyModifiers::CONTROL) && self.screen == AppScreen::Queue {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && self.screen == AppScreen::Queue {
                     self.move_highlighted_queue_item(false);
                 } else if key.modifiers.contains(KeyModifiers::SHIFT) && self.screen == AppScreen::Browser {
                     self.browser_shift_navigate(false);
@@ -1368,14 +1359,10 @@ impl App {
                 }
             }
             KeyCode::Char('j') => {
-                if self.screen == AppScreen::Queue && self.lyrics_focused {
-                    self.lyrics_scroll_offset += 1;
-                } else {
-                    if self.screen == AppScreen::Browser {
-                        self.browser.shift_start = None;
-                    }
-                    self.navigate_down();
+                if self.screen == AppScreen::Browser {
+                    self.browser.shift_start = None;
                 }
+                self.navigate_down();
             }
             KeyCode::Char('J') => {
                 if self.screen == AppScreen::Queue {
@@ -1385,7 +1372,7 @@ impl App {
                 }
             }
             KeyCode::PageUp => {
-                if self.screen == AppScreen::Queue && self.lyrics_focused {
+                if self.screen == AppScreen::Queue {
                     self.lyrics_scroll_offset = self.lyrics_scroll_offset.saturating_sub(10);
                 } else {
                     if self.screen == AppScreen::Browser {
@@ -1395,7 +1382,7 @@ impl App {
                 }
             }
             KeyCode::PageDown => {
-                if self.screen == AppScreen::Queue && self.lyrics_focused {
+                if self.screen == AppScreen::Queue {
                     self.lyrics_scroll_offset += 10;
                 } else {
                     if self.screen == AppScreen::Browser {
@@ -2578,16 +2565,19 @@ impl App {
             let elapsed_changed = elapsed != self.last_media_elapsed;
 
             let metadata_changed = metadata != self.last_media_metadata
-                || self.current_cover_path != self.last_media_cover;
+                || self.current_cover_path != self.last_media_cover
+                || duration != self.last_media_duration;
             if status_changed || track_changed || elapsed_changed || metadata_changed {
                 if track_changed { self.lyrics_scroll_offset = 0; }
                 if track_changed || metadata_changed {
-                    self.last_media_metadata = metadata.clone();
-                    self.last_media_cover = self.current_cover_path.clone();
-                    let cover_url = self.current_cover_path.as_ref().map(|path| format!("file://{}", path.to_string_lossy()));
+                    let cover_url = self.current_cover_path.as_deref().and_then(Self::file_url);
+                    let fallback_title = current_track.as_ref()
+                        .and_then(|path| path.file_stem())
+                        .map(|name| name.to_string_lossy().into_owned());
 
-                    if let Some(meta) = metadata {
-                        let title = meta.title.as_deref();
+                    let result = if let Some(ref meta) = metadata {
+                        let title = meta.title.as_deref().filter(|title| !title.trim().is_empty())
+                            .or(fallback_title.as_deref());
                         let artist = meta.artist.as_deref();
                         let album = meta.album.as_deref();
                         let m_meta = souvlaki::MediaMetadata {
@@ -2597,19 +2587,30 @@ impl App {
                             duration: Some(std::time::Duration::from_secs(duration)),
                             cover_url: cover_url.as_deref(),
                         };
-                        let _ = controls.set_metadata(m_meta);
+                        controls.set_metadata(m_meta)
                     } else {
-                        let title = current_track.as_ref()
-                            .and_then(|p| p.file_name())
-                            .map(|s| s.to_string_lossy().into_owned());
                         let m_meta = souvlaki::MediaMetadata {
-                            title: title.as_deref(),
+                            title: fallback_title.as_deref(),
+                            cover_url: cover_url.as_deref(),
                             duration: Some(std::time::Duration::from_secs(duration)),
                             ..Default::default()
                         };
-                        let _ = controls.set_metadata(m_meta);
+                        controls.set_metadata(m_meta)
+                    };
+                    match result {
+                        Ok(()) => {
+                            self.last_media_metadata = metadata;
+                            self.last_media_cover = self.current_cover_path.clone();
+                            self.last_media_duration = duration;
+                            self.last_media_track = current_track;
+                        }
+                        Err(error) => {
+                            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("debug_mpris.log") {
+                                use std::io::Write;
+                                let _ = writeln!(file, "set_metadata error: {error:?}");
+                            }
+                        }
                     }
-                    self.last_media_track = current_track;
                 }
 
                 if status_changed || elapsed_changed {
@@ -2673,14 +2674,18 @@ impl App {
         self.last_discord_track = current_track;
     }
 
+    fn file_url(path: &Path) -> Option<String> {
+        url::Url::from_file_path(std::fs::canonicalize(path).ok()?).ok().map(Into::into)
+    }
+
     // Busca carátula: primero en disco junto al track, luego embebida con lofty y la cachea
-    pub fn find_cover_art(track_path: &Path) -> Option<String> {
+    pub fn find_cover_art(track_path: &Path) -> Option<PathBuf> {
         if let Some(parent) = track_path.parent() {
             let common_names = ["cover.jpg", "cover.png", "folder.jpg", "folder.png", "front.jpg", "front.png", "Cover.jpg", "Cover.png", "Folder.jpg", "Folder.png"];
             for name in &common_names {
                 let img_path = parent.join(name);
                 if img_path.exists() && img_path.is_file() {
-                    return Some(format!("file://{}", img_path.to_string_lossy()));
+                    return Some(img_path);
                 }
             }
 
@@ -2691,7 +2696,7 @@ impl App {
                         && let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
                             let lower = filename.to_lowercase();
                             if lower == "cover.jpg" || lower == "cover.png" || lower == "folder.jpg" || lower == "folder.png" || lower == "front.jpg" || lower == "front.png" {
-                                return Some(format!("file://{}", path.to_string_lossy()));
+                                return Some(path);
                             }
                         }
                 }
@@ -2700,8 +2705,7 @@ impl App {
 
         // Si no hay imagen en disco, intentamos extraerla del tag del archivo y cacheamos en disco
         if let Ok(tagged_file) = Probe::open(track_path).and_then(|p| p.read())
-            && let Some(tag) = tagged_file.primary_tag()
-                && let Some(picture) = tag.pictures().first() {
+            && let Some(picture) = tagged_file.tags().iter().flat_map(|tag| tag.pictures()).next() {
                     let data = picture.data();
                     if let Some(cache_dir) = dirs::cache_dir() {
                         let art_cache_dir = cache_dir.join("stash").join("album_art");
@@ -2719,7 +2723,7 @@ impl App {
                             let cached_path = art_cache_dir.join(format!("{}.{}", hash, ext));
 
                             if cached_path.exists() || std::fs::write(&cached_path, data).is_ok() {
-                                return Some(format!("file://{}", cached_path.to_string_lossy()));
+                                return Some(cached_path);
                             }
                         }
                     }
@@ -4896,6 +4900,18 @@ mod tests {
     }
 
     #[test]
+    fn artwork_url_escapes_special_characters_and_round_trips() {
+        let root = std::env::current_dir().unwrap().join("target/artwork url # test");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("cover%.jpg");
+        std::fs::write(&path, []).unwrap();
+        let encoded = App::file_url(&path).unwrap();
+        assert!(encoded.contains("artwork%20url%20%23%20test/cover%25.jpg"));
+        assert_eq!(url::Url::parse(&encoded).unwrap().to_file_path().unwrap(), path);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn test_find_cover_art() {
         let test_root = std::env::current_dir()
             .unwrap()
@@ -4915,7 +4931,7 @@ mod tests {
 
         let res = App::find_cover_art(&track_path);
         assert!(res.is_some());
-        let expected_url = format!("file://{}", cover_path.to_string_lossy());
+        let expected_url = cover_path;
         assert_eq!(res.unwrap(), expected_url);
 
         let _ = std::fs::remove_dir_all(&test_root);

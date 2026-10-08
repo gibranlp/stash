@@ -76,6 +76,21 @@ fn parse_synced_lyrics(lyrics: &str) -> Option<Vec<TimedLyricLine>> {
 }
 
 
+// Paragraph scrolling uses rendered rows, so count wrapped rows before the
+// active lyric instead of assuming every timestamp occupies one screen row.
+fn wrapped_lyric_rows(lines: &[Line<'_>], width: u16) -> usize {
+    Paragraph::new(lines.to_vec())
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .line_count(width)
+}
+
+fn synced_lyrics_scroll(lines: &[Line<'_>], active: Option<usize>, inner: Rect) -> usize {
+    let Some(active) = active else { return 0 };
+    wrapped_lyric_rows(&lines[..active], inner.width)
+        .saturating_sub(inner.height as usize / 2)
+}
+
+
 pub fn render(f: &mut Frame, app: &mut App) {
     // Snapshot the active SpectrumOS-derived theme for this frame so every render
     // helper below (many take no `App` at all — popups, the help screen, ...) can
@@ -668,27 +683,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 f.render_widget(placeholder, info_inner);
             }
 
-            let lyrics_border_style = if app.lyrics_focused {
-                Style::default().fg(crate::theme::current().accent_alt)
-            } else {
-                Style::default().fg(crate::theme::current().muted)
-            };
-            let lyrics_title = if app.lyrics_focused {
-                " Lyrics [Tab to exit] "
-            } else {
-                " Lyrics [Tab to scroll] "
-            };
             let lyrics_block = Block::default()
                 .borders(Borders::ALL)
-                .border_type(if app.lyrics_focused {
-                    BorderType::Double
-                } else {
-                    BorderType::Rounded
-                })
-                .border_style(lyrics_border_style)
-                .title(lyrics_title);
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(crate::theme::current().muted))
+                .title(" Lyrics ");
 
             use crate::models::LyricsState;
+            let mut lyrics_highlight = None;
             let lyrics_para = if active_track.is_none() {
                 Paragraph::new(vec![
                     Line::from(""),
@@ -715,25 +717,26 @@ pub fn render(f: &mut Frame, app: &mut App) {
                                     let prefix = if is_active { "▶ " } else { "  " };
                                     let style = if is_active {
                                         Style::default()
-                                            .fg(crate::theme::current().accent)
+                                            .fg(crate::theme::current().background)
+                                            .bg(crate::theme::current().accent)
                                             .add_modifier(Modifier::BOLD)
                                     } else if active_line.is_some_and(|active| index < active) {
                                         Style::default().fg(crate::theme::current().foreground)
                                     } else {
                                         Style::default().fg(crate::theme::current().muted)
                                     };
-                                    Line::from(Span::styled(format!("{prefix}{}", line.text), style))
+                                    Line::from(format!("{prefix}{}", line.text)).style(style)
                                 })
                                 .collect();
-                            let visible_height = queue_chunks[2].height.saturating_sub(2) as usize;
-                            let auto_scroll = active_line
-                                .unwrap_or(0)
-                                .saturating_sub(visible_height / 2);
-                            let scroll = if app.lyrics_focused {
-                                app.lyrics_scroll_offset
-                            } else {
-                                auto_scroll
-                            };
+                            let inner = lyrics_block.inner(queue_chunks[2]);
+                            let scroll = synced_lyrics_scroll(&lyrics_lines, active_line, inner);
+                            if let Some(active) = active_line {
+                                let row = wrapped_lyric_rows(&lyrics_lines[..active], inner.width)
+                                    .saturating_sub(scroll.min(u16::MAX as usize));
+                                let height = wrapped_lyric_rows(&lyrics_lines[active..=active], inner.width)
+                                    .min((inner.height as usize).saturating_sub(row));
+                                lyrics_highlight = Some(Rect::new(inner.x, inner.y.saturating_add(row as u16), inner.width, height as u16));
+                            }
                             Paragraph::new(lyrics_lines)
                                 .block(lyrics_block)
                                 .scroll((scroll.min(u16::MAX as usize) as u16, 0))
@@ -799,6 +802,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 }
             };
             f.render_widget(lyrics_para, queue_chunks[2]);
+            if let Some(area) = lyrics_highlight {
+                f.buffer_mut().set_style(area, Style::default()
+                    .fg(crate::theme::current().background)
+                    .bg(crate::theme::current().accent)
+                    .add_modifier(Modifier::BOLD));
+            }
         }
         AppScreen::Library => {
             render_library(f, app, chunks[1]);
@@ -1919,7 +1928,7 @@ fn render_help_popup(f: &mut Frame, scroll: u16) {
         Line::from(vec![k("  C                 "), d("Clear entire queue")]),
         Line::from(vec![k("  v                 "), d("Cycle visualizer: Spectrum → Waveform → Levels")]),
         Line::from(vec![k("  [ / ]             "), d("Visualizer decay slower / faster")]),
-        Line::from(vec![k("  PgUp / PgDn       "), d("Scroll queue / lyrics")]),
+        Line::from(vec![k("  PgUp / PgDn       "), d("Scroll plain lyrics / browser")]),
         Line::from(""),
         Line::from(h("── Library Healer (4) ─────────────────────────────────────")),
         Line::from(vec![k("  s / Enter         "), d("Start scan  (Menu)")]),
@@ -3525,6 +3534,19 @@ fn render_healer_editor(f: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod synced_lyrics_tests {
     use super::*;
+
+    #[test]
+    fn auto_scroll_counts_wrapped_rows_and_follows_seeks() {
+        let lines = vec![Line::from("first"), Line::from("one two three four five six"),
+            Line::from("current"), Line::from("next")];
+        let area = Rect::new(0, 0, 10, 5);
+        assert_eq!(synced_lyrics_scroll(&lines, None, area), 0);
+        assert_eq!(synced_lyrics_scroll(&lines, Some(0), area), 0);
+        // The long second lyric occupies three rows at this width.
+        assert_eq!(synced_lyrics_scroll(&lines, Some(2), area), 2);
+        assert_eq!(synced_lyrics_scroll(&lines, Some(3), area), 3);
+        assert_eq!(synced_lyrics_scroll(&lines, Some(0), area), 0);
+    }
 
     #[test]
     fn parses_and_sorts_lrc_lines() {

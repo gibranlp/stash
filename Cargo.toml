@@ -1,6 +1,6 @@
 [package]
 name = "stash"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 authors = ["gibranlp"]
 homepage = "https://gibranlp.dev"
@@ -9,9 +9,11 @@ description = "A fast, keyboard-driven terminal music browser, player, and file 
 
 [patch.crates-io]
 rodio = { path = "vendor/rodio" }
+souvlaki = { path = "vendor/souvlaki" }
 
 [dependencies]
-ratatui = "0.26"
+ratatui = { version = "0.26", features = ["unstable-rendered-line-info"] }
+url = "2"
 crossterm = "0.27"
 unicode-width = "0.1"
 rodio = { version = "0.19", features = ["symphonia-all"] }
