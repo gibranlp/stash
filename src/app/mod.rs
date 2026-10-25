@@ -248,6 +248,7 @@ pub struct App {
     pub discord: DiscordPresence,
     pub last_discord_track: Option<PathBuf>,
     pub last_discord_status: Option<PlaybackStatus>,
+    last_discord_update: Option<std::time::Instant>,
     pub rename_target: Option<PathBuf>,
     pub last_previewed_file: Option<PathBuf>,
     pub current_image_data: Option<(PathBuf, Arc<image::DynamicImage>)>,
@@ -285,6 +286,7 @@ pub struct App {
     pub library_pending_add_paths: Vec<PathBuf>,
     pub add_coll_creating: bool, // true = "New playlist" sub-input is active in the popup
     pub update: crate::updater::UpdateSlot,
+    last_update_check: std::time::Instant,
     pub manage_folders_index: usize,
     pub notification: Option<(String, u8)>,  // (message, ticks_remaining at 50ms each)
     pub library_track_list_state: ListState,
@@ -551,6 +553,7 @@ impl App {
         let library_watcher = start_library_watcher(&config.music_folders, event_tx.clone());
         let theme = crate::theme::Theme::load();
         let theme_watcher = crate::theme::Theme::start_watcher(event_tx.clone());
+        let auto_update = config.auto_update;
 
         Self {
             browser,
@@ -580,6 +583,7 @@ impl App {
             discord,
             last_discord_track: None,
             last_discord_status: None,
+            last_discord_update: None,
             rename_target: None,
             last_previewed_file: None,
             current_image_data: None,
@@ -618,9 +622,10 @@ impl App {
             add_coll_creating: false,
             update: {
                 let slot = crate::updater::new_slot();
-                crate::updater::spawn_check(slot.clone());
+                crate::updater::spawn_check(slot.clone(), auto_update);
                 slot
             },
+            last_update_check: std::time::Instant::now(),
             manage_folders_index: 0,
             notification: None,
             library_track_list_state: ListState::default(),
@@ -758,6 +763,11 @@ impl App {
             Event::Key(key) => self.handle_key(key),
             Event::Paste(content) => self.handle_paste(content),
             Event::Tick => {
+                let update_interval = crate::updater::check_interval(&self.update.lock().unwrap());
+                if self.last_update_check.elapsed() >= update_interval {
+                    crate::updater::spawn_check(self.update.clone(), self.config.auto_update);
+                    self.last_update_check = std::time::Instant::now();
+                }
                 // Detect 'm' key release: no 'm' press for 300ms means the key was let go.
                 // The short-tap mark action happens immediately on key press so moving the
                 // cursor during this window cannot mark a different track.
@@ -1144,7 +1154,7 @@ impl App {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
-        // u/U opens the update confirmation dialog from any screen when an update is available
+        // U applies a pending manual update or checks again after a failure.
         let plain_or_shift = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
         if matches!(key.code, KeyCode::Char('u') | KeyCode::Char('U')) && plain_or_shift {
             let state = self.update.lock().unwrap().clone();
@@ -1152,6 +1162,9 @@ impl App {
                 self.input_mode = InputMode::ConfirmUpdate;
                 return;
             }
+            crate::updater::spawn_check(self.update.clone(), self.config.auto_update);
+            self.last_update_check = std::time::Instant::now();
+            return;
         }
 
         // Number keys switch screens from anywhere
@@ -2284,8 +2297,8 @@ impl App {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 let state = self.update.lock().unwrap().clone();
-                if let crate::updater::UpdateProgress::Available { version, url } = state {
-                    crate::updater::spawn_download(version, url, self.update.clone());
+                if let crate::updater::UpdateProgress::Available { release } = state {
+                    crate::updater::spawn_download(release, self.update.clone());
                 }
                 self.input_mode = InputMode::Normal;
             }
@@ -2648,15 +2661,17 @@ impl App {
         let status_changed = Some(status) != self.last_discord_status;
         let track_changed = current_track != self.last_discord_track;
 
-        if !status_changed && !track_changed {
+        let refresh_due = status == PlaybackStatus::Playing
+            && self.last_discord_update.is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(5));
+        if !status_changed && !track_changed && !refresh_due {
             return;
         }
 
         match status {
-            PlaybackStatus::Stopped => {
+            PlaybackStatus::Stopped | PlaybackStatus::Paused => {
                 self.discord.clear_activity();
             }
-            PlaybackStatus::Playing | PlaybackStatus::Paused => {
+            PlaybackStatus::Playing => {
                 let title = metadata.as_ref()
                     .and_then(|m| m.title.clone())
                     .or_else(|| current_track.as_ref()
@@ -2670,6 +2685,7 @@ impl App {
             }
         }
 
+        self.last_discord_update = Some(std::time::Instant::now());
         self.last_discord_status = Some(status);
         self.last_discord_track = current_track;
     }

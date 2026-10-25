@@ -11,6 +11,8 @@ pub struct AppConfig {
     pub theme: String,
     pub show_hidden: bool,
     pub auto_resume: bool,
+    #[serde(default = "auto_update_default")]
+    pub auto_update: bool,
     #[serde(default)]
     pub shuffle: bool,
     #[serde(default)]
@@ -19,7 +21,7 @@ pub struct AppConfig {
     pub visualizer_mode: VisualizerMode,
     #[serde(default = "default_visualizer_decay")]
     pub visualizer_decay: f32,
-    // ID de la app de Discord para el Rich Presence — si no lo pones, no hay status
+    // Optional Discord application ID override; None uses the built-in Stash application.
     #[serde(default)]
     pub discord_app_id: Option<u64>,
     #[serde(default)]
@@ -30,6 +32,8 @@ fn default_visualizer_decay() -> f32 {
     0.88
 }
 
+fn auto_update_default() -> bool { true }
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -38,6 +42,7 @@ impl Default for AppConfig {
             theme: "default".to_string(),
             show_hidden: false,
             auto_resume: true,
+            auto_update: true,
             shuffle: false,
             repeat: RepeatMode::Off,
             visualizer_mode: VisualizerMode::Spectrum,
@@ -104,4 +109,18 @@ pub fn resolve_path(path_str: &str) -> PathBuf {
             return home.join(&path_str[2..]);
         }
     PathBuf::from(path_str)
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::AppConfig;
+
+    #[test]
+    fn old_configs_enable_automatic_updates_and_opt_out_is_preserved() {
+        let mut old = serde_json::to_value(AppConfig::default()).unwrap();
+        old.as_object_mut().unwrap().remove("auto_update");
+        assert!(serde_json::from_value::<AppConfig>(old.clone()).unwrap().auto_update);
+        old["auto_update"] = false.into();
+        assert!(!serde_json::from_value::<AppConfig>(old).unwrap().auto_update);
+    }
 }

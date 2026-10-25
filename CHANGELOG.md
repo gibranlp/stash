@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.0 — 2026-10-25
+
+- Automatically install newer stable GitHub releases in the background, with periodic checks, retryable errors, and update status on every screen. Add `auto_update: false` for manual confirmation.
+- Select actual uploaded release assets, verify size and SHA-256, stream downloads to temporary files, and replace the executable atomically. Preserve the installed copy when verification fails and prevent duplicate updates before restart.
+
+- Fall back to streaming FFmpeg decoding for unsupported audio, including WebM/Opus files named `.mp3`; preserve seeking and stop decoder processes when playback ends. Recognize `.opus` files as audio.
+
+- Improve lyrics searches with cleaned titles, main-artist variants, artist/title filename parsing, and broader fallback queries.
+- Reject unrelated artists and substring title matches; use plain lyrics when a matching edit has different timing.
+- Cache successful online lyrics, inspect all embedded tag blocks, and cancel obsolete searches after skipping a track.
+- Recover from exact-lookup errors, bound network requests, and respect lyrics-service rate limits.
+
+- Make Discord/Vesktop “Listening to Stash” reconnect reliably, retaining the current song while the client is offline.
+- Refresh song metadata and progress after seeking, and clear activity on pause, stop, or exit.
+- Discover additional IPC sockets, including Vesktop Flatpak and temporary-directory sockets; skip stale endpoints.
+- Validate Discord acknowledgements and handle IPC pings without blocking playback.
+
 ## 0.7.1 — 2026-10-08
 
 - Keep Linux MPRIS metadata and artwork responsive during playback updates.

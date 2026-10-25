@@ -1174,13 +1174,13 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let help_bar = Paragraph::new(Line::from(help_bar_spans));
     f.render_widget(help_bar, chunks[3]);
 
-    if !show_player_and_vis {
-        let update_state = app.update.lock().unwrap().clone();
+    let update_state = app.update.lock().unwrap().clone();
+    if !show_player_and_vis || !matches!(update_state, crate::updater::UpdateProgress::Idle) {
         let sep_line = match update_state {
-            crate::updater::UpdateProgress::Available { ref version, .. } => Line::from(vec![
+            crate::updater::UpdateProgress::Available { ref release } => Line::from(vec![
                 Span::styled("─── ", Style::default().fg(crate::theme::current().muted)),
                 Span::styled(
-                    format!("New version {} available ", version),
+                    format!("New version {} available ", release.version),
                     Style::default().fg(crate::theme::current().warning),
                 ),
                 Span::styled(" U ", Style::default().fg(crate::theme::current().background).bg(crate::theme::current().warning)),
@@ -1224,11 +1224,15 @@ pub fn render(f: &mut Frame, app: &mut App) {
             crate::updater::UpdateProgress::Error(ref e) => Line::from(vec![
                 Span::styled("─── ", Style::default().fg(crate::theme::current().muted)),
                 Span::styled(
-                    format!("Update failed: {} ", e),
+                    format!("Update failed (U to retry): {} ", e),
                     Style::default().fg(crate::theme::current().error),
                 ),
                 Span::styled("───", Style::default().fg(crate::theme::current().muted)),
             ]),
+            crate::updater::UpdateProgress::Checking => Line::from(Span::styled(
+                "─── Checking GitHub for updates... ───",
+                Style::default().fg(crate::theme::current().muted),
+            )),
             _ => {
                 if let Some((ref msg, _)) = app.notification {
                     let (icon, color) = if msg.starts_with("Already") {
@@ -1248,7 +1252,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 }
             }
         };
-        f.render_widget(Paragraph::new(sep_line), chunks[2]);
+        let update_area = if show_player_and_vis { chunks[3] } else { chunks[2] };
+        f.render_widget(Paragraph::new(sep_line), update_area);
     }
 
     // Los overlays/diálogos van siempre al último para que queden encima de todo
@@ -1273,7 +1278,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         render_manage_folders_popup(f, app);
     } else if app.input_mode == InputMode::ConfirmUpdate {
         let version = match &*app.update.lock().unwrap() {
-            crate::updater::UpdateProgress::Available { version, .. } => version.clone(),
+            crate::updater::UpdateProgress::Available { release } => release.version.clone(),
             _ => "?".to_string(),
         };
         render_confirm_popup(f, " Update Available ", &format!("Update to {} now? (y/n)", version));
@@ -1945,7 +1950,7 @@ fn render_help_popup(f: &mut Frame, scroll: u16) {
         Line::from(vec![k("  Esc / q           "), d("Back")]),
         Line::from(""),
         Line::from(h("── General ────────────────────────────────────────────────")),
-        Line::from(vec![k("  U                 "), d("Apply pending self-update (shown in title bar)")]),
+        Line::from(vec![k("  U                 "), d("Check/retry updates or apply a pending manual update")]),
         Line::from(vec![k("  ?                 "), d("Toggle this help  —  j / k or ↑↓ to scroll")]),
         Line::from(vec![k("  Esc               "), d("Close dialog / cancel")]),
         Line::from(vec![k("  q / Ctrl+C        "), d("Quit")]),

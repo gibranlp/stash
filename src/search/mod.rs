@@ -102,7 +102,7 @@ pub fn matches_audio_extension(path: &Path) -> bool {
         }
         matches!(
             ext.as_str(),
-            "mp3" | "flac" | "wav" | "ogg" | "m4a" | "aac" | "mp4" | "aiff" | "aif"
+            "mp3" | "flac" | "wav" | "ogg" | "opus" | "m4a" | "aac" | "mp4" | "aiff" | "aif"
         )
     } else {
         false

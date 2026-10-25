@@ -1,11 +1,13 @@
-use std::fs::File;
-use std::io::BufReader;
+mod lyrics;
+mod decoder;
+use lyrics::{clean_filename_title, fetch_lyrics_online, load_lyrics, non_empty_lyrics};
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
-use rodio::{Decoder, OutputStream, Sink, Source};
+use rodio::{OutputStream, Sink, Source};
 use lofty::prelude::*;
 use lofty::probe::Probe;
 use crate::models::{AudioMetadata, LyricsState, PlaybackStatus, RepeatMode};
@@ -123,8 +125,7 @@ impl AudioEngine {
                                 let handle = stream_handle.as_ref()
                                     .ok_or_else(|| "No audio output device is available".to_string())?;
                                 let new_sink = Sink::try_new(handle).map_err(|e| e.to_string())?;
-                                let file = File::open(&path).map_err(|e| e.to_string())?;
-                                let source = Decoder::new(BufReader::new(file)).map_err(|e| e.to_string())?;
+                                let source = decoder::open(&path)?;
                                 Ok((new_sink, source))
                             })();
                             let source = match prepared {
@@ -198,8 +199,8 @@ impl AudioEngine {
 
                                 if let Ok(tagged_file) = Probe::open(&bg_path).and_then(|p| p.read()) {
                                     if let Some(tag) = tagged_file.primary_tag().or(tagged_file.first_tag()) {
-                                        title = tag.title().map(|s| s.to_string());
-                                        artist = tag.artist().map(|s| s.to_string());
+                                        title = tag.title().filter(|s| !s.trim().is_empty()).map(|s| s.to_string());
+                                        artist = tag.artist().filter(|s| !s.trim().is_empty()).map(|s| s.to_string());
                                         album = tag.album().map(|s| s.to_string());
                                         genre = tag.genre().map(|s| s.to_string());
                                         track = tag.track();
@@ -207,10 +208,12 @@ impl AudioEngine {
 
                                         // Si no encontramos letra en disco, checamos si viene
                                         // embebida en el tag del archivo
-                                        if lyrics.is_none()
-                                            && let Some(embedded) = tag.get_string(&lofty::tag::ItemKey::Lyrics) {
-                                                lyrics = non_empty_lyrics(embedded);
-                                            }
+                                        if lyrics.is_none() {
+                                            lyrics = tagged_file.tags().iter().find_map(|tag| {
+                                                tag.get_string(&lofty::tag::ItemKey::Lyrics)
+                                                    .and_then(non_empty_lyrics)
+                                            });
+                                        }
                                     }
                                     let properties = tagged_file.properties();
                                     let lofty_dur = properties.duration().as_secs();
@@ -266,7 +269,8 @@ impl AudioEngine {
                                             t,
                                             artist.as_deref(),
                                             album.as_deref(),
-                                            duration_secs,
+                                            duration_secs.or(decoder_duration),
+                                            || bg_state.lock().unwrap().current_track.as_deref() == Some(&bg_path),
                                         );
                                         let mut st = bg_state.lock().unwrap();
                                         if st.current_track.as_deref() == Some(&bg_path) {
@@ -672,271 +676,6 @@ fn fft(input: &mut [Complex]) {
             }
         }
         width *= 2;
-    }
-}
-
-// Busca letra en disco junto al archivo de audio — primero .lrc, luego .txt
-fn load_lyrics(path: &std::path::Path) -> Option<String> {
-    for extension in ["lrc", "LRC", "txt", "TXT"] {
-        let lyrics_path = path.with_extension(extension);
-        if let Ok(content) = std::fs::read_to_string(&lyrics_path)
-            && let Some(content) = non_empty_lyrics(&content)
-        {
-            return Some(content);
-        }
-    }
-    None
-}
-
-fn clean_filename_title(filename: &str) -> String {
-    let trimmed = filename.trim();
-    let without_track_number = trimmed
-        .find(|c: char| !c.is_ascii_digit() && !matches!(c, ' ' | '-' | '_' | '.'))
-        .filter(|&index| index > 0 && index <= 5)
-        .map(|index| &trimmed[index..])
-        .unwrap_or(trimmed);
-    without_track_number
-        .trim_start_matches([' ', '-', '_', '.'])
-        .trim()
-        .to_string()
-}
-
-fn non_empty_lyrics(lyrics: &str) -> Option<String> {
-    let lyrics = lyrics.trim_start_matches('\u{feff}').trim();
-    (!lyrics.is_empty()).then(|| lyrics.to_string())
-}
-
-fn lyrics_from_value(value: &serde_json::Value) -> Option<String> {
-    value
-        .get("syncedLyrics")
-        .and_then(|value| value.as_str())
-        .and_then(non_empty_lyrics)
-        .or_else(|| {
-            value
-                .get("plainLyrics")
-                .and_then(|value| value.as_str())
-                .and_then(non_empty_lyrics)
-        })
-}
-
-fn normalized_track_name(value: &str) -> String {
-    let base = value
-        .split(['(', '['])
-        .next()
-        .unwrap_or(value)
-        .to_lowercase();
-    base.chars()
-        .filter(|character| character.is_alphanumeric())
-        .collect()
-}
-
-fn best_search_result(
-    results: &serde_json::Value,
-    title: &str,
-    artist: Option<&str>,
-    duration: Option<u64>,
-) -> Option<String> {
-    let expected_title = normalized_track_name(title);
-    let expected_artist = artist.map(normalized_track_name);
-    if expected_title.is_empty() {
-        return None;
-    }
-
-    results
-        .as_array()?
-        .iter()
-        .filter_map(|result| {
-            let lyrics = lyrics_from_value(result)?;
-            let candidate_title = result
-                .get("trackName")
-                .and_then(|value| value.as_str())
-                .map(normalized_track_name)?;
-
-            let mut score = if candidate_title == expected_title {
-                100
-            } else if candidate_title.contains(&expected_title)
-                || expected_title.contains(&candidate_title)
-            {
-                40
-            } else {
-                return None;
-            };
-
-            if let Some(ref expected_artist) = expected_artist {
-                let candidate_artist = result
-                    .get("artistName")
-                    .and_then(|value| value.as_str())
-                    .map(normalized_track_name)
-                    .unwrap_or_default();
-                if candidate_artist == *expected_artist {
-                    score += 50;
-                } else if !candidate_artist.is_empty()
-                    && (candidate_artist.contains(expected_artist)
-                        || expected_artist.contains(&candidate_artist))
-                {
-                    score += 20;
-                } else {
-                    score -= 30;
-                }
-            }
-
-            if let (Some(expected), Some(candidate)) = (
-                duration,
-                result.get("duration").and_then(|value| value.as_f64()),
-            ) {
-                let difference = (candidate - expected as f64).abs();
-                score += if difference <= 3.0 {
-                    30
-                } else if difference <= 10.0 {
-                    10
-                } else if difference > 30.0 {
-                    -15
-                } else {
-                    0
-                };
-            }
-
-            Some((score, lyrics))
-        })
-        .max_by_key(|(score, _)| *score)
-        .map(|(_, lyrics)| lyrics)
-}
-
-fn friendly_request_error(error: ureq::Error) -> String {
-    match error {
-        ureq::Error::Status(429, _) => {
-            "The lyrics service is busy right now. Please try again in a moment.".to_string()
-        }
-        ureq::Error::Status(code, _) if code >= 500 => {
-            "The lyrics service is temporarily unavailable. Please try again later.".to_string()
-        }
-        ureq::Error::Status(_, _) => {
-            "The lyrics service couldn't complete this request.".to_string()
-        }
-        ureq::Error::Transport(transport) => match transport.kind() {
-            ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed => {
-                "You're offline, so online lyrics couldn't be loaded.".to_string()
-            }
-            ureq::ErrorKind::Io => {
-                "The lyrics lookup timed out. Please try again in a moment.".to_string()
-            }
-            _ => "Online lyrics couldn't be reached right now.".to_string(),
-        },
-    }
-}
-
-fn get_json(agent: &ureq::Agent, url: &str) -> Result<Option<serde_json::Value>, String> {
-    let response = match agent
-        .get(url)
-        .set(
-            "User-Agent",
-            concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")),
-        )
-        .call()
-    {
-        Ok(response) => response,
-        Err(ureq::Error::Status(404, _)) => return Ok(None),
-        Err(error) => return Err(friendly_request_error(error)),
-    };
-
-    response.into_json().map(Some).map_err(|_| {
-        "The lyrics service sent an unexpected response. Please try again later.".to_string()
-    })
-}
-
-// Consulta primero el endpoint exacto de LRCLIB y, si no encuentra la rola,
-// usa búsqueda para tolerar álbumes, duraciones o sufijos de título distintos.
-fn fetch_lyrics_online(
-    title: &str,
-    artist: Option<&str>,
-    album: Option<&str>,
-    duration: Option<u64>,
-) -> Result<Option<String>, String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(10))
-        .timeout_read(std::time::Duration::from_secs(15))
-        .build();
-
-    let mut url = format!(
-        "https://lrclib.net/api/get?track_name={}",
-        urlencoding::encode(title)
-    );
-    if let Some(a) = artist {
-        url.push_str(&format!("&artist_name={}", urlencoding::encode(a)));
-    }
-    if let Some(al) = album {
-        url.push_str(&format!("&album_name={}", urlencoding::encode(al)));
-    }
-    if let Some(d) = duration {
-        url.push_str(&format!("&duration={}", d));
-    }
-
-    // LRCLIB requires artist_name for exact lookups. Files without an artist tag
-    // can still use the more forgiving search endpoint below.
-    if artist.is_some()
-        && let Some(exact_match) = get_json(&agent, &url)?
-        && let Some(lyrics) = lyrics_from_value(&exact_match)
-    {
-        return Ok(Some(lyrics));
-    }
-
-    let mut search_url = format!(
-        "https://lrclib.net/api/search?track_name={}",
-        urlencoding::encode(title)
-    );
-    if let Some(artist) = artist {
-        search_url.push_str(&format!(
-            "&artist_name={}",
-            urlencoding::encode(artist)
-        ));
-    }
-
-    let Some(search_results) = get_json(&agent, &search_url)? else {
-        return Ok(None);
-    };
-    Ok(best_search_result(&search_results, title, artist, duration))
-}
-
-#[cfg(test)]
-mod lyrics_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn cleans_track_number_from_filename_title() {
-        assert_eq!(clean_filename_title("01 - A Great Song"), "A Great Song");
-        assert_eq!(clean_filename_title("12_song title"), "song title");
-        assert_eq!(clean_filename_title("1985"), "1985");
-    }
-
-    #[test]
-    fn ignores_empty_local_or_remote_lyrics() {
-        assert_eq!(non_empty_lyrics(" \n\t"), None);
-        assert_eq!(non_empty_lyrics("\u{feff}Words\n"), Some("Words".to_string()));
-        assert_eq!(lyrics_from_value(&json!({ "plainLyrics": "" })), None);
-    }
-
-    #[test]
-    fn search_fallback_prefers_matching_artist_and_duration() {
-        let results = json!([
-            {
-                "trackName": "Home",
-                "artistName": "Someone Else",
-                "duration": 180.0,
-                "plainLyrics": "wrong"
-            },
-            {
-                "trackName": "Home (Remastered)",
-                "artistName": "The Band",
-                "duration": 201.5,
-                "plainLyrics": "right"
-            }
-        ]);
-
-        assert_eq!(
-            best_search_result(&results, "Home", Some("The Band"), Some(202)),
-            Some("right".to_string())
-        );
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "stash"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
 authors = ["gibranlp"]
 homepage = "https://gibranlp.dev"
@@ -31,6 +31,9 @@ base64 = "0.21"
 ureq = { version = "2", features = ["json"] }
 urlencoding = "2"
 notify = { version = "6", features = ["macos_fsevent"] }
+semver = "1"
+sha2 = "0.10"
+tempfile = "3.20"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9"

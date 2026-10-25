@@ -2,101 +2,151 @@ pub const DEFAULT_APP_ID: u64 = 1524097992859320521;
 
 #[cfg(unix)]
 mod imp {
+    use serde_json::{Value, json};
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-    use std::thread;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-    use serde_json::json;
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    pub enum DiscordCommand {
-        SetActivity {
-            title: String,
-            artist: String,
-            elapsed_secs: u64,
-            duration_secs: u64,
-        },
-        ClearActivity,
-    }
+    const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
     pub struct DiscordPresence {
-        tx: Option<Sender<DiscordCommand>>,
+        tx: Option<Sender<Value>>,
+        worker: Option<JoinHandle<()>>,
     }
 
     impl DiscordPresence {
         pub fn new(client_id: u64) -> Self {
             let (tx, rx) = mpsc::channel();
-            thread::Builder::new()
+            let worker = thread::Builder::new()
                 .name("discord-rpc".to_string())
-                .spawn(move || run_discord_thread(client_id, rx))
+                .spawn(move || run_discord_thread(client_id, rx, socket_paths(), RETRY_INTERVAL))
                 .ok();
-            Self { tx: Some(tx) }
-        }
-
-        pub fn set_activity(&self, title: &str, artist: &str, elapsed_secs: u64, duration_secs: u64) {
-            if let Some(ref tx) = self.tx {
-                let _ = tx.send(DiscordCommand::SetActivity {
-                    title: title.to_string(),
-                    artist: artist.to_string(),
-                    elapsed_secs,
-                    duration_secs,
-                });
+            Self {
+                tx: Some(tx),
+                worker,
             }
         }
 
+        pub fn set_activity(
+            &self,
+            title: &str,
+            artist: &str,
+            elapsed_secs: u64,
+            duration_secs: u64,
+        ) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            self.send(activity(title, artist, elapsed_secs, duration_secs, now));
+        }
+
         pub fn clear_activity(&self) {
-            if let Some(ref tx) = self.tx {
-                let _ = tx.send(DiscordCommand::ClearActivity);
+            self.send(Value::Null);
+        }
+
+        fn send(&self, activity: Value) {
+            if let Some(tx) = &self.tx {
+                let _ = tx.send(activity);
             }
         }
     }
 
-    // Hilo que vive aparte y maneja toda la comunicación con Discord.
-    // Si se cae la conexión, reintenta cada 10 segundos sin tronar el resto de la app.
-    fn run_discord_thread(client_id: u64, rx: Receiver<DiscordCommand>) {
-        let mut ipc = DiscordIpc::new(client_id);
-        let mut connected = ipc.connect();
-        let mut reconnect_needed = !connected;
-        let mut next_reconnect = Instant::now() + Duration::from_secs(10);
+    impl Drop for DiscordPresence {
+        fn drop(&mut self) {
+            self.tx.take();
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
 
-        loop {
-            if reconnect_needed && Instant::now() >= next_reconnect {
-                connected = ipc.connect();
-                reconnect_needed = !connected;
-                if reconnect_needed {
-                    next_reconnect = Instant::now() + Duration::from_secs(10);
+    fn activity(title: &str, artist: &str, elapsed: u64, duration: u64, now: u64) -> Value {
+        // Store absolute timestamps so reconnecting does not reset the progress bar.
+        let start = now.saturating_sub(elapsed);
+        let mut timestamps = json!({ "start": start });
+        if duration > 0 {
+            timestamps["end"] = json!(start.saturating_add(duration));
+        }
+        let mut result = json!({
+            "type": 2,
+            "details": truncate(title),
+            "timestamps": timestamps
+        });
+        if !artist.trim().is_empty() {
+            result["state"] = json!(truncate(artist));
+        }
+        result
+    }
+
+    fn truncate(value: &str) -> String {
+        // Discord limits rich presence text to 128 characters.
+        value.chars().take(128).collect()
+    }
+
+    fn socket_paths() -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        for key in ["XDG_RUNTIME_DIR", "TMPDIR", "TMP", "TEMP"] {
+            if let Some(path) = std::env::var_os(key).filter(|p| !p.is_empty()) {
+                roots.push(PathBuf::from(path));
+            }
+        }
+        roots.push(PathBuf::from("/tmp"));
+        let mut paths = Vec::new();
+        for root in roots {
+            for subdir in [
+                "",
+                "snap.discord",
+                "app/com.discordapp.Discord",
+                "app/com.discordapp.DiscordCanary",
+                "app/dev.vencord.Vesktop",
+            ] {
+                for index in 0..10 {
+                    let path = root.join(subdir).join(format!("discord-ipc-{index}"));
+                    if !paths.contains(&path) {
+                        paths.push(path);
+                    }
                 }
             }
+        }
+        paths
+    }
 
-            match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(cmd) => {
-                    // Jalamos todos los comandos pendientes y nos quedamos solo con el más nuevo,
-                    // pa' no mandarle a Discord info ya stale si el usuario anduvo skipeando rolas.
-                    let mut latest = cmd;
-                    while let Ok(newer) = rx.try_recv() {
-                        latest = newer;
-                    }
-
-                    if !connected {
-                        continue;
-                    }
-
-                    let ok = match &latest {
-                        DiscordCommand::SetActivity { title, artist, elapsed_secs, duration_secs } => {
-                            ipc.set_activity(title, artist, *elapsed_secs, *duration_secs)
-                        }
-                        DiscordCommand::ClearActivity => ipc.clear_activity(),
-                    };
-
-                    if !ok {
-                        connected = false;
-                        reconnect_needed = true;
-                        next_reconnect = Instant::now() + Duration::from_secs(10);
+    fn run_discord_thread(
+        client_id: u64,
+        rx: Receiver<Value>,
+        paths: Vec<PathBuf>,
+        interval: Duration,
+    ) {
+        let mut ipc = DiscordIpc::new(client_id);
+        let mut latest = Value::Null;
+        loop {
+            match rx.recv_timeout(interval) {
+                Ok(next) => {
+                    latest = next;
+                    // Publish only the newest state after rapid skips or pause/resume.
+                    while let Ok(next) = rx.try_recv() {
+                        latest = next;
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    if ipc.socket.is_some() {
+                        ipc.set_activity(Value::Null);
+                    }
+                    break;
+                }
+            }
+            // Keep the latest state while offline and replay it after reconnecting.
+            // Periodic acknowledgements also detect a client restart during the same song.
+            if ipc.socket.is_none() && !ipc.connect(&paths) {
+                continue;
+            }
+            if !ipc.set_activity(latest.clone()) {
+                ipc.socket = None;
             }
         }
     }
@@ -104,7 +154,6 @@ mod imp {
     struct DiscordIpc {
         client_id: u64,
         socket: Option<UnixStream>,
-        pid: u32,
         nonce: u32,
     }
 
@@ -113,141 +162,211 @@ mod imp {
             Self {
                 client_id,
                 socket: None,
-                pid: std::process::id(),
                 nonce: 0,
             }
         }
 
-        // Discord puede estar instalado de varias formas en Linux, así que checamos
-        // los sockets en el orden más común: instalación normal, snap, flatpak, flatpak canary.
-        fn find_socket() -> Option<PathBuf> {
-            let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok()?;
-            for i in 0..10 {
-                let p = PathBuf::from(format!("{runtime_dir}/discord-ipc-{i}"));
-                if p.exists() {
-                    return Some(p);
+        fn connect(&mut self, paths: &[PathBuf]) -> bool {
+            // Try all candidates: a stale socket must not hide a working Vesktop socket.
+            for path in paths {
+                let Ok(stream) = UnixStream::connect(path) else {
+                    continue;
+                };
+                let timeout = Some(Duration::from_millis(500));
+                if stream.set_read_timeout(timeout).is_err()
+                    || stream.set_write_timeout(timeout).is_err()
+                {
+                    continue;
                 }
+                self.socket = Some(stream);
+                let handshake = json!({ "v": 1, "client_id": self.client_id.to_string() });
+                if self.send_frame(0, &handshake)
+                    && self
+                        .recv_frame()
+                        .is_some_and(|value| value["evt"] == "READY")
+                {
+                    return true;
+                }
+                self.socket = None;
             }
-            let p = PathBuf::from(format!("{runtime_dir}/snap.discord/discord-ipc-0"));
-            if p.exists() {
-                return Some(p);
-            }
-            let p = PathBuf::from(format!("{runtime_dir}/app/com.discordapp.Discord/discord-ipc-0"));
-            if p.exists() {
-                return Some(p);
-            }
-            let p = PathBuf::from(format!("{runtime_dir}/app/com.discordapp.DiscordCanary/discord-ipc-0"));
-            if p.exists() {
-                return Some(p);
+            false
+        }
+
+        fn send_frame(&mut self, opcode: u32, payload: &Value) -> bool {
+            let Some(socket) = self.socket.as_mut() else {
+                return false;
+            };
+            let data = payload.to_string();
+            let mut frame = Vec::with_capacity(8 + data.len());
+            frame.extend_from_slice(&opcode.to_le_bytes());
+            frame.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            frame.extend_from_slice(data.as_bytes());
+            socket.write_all(&frame).is_ok()
+        }
+
+        fn recv_frame(&mut self) -> Option<Value> {
+            // Handle IPC ping frames while waiting for READY or a command acknowledgement.
+            for _ in 0..8 {
+                let socket = self.socket.as_mut()?;
+                let mut header = [0u8; 8];
+                socket.read_exact(&mut header).ok()?;
+                let opcode = u32::from_le_bytes(header[..4].try_into().ok()?);
+                let length = u32::from_le_bytes(header[4..].try_into().ok()?) as usize;
+                if length > 65536 {
+                    return None;
+                }
+                let mut data = vec![0u8; length];
+                socket.read_exact(&mut data).ok()?;
+                if opcode == 3 {
+                    // Pong must echo the original bytes, even if the ping isn't JSON.
+                    header[..4].copy_from_slice(&4u32.to_le_bytes());
+                    socket.write_all(&header).ok()?;
+                    socket.write_all(&data).ok()?;
+                    continue;
+                }
+                if opcode != 1 {
+                    return None;
+                }
+                return serde_json::from_slice(&data).ok();
             }
             None
         }
 
-        // Conecta al socket, manda el handshake inicial y espera la respuesta de Discord.
-        // Si algo falla en cualquier paso, limpiamos el socket y devolvemos false.
-        fn connect(&mut self) -> bool {
-            let path = match Self::find_socket() {
-                Some(p) => p,
-                None => return false,
-            };
-
-            let stream = match UnixStream::connect(&path) {
-                Ok(s) => s,
-                Err(_) => return false,
-            };
-            stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
-            self.socket = Some(stream);
-
-            let handshake = json!({ "v": 1, "client_id": self.client_id.to_string() });
-            if !self.send_frame(0, &handshake.to_string()) {
-                self.socket = None;
-                return false;
-            }
-
-            match self.recv_frame() {
-                Some(_) => true,
-                None => {
-                    self.socket = None;
-                    self.// Drenamos el ACK que manda Discord pa' no llenar el buffer; si no llega, no importa.
-                    recv_frame();
-                    false
-                }
-            }
-        }
-
-        // El protocolo IPC de Discord usa frames con header de 8 bytes:
-        // 4 bytes opcode (little-endian) + 4 bytes longitud del payload.
-        fn send_frame(&mut self, opcode: u32, json_str: &str) -> bool {
-            let socket = match self.socket.as_mut() {
-                Some(s) => s,
-                None => return false,
-            };
-            let data = json_str.as_bytes();
-            let mut buf = Vec::with_capacity(8 + data.len());
-            buf.extend_from_slice(&opcode.to_le_bytes());
-            buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
-            buf.extend_from_slice(data);
-            if socket.write_all(&buf).is_err() {
-                self.socket = None;
-                return false;
-            }
-            true
-        }
-
-        fn recv_frame(&mut self) -> Option<serde_json::Value> {
-            let socket = self.socket.as_mut()?;
-            let mut header = [0u8; 8];
-            socket.read_exact(&mut header).ok()?;
-            let length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-            if length > 65536 {
-                return None;
-            }
-            let mut buf = vec![0u8; length];
-            socket.read_exact(&mut buf).ok()?;
-            serde_json::from_slice(&buf).ok()
-        }
-
-        fn send_command(&mut self, activity_args: serde_json::Value) -> bool {
-            self.nonce += 1;
+        fn set_activity(&mut self, activity: Value) -> bool {
+            self.nonce = self.nonce.wrapping_add(1);
+            let nonce = self.nonce.to_string();
             let payload = json!({
                 "cmd": "SET_ACTIVITY",
-                "args": activity_args,
-                "nonce": self.nonce.to_string()
+                "args": { "pid": std::process::id(), "activity": activity },
+                "nonce": nonce
             });
-            if !self.send_frame(1, &payload.to_string()) {
+            if !self.send_frame(1, &payload) {
                 return false;
             }
-            // Drenamos el ACK que manda Discord pa' no llenar el buffer; si no llega, no importa.
-            self.recv_frame();
-            true
-        }
-
-        // Calculamos el timestamp de inicio restándole al tiempo actual los segundos ya reproducidos,
-        // así Discord muestra la barra de progreso bien alineada con lo que va sonando.
-        fn set_activity(&mut self, title: &str, artist: &str, elapsed_secs: u64, duration_secs: u64) -> bool {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let start_ts = now.saturating_sub(elapsed_secs);
-
-            let mut timestamps = json!({ "start": start_ts });
-            if duration_secs > 0 {
-                timestamps["end"] = json!(start_ts + duration_secs);
+            for _ in 0..8 {
+                let Some(reply) = self.recv_frame() else {
+                    return false;
+                };
+                if reply["nonce"] == nonce {
+                    return reply["evt"] != "ERROR" && reply["cmd"] == "SET_ACTIVITY";
+                }
             }
+            false
+        }
+    }
 
-            let activity = json!({
-                "type": 2,
-                "details": title,
-                "state": artist,
-                "timestamps": timestamps
-            });
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::discord::DEFAULT_APP_ID;
+        use std::os::unix::net::UnixListener;
 
-            self.send_command(json!({ "pid": self.pid, "activity": activity }))
+        fn read(stream: &mut UnixStream) -> (u32, Value) {
+            let mut header = [0; 8];
+            stream.read_exact(&mut header).unwrap();
+            let mut data = vec![0; u32::from_le_bytes(header[4..].try_into().unwrap()) as usize];
+            stream.read_exact(&mut data).unwrap();
+            (
+                u32::from_le_bytes(header[..4].try_into().unwrap()),
+                serde_json::from_slice(&data).unwrap(),
+            )
         }
 
-        fn clear_activity(&mut self) -> bool {
-            self.send_command(json!({ "pid": self.pid, "activity": null }))
+        fn reply(stream: &mut UnixStream, value: Value) {
+            let data = value.to_string();
+            stream.write_all(&1u32.to_le_bytes()).unwrap();
+            stream
+                .write_all(&(data.len() as u32).to_le_bytes())
+                .unwrap();
+            stream.write_all(data.as_bytes()).unwrap();
+        }
+
+        #[test]
+        fn listening_payload_has_track_and_absolute_progress() {
+            let value = activity("Song", "Artist", 30, 180, 1000);
+            assert_eq!(value["type"], 2);
+            assert_eq!(value["details"], "Song");
+            assert_eq!(value["state"], "Artist");
+            assert_eq!(value["timestamps"], json!({"start": 970, "end": 1150}));
+            let unknown = activity(&"é".repeat(150), "", 0, 0, 1000);
+            assert_eq!(unknown["details"].as_str().unwrap().chars().count(), 128);
+            assert!(unknown.get("state").is_none());
+            assert!(unknown["timestamps"].get("end").is_none());
+        }
+
+        #[test]
+        fn handles_ping_and_rejects_error_acknowledgements() {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let worker = thread::spawn(move || {
+                let (_, command) = read(&mut server);
+                server.write_all(&3u32.to_le_bytes()).unwrap();
+                server.write_all(&4u32.to_le_bytes()).unwrap();
+                server.write_all(b"ping").unwrap();
+                let mut pong = [0; 12];
+                server.read_exact(&mut pong).unwrap();
+                assert_eq!(&pong[..4], &4u32.to_le_bytes());
+                assert_eq!(&pong[8..], b"ping");
+                reply(
+                    &mut server,
+                    json!({"cmd": "SET_ACTIVITY", "evt": "ERROR", "nonce": command["nonce"]}),
+                );
+            });
+            let mut ipc = DiscordIpc::new(DEFAULT_APP_ID);
+            ipc.socket = Some(client);
+            assert!(!ipc.set_activity(activity("Song", "Artist", 0, 180, 1000)));
+            worker.join().unwrap();
+        }
+
+        #[test]
+        fn replays_offline_track_after_reconnect_and_clears_on_exit() {
+            let root = std::env::temp_dir().join(format!("stash-rpc-test-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("discord-ipc-1");
+            let (tx, rx) = mpsc::channel();
+            let paths = vec![root.join("discord-ipc-0"), path.clone()];
+            let worker = thread::spawn(move || {
+                run_discord_thread(DEFAULT_APP_ID, rx, paths, Duration::from_millis(30))
+            });
+            let expected = activity("Song", "Artist", 30, 180, 1000);
+            tx.send(expected.clone()).unwrap();
+            thread::sleep(Duration::from_millis(80));
+            let listener = UnixListener::bind(&path).unwrap();
+            // Two connections, without sending another song command.
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let (opcode, handshake) = read(&mut socket);
+                assert_eq!(opcode, 0);
+                assert_eq!(handshake["client_id"], DEFAULT_APP_ID.to_string());
+                reply(&mut socket, json!({"cmd": "DISPATCH", "evt": "READY"}));
+                let (_, command) = read(&mut socket);
+                assert_eq!(command["args"]["activity"], expected);
+                reply(
+                    &mut socket,
+                    json!({"cmd": "SET_ACTIVITY", "evt": null, "nonce": command["nonce"]}),
+                );
+                if attempt == 1 {
+                    drop(tx);
+                    let (_, clear) = read(&mut socket);
+                    assert!(clear["args"]["activity"].is_null());
+                    reply(
+                        &mut socket,
+                        json!({"cmd": "SET_ACTIVITY", "evt": null, "nonce": clear["nonce"]}),
+                    );
+                    break;
+                }
+            }
+            worker.join().unwrap();
+            std::fs::remove_file(path).unwrap();
+            std::fs::remove_dir(root).unwrap();
         }
     }
 }
@@ -263,8 +382,13 @@ impl DiscordPresence {
     pub fn new(_client_id: u64) -> Self {
         Self
     }
-
-    pub fn set_activity(&self, _title: &str, _artist: &str, _elapsed_secs: u64, _duration_secs: u64) {}
-
+    pub fn set_activity(
+        &self,
+        _title: &str,
+        _artist: &str,
+        _elapsed_secs: u64,
+        _duration_secs: u64,
+    ) {
+    }
     pub fn clear_activity(&self) {}
 }

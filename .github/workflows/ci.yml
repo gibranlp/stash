@@ -24,7 +24,7 @@ jobs:
             target
           key: ci-cargo-${{ hashFiles('**/Cargo.lock') }}
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libdbus-1-dev pkg-config playerctl
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libdbus-1-dev pkg-config playerctl ffmpeg
       - name: Test
         run: cargo test --locked
       - name: Test MPRIS metadata delivery
