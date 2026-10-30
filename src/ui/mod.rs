@@ -96,7 +96,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // helper below (many take no `App` at all — popups, the help screen, ...) can
     // read it via `crate::theme::current()`.
     crate::theme::set_current(app.theme);
-    let show_player_and_vis = app.screen == AppScreen::Queue;
+    let show_player_and_vis = app.shows_player();
     let show_header = app.screen == AppScreen::Browser;
 
     // El layout cambia dependiendo de si estamos en la pantalla del queue o no
@@ -132,16 +132,25 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if show_header {
         let current_dir_str = app.browser.current_dir.to_string_lossy();
         let header_text = format!(" Stash | Path: {} ", current_dir_str);
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled(&header_text, Style::default().fg(crate::theme::current().warning).add_modifier(Modifier::BOLD)),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(crate::theme::current().muted)),
+        let header_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(crate::theme::current().muted));
+        let version = format!(" v{} ", env!("CARGO_PKG_VERSION"));
+        // The installed version stays visible on the right; a long path is cut short instead.
+        let header_parts = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(version.width() as u16)])
+            .split(header_block.inner(chunks[0]));
+        f.render_widget(header_block, chunks[0]);
+        f.render_widget(
+            Paragraph::new(Span::styled(&header_text, Style::default().fg(crate::theme::current().warning).add_modifier(Modifier::BOLD))),
+            header_parts[0],
         );
-        f.render_widget(header, chunks[0]);
+        f.render_widget(
+            Paragraph::new(Span::styled(version, Style::default().fg(crate::theme::current().muted))),
+            header_parts[1],
+        );
     }
 
     f.render_widget(Clear, chunks[1]);
@@ -815,12 +824,20 @@ pub fn render(f: &mut Frame, app: &mut App) {
         AppScreen::Healer => {
             render_healer(f, app, chunks[1]);
         }
+        AppScreen::Radio => {
+            vis_rect = Some(render_radio(f, app, chunks[1]));
+        }
     }
 
     if show_player_and_vis {
         let audio_state = app.audio.shared_state.lock().unwrap().clone();
 
-        let now_playing_title = if let Some(ref meta) = audio_state.metadata {
+        let now_playing_title = if let Some(ref radio) = audio_state.radio {
+            match radio.songs.first() {
+                Some(song) => format!("{} — {} - {}", radio.station.name, song.artist, song.title),
+                None => radio.station.name.to_string(),
+            }
+        } else if let Some(ref meta) = audio_state.metadata {
             let title = meta.title.as_deref().unwrap_or("Unknown Track");
             let artist = meta.artist.as_deref().unwrap_or("Unknown Artist");
             format!("{} - {}", artist, title)
@@ -830,10 +847,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
             "Stopped".to_string()
         };
 
-        let play_status_label = match audio_state.status {
-            PlaybackStatus::Playing => "[NOW]",
-            PlaybackStatus::Paused => "[PAUSED]",
-            PlaybackStatus::Stopped => "[STOPPED]",
+        let play_status_label = match (audio_state.status, &audio_state.radio) {
+            (_, Some(radio)) if radio.connecting => "[TUNING]",
+            (PlaybackStatus::Playing, Some(_)) => "[LIVE]",
+            (PlaybackStatus::Playing, None) => "[NOW]",
+            (PlaybackStatus::Paused, _) => "[PAUSED]",
+            (PlaybackStatus::Stopped, _) => "[STOPPED]",
         };
 
         let elapsed = format_time(audio_state.elapsed_secs);
@@ -852,19 +871,27 @@ pub fn render(f: &mut Frame, app: &mut App) {
             "-".repeat(bar_width.saturating_sub(filled_width))
         );
 
-        let status_title_line = format!(
-            " {}  {}  (repeat: {}, shuffle: {})",
-            play_status_label,
-            now_playing_title,
-            match audio_state.repeat {
-                RepeatMode::Off => "off",
-                RepeatMode::All => "all",
-                RepeatMode::One => "1",
-            },
-            if audio_state.shuffle { "on" } else { "off" }
-        );
-
-        let progress_line = format!(" {} {} / {} ", progress_bar_str, elapsed, duration);
+        let (status_title_line, progress_line) = if let Some(ref radio) = audio_state.radio {
+            (
+                format!(" {}  {}  (radio: {})", play_status_label, now_playing_title, radio.station.genre.to_lowercase()),
+                format!(" ● LIVE  {} tuned in  ·  SomaFM · MP3 128 kbps ", elapsed),
+            )
+        } else {
+            (
+                format!(
+                    " {}  {}  (repeat: {}, shuffle: {})",
+                    play_status_label,
+                    now_playing_title,
+                    match audio_state.repeat {
+                        RepeatMode::Off => "off",
+                        RepeatMode::All => "all",
+                        RepeatMode::One => "1",
+                    },
+                    if audio_state.shuffle { "on" } else { "off" }
+                ),
+                format!(" {} {} / {} ", progress_bar_str, elapsed, duration),
+            )
+        };
 
         let info_line = format!(
             " Volume: {}%    Selected: {}    Queue: {}",
@@ -1123,6 +1150,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             ik(" 2 "),
             ik(" 3 "),
             ik(" 4 "),
+            ik(" 5 "),
             sep(),
             ck(" Space "), cl(" Select "),
             ck(" q "), cl(" Queue "),
@@ -1136,6 +1164,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             ak(" 2 "), al(" Player "),
             ik(" 3 "),
             ik(" 4 "),
+            ik(" 5 "),
             sep(),
             ck(" Space "), cl(" Play/Pause "),
             ck(" n/b "), cl(" Next/Prev "),
@@ -1149,6 +1178,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             ik(" 2 "),
             ak(" 3 "), al(" Library "),
             ik(" 4 "),
+            ik(" 5 "),
             sep(),
             ck(" Tab "), cl(" Panels "),
             ck(" Enter "), cl(" Play All "),
@@ -1162,11 +1192,26 @@ pub fn render(f: &mut Frame, app: &mut App) {
             ik(" 2 "),
             ik(" 3 "),
             ak(" 4 "), al(" Healer "),
+            ik(" 5 "),
             sep(),
             ck(" s "), cl(" Scan "),
             ck(" l "), cl(" Lookup "),
             ck(" Enter "), cl(" Apply "),
             ck(" Esc "), cl(" Back "),
+            ck(" ? "), cl(" Help "),
+        ],
+        AppScreen::Radio => vec![
+            ik(" 1 "),
+            ik(" 2 "),
+            ik(" 3 "),
+            ik(" 4 "),
+            ak(" 5 "), al(" Radio "),
+            sep(),
+            ck(" Enter "), cl(" Tune In "),
+            ck(" Space "), cl(" Play/Pause "),
+            ck(" n/b "), cl(" Next/Prev "),
+            ck(" f "), cl(" Favorite "),
+            ck(" / "), cl(" Search "),
             ck(" ? "), cl(" Help "),
         ],
     };
@@ -1186,40 +1231,6 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 Span::styled(" U ", Style::default().fg(crate::theme::current().background).bg(crate::theme::current().warning)),
                 Span::styled(" Update ", Style::default().fg(crate::theme::current().warning)),
                 Span::styled(" ───", Style::default().fg(crate::theme::current().muted)),
-            ]),
-            crate::updater::UpdateProgress::Downloading { ref version, downloaded, total } => {
-                let pct = downloaded.saturating_mul(100).checked_div(total).unwrap_or(0);
-                let bar_width: usize = 20;
-                let filled = (pct as usize * bar_width / 100).min(bar_width);
-                let bar = format!(
-                    "{}{}",
-                    "█".repeat(filled),
-                    "░".repeat(bar_width - filled)
-                );
-                Line::from(vec![
-                    Span::styled("─── ", Style::default().fg(crate::theme::current().muted)),
-                    Span::styled(
-                        format!("Downloading {} ", version),
-                        Style::default().fg(crate::theme::current().accent),
-                    ),
-                    Span::styled(bar, Style::default().fg(crate::theme::current().accent)),
-                    Span::styled(
-                        format!(" {}% ───", pct),
-                        Style::default().fg(crate::theme::current().accent),
-                    ),
-                ])
-            }
-            crate::updater::UpdateProgress::Replacing => Line::from(Span::styled(
-                "─── Replacing binary... ───",
-                Style::default().fg(crate::theme::current().accent),
-            )),
-            crate::updater::UpdateProgress::Done { ref version } => Line::from(vec![
-                Span::styled("─── ", Style::default().fg(crate::theme::current().muted)),
-                Span::styled(
-                    format!("Updated to {}! Restart stash to apply. ", version),
-                    Style::default().fg(crate::theme::current().success),
-                ),
-                Span::styled("───", Style::default().fg(crate::theme::current().muted)),
             ]),
             crate::updater::UpdateProgress::Error(ref e) => Line::from(vec![
                 Span::styled("─── ", Style::default().fg(crate::theme::current().muted)),
@@ -1281,7 +1292,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             crate::updater::UpdateProgress::Available { release } => release.version.clone(),
             _ => "?".to_string(),
         };
-        render_confirm_popup(f, " Update Available ", &format!("Update to {} now? (y/n)", version));
+        render_update_popup(f, &version);
     } else if app.screen == AppScreen::Library && app.library.bulk_tag_editor.is_some() {
         render_bulk_tag_editor_popup(f, app);
     } else if app.input_mode == InputMode::TagEdit || (app.screen == AppScreen::Library && app.library.tag_editor.is_some()) {
@@ -1674,6 +1685,35 @@ fn render_confirm_popup(f: &mut Frame, title: &str, label: &str) {
     f.render_widget(confirm_para, area);
 }
 
+fn render_update_popup(f: &mut Frame, version: &str) {
+    let area = centered_rect_fixed(60, 9, f.size());
+    f.render_widget(Clear, area);
+    let theme = crate::theme::current();
+    let key = |k: &'static str| Span::styled(k, Style::default().fg(theme.background).bg(theme.accent));
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(" Stash {version} is available (you have v{}).", env!("CARGO_PKG_VERSION")),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(" Stash will close, install the update and reopen."),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw(" "), key(" Y "), Span::raw(" Update now    "),
+            key(" N "), Span::raw(" Later (press U to update anytime)"),
+        ]),
+    ];
+    let popup = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .border_style(Style::default().fg(theme.accent))
+            .title(" Update Available "),
+    );
+    f.render_widget(popup, area);
+}
+
 fn render_manage_folders_popup(f: &mut Frame, app: &App) {
     let height = (app.config.music_folders.len() as u16 + 6).clamp(8, 24);
     let area = centered_rect_fixed(60, height, f.size());
@@ -1855,6 +1895,179 @@ fn render_add_to_collection_popup(f: &mut Frame, app: &mut App) {
     f.render_widget(ratatui::widgets::Paragraph::new(hint), vchunks[2]);
 }
 
+// Radio tab: station list + visualizer on the left like the Player tab, then
+// station details and the station's recently played songs. Returns the
+// visualizer area, which the shared player code draws into.
+fn render_radio(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
+    use crate::radio::STATIONS;
+    let theme = crate::theme::current();
+    let (radio, status) = {
+        let state = app.audio.shared_state.lock().unwrap();
+        (state.radio.clone(), state.status)
+    };
+    let tuned_slug = radio.as_ref().map(|r| r.station.slug);
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+        ])
+        .split(area);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(7)])
+        .split(columns[0]);
+
+    let filtered = app.radio_filtered_indices();
+    let name_width = STATIONS.iter().map(|s| s.name.width()).max().unwrap_or(0) + 2;
+    let items: Vec<ListItem> = filtered
+        .iter()
+        .enumerate()
+        .map(|(idx, &station_idx)| {
+            let station = &STATIONS[station_idx];
+            let is_highlighted = idx == app.radio_selected_index;
+            let is_tuned = tuned_slug == Some(station.slug);
+            let is_favorite = app.config.radio_favorites.iter().any(|f| f == station.slug);
+
+            let text_style = if is_tuned {
+                Style::default().fg(theme.success).add_modifier(Modifier::BOLD)
+            } else if is_highlighted {
+                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.foreground)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(if is_highlighted { "> " } else { "  " }, Style::default().fg(theme.accent)),
+                Span::styled(if is_tuned { "=> " } else { "   " }, Style::default().fg(theme.success)),
+                Span::styled(if is_favorite { "★ " } else { "  " }, Style::default().fg(theme.warning)),
+                Span::styled(format!("{:<name_width$}", station.name), text_style),
+                Span::styled(station.genre, Style::default().fg(theme.muted)),
+            ]))
+        })
+        .collect();
+
+    let mut title = String::from(" Radio Stations");
+    if app.radio_favorites_only {
+        title.push_str(" — favorites");
+    }
+    if app.search.active && !app.search.query.is_empty() {
+        title.push_str(&format!(" (filtered: {})", app.search.query));
+    }
+    title.push_str(&format!(" [{}] ", filtered.len()));
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .border_style(Style::default().fg(theme.accent))
+            .title(title),
+    );
+    // Same centered scrolling as the queue list.
+    let h = left[0].height.saturating_sub(2) as usize;
+    let total = filtered.len();
+    let half = h / 2;
+    let offset = if total <= h || app.radio_selected_index < half {
+        0
+    } else if app.radio_selected_index >= total.saturating_sub(half) {
+        total.saturating_sub(h)
+    } else {
+        app.radio_selected_index - half
+    };
+    *app.radio_list_state.offset_mut() = offset;
+    app.radio_list_state.select((!filtered.is_empty()).then_some(app.radio_selected_index));
+    f.render_stateful_widget(list, left[0], &mut app.radio_list_state);
+
+    // The tuned station takes precedence, like the Player tab's active track.
+    let shown = radio.as_ref().map(|r| r.station.clone()).or_else(|| {
+        filtered.get(app.radio_selected_index).map(|&i| STATIONS[i].clone())
+    });
+    let label = |name: &'static str| Span::styled(name, Style::default().fg(theme.accent));
+    let mut info = Vec::new();
+    if let Some(ref station) = shown {
+        let state_text = match (&radio, status) {
+            (None, _) => ("Not tuned — press Enter", theme.muted),
+            (Some(r), _) if r.connecting => ("Tuning in...", theme.warning),
+            (Some(_), PlaybackStatus::Playing) => ("On air", theme.success),
+            (Some(_), PlaybackStatus::Paused) => ("Paused", theme.warning),
+            (Some(_), PlaybackStatus::Stopped) => ("Disconnected", theme.error),
+        };
+        info.push(Line::from(Span::styled(format!(" {}", station.name), Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD))));
+        info.push(Line::from(Span::styled(format!(" {}", station.description), Style::default().fg(theme.muted))));
+        info.push(Line::from(""));
+        info.push(Line::from(vec![label(" Genre:   "), Span::styled(station.genre, Style::default().fg(theme.accent_alt))]));
+        info.push(Line::from(vec![label(" Status:  "), Span::styled(state_text.0, Style::default().fg(state_text.1))]));
+        info.push(Line::from(vec![label(" Format:  "), Span::styled("MP3 · 128 kbps", Style::default().fg(theme.foreground))]));
+        info.push(Line::from(vec![label(" Source:  "), Span::styled("SomaFM", Style::default().fg(theme.foreground))]));
+
+        if let Some(song) = radio.as_ref().filter(|r| r.station == *station).and_then(|r| r.songs.first()) {
+            info.push(Line::from(""));
+            info.push(Line::from(Span::styled(" Now Playing", Style::default().fg(theme.success).add_modifier(Modifier::BOLD))));
+            info.push(Line::from(vec![label(" Title:   "), Span::styled(song.title.clone(), Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD))]));
+            info.push(Line::from(vec![label(" Artist:  "), Span::styled(song.artist.clone(), Style::default().fg(theme.warning))]));
+            if !song.album.is_empty() {
+                info.push(Line::from(vec![label(" Album:   "), Span::styled(song.album.clone(), Style::default().fg(theme.foreground))]));
+            }
+        }
+    } else {
+        info.push(Line::from(""));
+        info.push(Line::from(Span::styled("  No stations match this filter.", Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC))));
+    }
+    f.render_widget(
+        Paragraph::new(info)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.accent_alt))
+                    .title(" Station Information "),
+            ),
+        columns[1],
+    );
+
+    let songs = radio.as_ref().map(|r| r.songs.as_slice()).unwrap_or_default();
+    let recent: Vec<Line> = if radio.is_none() {
+        vec![
+            Line::from(""),
+            Line::from(Span::styled("  Nothing tuned in", Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC))),
+            Line::from(Span::styled("  Pick a station and press Enter.", Style::default().fg(theme.muted))),
+        ]
+    } else if songs.is_empty() {
+        vec![
+            Line::from(""),
+            Line::from(Span::styled("  Fetching song history...", Style::default().fg(theme.accent))),
+        ]
+    } else {
+        songs.iter().enumerate().flat_map(|(i, song)| {
+            let (marker, style) = if i == 0 {
+                ("▶ ", Style::default().fg(theme.success).add_modifier(Modifier::BOLD))
+            } else {
+                ("  ", Style::default().fg(theme.foreground))
+            };
+            [
+                Line::from(vec![Span::styled(marker, style), Span::styled(song.title.clone(), style)]),
+                Line::from(Span::styled(format!("  {}", song.artist), Style::default().fg(theme.muted))),
+            ]
+        }).collect()
+    };
+    f.render_widget(
+        Paragraph::new(recent)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.muted))
+                    .title(" Recently Played "),
+            ),
+        columns[2],
+    );
+
+    left[1]
+}
+
 fn render_help_popup(f: &mut Frame, scroll: u16) {
     let area = centered_rect_fixed(70, (f.size().height).saturating_sub(4).min(52), f.size());
     f.render_widget(Clear, area);
@@ -1865,7 +2078,7 @@ fn render_help_popup(f: &mut Frame, scroll: u16) {
 
     let help_text = vec![
         Line::from(h("── Screens ────────────────────────────────────────────────")),
-        Line::from(vec![k("  1 / 2 / 3 / 4    "), d("Browser / Queue / Library / Healer")]),
+        Line::from(vec![k("  1 / 2 / 3 / 4 / 5 "), d("Browser / Queue / Library / Healer / Radio")]),
         Line::from(vec![k("  Q                "), d("Toggle Queue overlay from any screen")]),
         Line::from(""),
         Line::from(h("── Browser — Navigation ───────────────────────────────────")),
@@ -1934,6 +2147,18 @@ fn render_help_popup(f: &mut Frame, scroll: u16) {
         Line::from(vec![k("  v                 "), d("Cycle visualizer: Spectrum → Waveform → Levels")]),
         Line::from(vec![k("  [ / ]             "), d("Visualizer decay slower / faster")]),
         Line::from(vec![k("  PgUp / PgDn       "), d("Scroll plain lyrics / browser")]),
+        Line::from(""),
+        Line::from(h("── Radio (5) ──────────────────────────────────────────────")),
+        Line::from(vec![k("  j / k  ↑ / ↓     "), d("Move through stations")]),
+        Line::from(vec![k("  Enter             "), d("Tune in to highlighted station")]),
+        Line::from(vec![k("  Space             "), d("Pause / resume live (reconnects on resume)")]),
+        Line::from(vec![k("  n / b  l / h      "), d("Next / previous station")]),
+        Line::from(vec![k("  s                 "), d("Stop radio")]),
+        Line::from(vec![k("  f                 "), d("Toggle favorite station")]),
+        Line::from(vec![k("  F                 "), d("Show favorites only")]),
+        Line::from(vec![k("  /                 "), d("Search by name, genre or description")]),
+        Line::from(vec![k("  Esc               "), d("Clear filters")]),
+        Line::from(vec![k("  v  [ / ]          "), d("Visualizer mode / decay")]),
         Line::from(""),
         Line::from(h("── Library Healer (4) ─────────────────────────────────────")),
         Line::from(vec![k("  s / Enter         "), d("Start scan  (Menu)")]),

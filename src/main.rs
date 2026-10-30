@@ -10,6 +10,7 @@ mod library;
 mod models;
 mod queue;
 mod preview;
+mod radio;
 mod search;
 mod stats;
 mod theme;
@@ -39,6 +40,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = execute!(stdout, LeaveAlternateScreen, Show);
         original_hook(panic_info);
     }));
+
+    updater::remove_previous_executable();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -131,6 +134,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         LeaveAlternateScreen,
         Show
     )?;
+
+    if let Some(release) = app.pending_update.take() {
+        app.audio.stop();
+        drop(app);
+        updater::install_and_restart(&release)?;
+    }
 
     Ok(())
 }

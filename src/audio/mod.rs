@@ -11,10 +11,12 @@ use rodio::{OutputStream, Sink, Source};
 use lofty::prelude::*;
 use lofty::probe::Probe;
 use crate::models::{AudioMetadata, LyricsState, PlaybackStatus, RepeatMode};
+use crate::radio::{RadioSong, RadioStation};
 
-#[derive(Debug)]
 pub enum AudioCommand {
     Play(PathBuf),
+    PlayStream(RadioStation),
+    StreamReady(u64, Result<Box<dyn Source<Item = f32> + Send>, String>),
     Pause,
     Resume,
     Stop,
@@ -30,8 +32,20 @@ pub struct VisualizerFrame {
 }
 
 #[derive(Clone)]
+pub struct RadioState {
+    pub station: RadioStation,
+    pub connecting: bool,
+    // Most recent first, from the station's song feed.
+    pub songs: Vec<RadioSong>,
+    // Identifies one tune-in, so stale song-feed pollers can exit.
+    pub session: u64,
+}
+
+#[derive(Clone)]
 pub struct AudioSharedState {
     pub current_track: Option<PathBuf>,
+    // Set while a radio station is tuned in; current_track is None then.
+    pub radio: Option<RadioState>,
     pub status: PlaybackStatus,
     pub elapsed_secs: u64,
     pub elapsed_millis: u64,
@@ -59,6 +73,7 @@ impl AudioEngine {
         let (command_tx, command_rx) = channel::<AudioCommand>();
         let shared_state = Arc::new(Mutex::new(AudioSharedState {
             current_track: None,
+            radio: None,
             status: PlaybackStatus::Stopped,
             elapsed_secs: 0,
             elapsed_millis: 0,
@@ -77,6 +92,7 @@ impl AudioEngine {
         }));
 
         let state_clone = Arc::clone(&shared_state);
+        let stream_tx = command_tx.clone();
         thread::spawn(move || {
             // Si falla el dispositivo de audio, guardamos el error en el estado
             // pa que la UI lo pueda mostrar en lugar de tronar silencioso
@@ -105,6 +121,8 @@ impl AudioEngine {
             let mut elapsed_millis: u128 = 0;
             let (visualizer_tx, visualizer_rx) = sync_channel::<VisualizerFrame>(2);
             let mut sliding_buffer = vec![0.0; 512];
+            // Bumped on every play/stop so late stream connections are discarded.
+            let mut stream_generation: u64 = 0;
 
             loop {
                 loop {
@@ -118,6 +136,8 @@ impl AudioEngine {
                             if let Some(ref s) = sink {
                                 s.stop();
                             }
+                            stream_generation += 1;
+                            state_clone.lock().unwrap().radio = None;
                             elapsed_millis = 0;
                             while visualizer_rx.try_recv().is_ok() {}
 
@@ -298,14 +318,94 @@ impl AudioEngine {
                                 }
                             });
                         }
-                        AudioCommand::Pause => {
+                        AudioCommand::PlayStream(station) => {
                             if let Some(ref s) = sink {
+                                s.stop();
+                            }
+                            stream_generation += 1;
+                            elapsed_millis = 0;
+                            while visualizer_rx.try_recv().is_ok() {}
+                            {
+                                let mut st = state_clone.lock().unwrap();
+                                let same_station = st.radio.as_ref().is_some_and(|r| r.station == station);
+                                let songs = st.radio.take().filter(|_| same_station).map(|r| r.songs).unwrap_or_default();
+                                st.current_track = None;
+                                st.radio = Some(RadioState { station: station.clone(), connecting: true, songs, session: stream_generation });
+                                st.status = PlaybackStatus::Stopped;
+                                st.elapsed_secs = 0;
+                                st.elapsed_millis = 0;
+                                st.duration_secs = 0;
+                                st.metadata = Some(station_metadata(&station, None));
+                                st.lyrics_state = LyricsState::NotFound;
+                                st.device_error = None;
+                                st.visualizer_data.fill(0.0);
+                                st.visualizer_peaks.fill(0.0);
+                                st.left_level = 0.0;
+                                st.right_level = 0.0;
+                            }
+                            // Connecting can take seconds; keep the audio loop responsive.
+                            let generation = stream_generation;
+                            let tx = stream_tx.clone();
+                            let url = station.stream_url();
+                            thread::spawn(move || {
+                                let _ = tx.send(AudioCommand::StreamReady(generation, decoder::open_stream(&url)));
+                            });
+                            spawn_song_feed(Arc::clone(&state_clone), station, stream_generation);
+                        }
+                        AudioCommand::StreamReady(generation, result) => {
+                            if generation != stream_generation {
+                                continue;
+                            }
+                            let prepared = result.and_then(|source| {
+                                let handle = stream_handle.as_ref()
+                                    .ok_or_else(|| "No audio output device is available".to_string())?;
+                                let new_sink = Sink::try_new(handle).map_err(|e| e.to_string())?;
+                                Ok((new_sink, source))
+                            });
+                            let mut st = state_clone.lock().unwrap();
+                            match prepared {
+                                Ok((new_sink, source)) => {
+                                    new_sink.set_volume(st.volume as f32 / 100.0);
+                                    new_sink.append(VisualizerSource::new(source, visualizer_tx.clone()));
+                                    sink = Some(new_sink);
+                                    if let Some(ref mut radio) = st.radio {
+                                        radio.connecting = false;
+                                    }
+                                    st.status = PlaybackStatus::Playing;
+                                    elapsed_millis = 0;
+                                    last_tick = Instant::now();
+                                }
+                                Err(error) => {
+                                    let name = st.radio.take().map(|r| r.station.name).unwrap_or("station");
+                                    st.status = PlaybackStatus::Stopped;
+                                    st.metadata = None;
+                                    st.device_error = Some(format!("Cannot tune in to {name}: {error}"));
+                                }
+                            }
+                        }
+                        AudioCommand::Pause => {
+                            let mut st = state_clone.lock().unwrap();
+                            if st.radio.is_some() {
+                                // Live radio can't be buffered indefinitely; drop the
+                                // connection and tune in again on resume.
+                                stream_generation += 1;
+                                if let Some(ref s) = sink {
+                                    s.stop();
+                                }
+                                if let Some(ref mut radio) = st.radio {
+                                    radio.connecting = false;
+                                }
+                            } else if let Some(ref s) = sink {
                                 s.pause();
                             }
-                            let mut st = state_clone.lock().unwrap();
                             st.status = PlaybackStatus::Paused;
                         }
                         AudioCommand::Resume => {
+                            let station = state_clone.lock().unwrap().radio.as_ref().map(|r| r.station.clone());
+                            if let Some(station) = station {
+                                let _ = stream_tx.send(AudioCommand::PlayStream(station));
+                                continue;
+                            }
                             if let Some(ref s) = sink {
                                 s.play();
                             }
@@ -317,7 +417,9 @@ impl AudioEngine {
                             if let Some(ref s) = sink {
                                 s.stop();
                             }
+                            stream_generation += 1;
                             let mut st = state_clone.lock().unwrap();
+                            st.radio = None;
                             st.current_track = None;
                             st.status = PlaybackStatus::Stopped;
                             st.elapsed_secs = 0;
@@ -464,7 +566,16 @@ impl AudioEngine {
                             empty = s.empty();
                         }
 
-                        if empty {
+                        if empty && st.radio.is_some() {
+                            // A live stream only ends when the connection drops;
+                            // never advance the queue for it.
+                            st.status = PlaybackStatus::Stopped;
+                            st.device_error = Some("Radio stream disconnected — press Enter to tune in again".to_string());
+                            st.visualizer_data.fill(0.0);
+                            st.visualizer_peaks.fill(0.0);
+                            elapsed_millis = 0;
+                            false
+                        } else if empty {
                             st.status = PlaybackStatus::Stopped;
                             st.elapsed_secs = 0;
                             st.elapsed_millis = 0;
@@ -501,6 +612,10 @@ impl AudioEngine {
         let _ = self.command_tx.send(AudioCommand::Play(path));
     }
 
+    pub fn play_stream(&self, station: RadioStation) {
+        let _ = self.command_tx.send(AudioCommand::PlayStream(station));
+    }
+
     pub fn pause(&self) {
         let _ = self.command_tx.send(AudioCommand::Pause);
     }
@@ -520,6 +635,51 @@ impl AudioEngine {
     pub fn seek(&self, position: Duration) {
         let _ = self.command_tx.send(AudioCommand::Seek(position));
     }
+}
+
+fn station_metadata(station: &RadioStation, song: Option<&RadioSong>) -> AudioMetadata {
+    AudioMetadata {
+        title: Some(song.map_or(station.name, |s| s.title.as_str()).to_string()),
+        artist: Some(song.map_or("SomaFM", |s| s.artist.as_str()).to_string()),
+        album: Some(station.name.to_string()),
+        duration_secs: None,
+        track: None,
+        genre: Some(station.genre.to_string()),
+        year: None,
+        bitrate: Some(128),
+        sample_rate: None,
+        codec: Some("MP3 stream".to_string()),
+        lyrics: None,
+    }
+}
+
+// Polls the station's song feed while it stays tuned in, so the player, MPRIS
+// and Discord show the song on air instead of only the station name.
+fn spawn_song_feed(state: Arc<Mutex<AudioSharedState>>, station: RadioStation, session: u64) {
+    let tuned = move |state: &Arc<Mutex<AudioSharedState>>| {
+        state.lock().unwrap().radio.as_ref().is_some_and(|r| r.session == session)
+    };
+    thread::spawn(move || {
+        while tuned(&state) {
+            if let Ok(songs) = crate::radio::fetch_songs(&station) {
+                let mut st = state.lock().unwrap();
+                let Some(ref mut radio) = st.radio else { return };
+                if radio.session != session {
+                    return;
+                }
+                radio.songs = songs;
+                let metadata = station_metadata(&station, radio.songs.first());
+                st.metadata = Some(metadata);
+            }
+            // Wake often enough to exit promptly after switching stations.
+            for _ in 0..30 {
+                thread::sleep(Duration::from_secs(1));
+                if !tuned(&state) {
+                    return;
+                }
+            }
+        }
+    });
 }
 
 // Wrapper sobre un Source de rodio que intercepta cada sample pa mandarlo

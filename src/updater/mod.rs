@@ -28,15 +28,6 @@ pub enum UpdateProgress {
     Available {
         release: Release,
     },
-    Downloading {
-        version: String,
-        downloaded: u64,
-        total: u64,
-    },
-    Replacing,
-    Done {
-        version: String,
-    },
     Error(String),
 }
 
@@ -168,25 +159,17 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
-// Claim the operation before spawning: repeated keypresses/ticks cannot start
-// concurrent downloads. After replacement current_exe may refer to an unlinked
-// inode on Linux, so a completed update is terminal until Stash restarts.
+// Claim the check before spawning so repeated keypresses/ticks cannot overlap.
 fn begin_check(slot: &UpdateSlot) -> bool {
     let mut state = slot.lock().unwrap();
-    if matches!(
-        *state,
-        UpdateProgress::Checking
-            | UpdateProgress::Downloading { .. }
-            | UpdateProgress::Replacing
-            | UpdateProgress::Done { .. }
-    ) {
+    if matches!(*state, UpdateProgress::Checking) {
         return false;
     }
     *state = UpdateProgress::Checking;
     true
 }
 
-pub fn spawn_check(slot: UpdateSlot, auto_update: bool) {
+pub fn spawn_check(slot: UpdateSlot) {
     if !begin_check(&slot) {
         return;
     }
@@ -197,14 +180,7 @@ pub fn spawn_check(slot: UpdateSlot, auto_update: bool) {
             fetch_release(CURRENT_VERSION, asset)
         })();
         match result {
-            Ok(Some(release)) => {
-                *slot.lock().unwrap() = UpdateProgress::Available {
-                    release: release.clone(),
-                };
-                if auto_update {
-                    spawn_download(release, slot);
-                }
-            }
+            Ok(Some(release)) => *slot.lock().unwrap() = UpdateProgress::Available { release },
             Ok(None) => *slot.lock().unwrap() = UpdateProgress::Idle,
             Err(error) => *slot.lock().unwrap() = UpdateProgress::Error(format!("{error:#}")),
         }
@@ -227,28 +203,64 @@ fn fetch_release(current: &str, asset: &str) -> anyhow::Result<Option<Release>> 
     release_from_json(&json, current, asset)
 }
 
-pub fn spawn_download(release: Release, slot: UpdateSlot) {
-    {
-        let mut state = slot.lock().unwrap();
-        if !matches!(&*state, UpdateProgress::Available { release: available } if available.version == release.version)
-        {
-            return;
+// Environment variables a relaunched Stash reads to report the update result.
+pub const UPDATED_ENV: &str = "STASH_UPDATED_TO";
+pub const FAILED_ENV: &str = "STASH_UPDATE_FAILED";
+
+/// Runs after the TUI has closed: download, verify and install `release` with
+/// progress on the plain terminal, then start Stash again with the same
+/// arguments. Installing while Stash is closed avoids replacing an executable
+/// the OS still has locked (Windows reports that as access denied).
+pub fn install_and_restart(release: &Release) -> anyhow::Result<std::convert::Infallible> {
+    let current_exe = std::env::current_exe()
+        .and_then(|exe| exe.canonicalize())
+        .context("Cannot locate the installed Stash executable")?;
+    println!("Updating Stash {CURRENT_VERSION} → {}", release.version);
+    let mut last_pct = None;
+    let result = download_to(release, &current_exe, &mut |downloaded| {
+        let pct = downloaded.saturating_mul(100).checked_div(release.size).unwrap_or(0);
+        if last_pct != Some(pct) {
+            last_pct = Some(pct);
+            print!("\r  Downloading... {pct:>3}%");
+            let _ = std::io::stdout().flush();
         }
-        *state = UpdateProgress::Downloading {
-            version: release.version.clone(),
-            downloaded: 0,
-            total: release.size,
-        };
-    }
-    std::thread::spawn(move || {
-        let result = download(&release, &slot);
-        *slot.lock().unwrap() = match result {
-            Ok(()) => UpdateProgress::Done {
-                version: release.version,
-            },
-            Err(error) => UpdateProgress::Error(format!("{error:#}")),
-        };
     });
+    println!();
+    let mut relaunch = std::process::Command::new(&current_exe);
+    relaunch.args(std::env::args_os().skip(1));
+    match result {
+        Ok(()) => {
+            println!("  Installed {}. Restarting Stash...", release.version);
+            relaunch.env(UPDATED_ENV, &release.version).env_remove(FAILED_ENV);
+        }
+        Err(error) => {
+            eprintln!("  Update failed: {error:#}");
+            eprintln!("  Your current version was left untouched. Press Enter to reopen Stash.");
+            let _ = std::io::stdin().read_line(&mut String::new());
+            relaunch.env(FAILED_ENV, &release.version).env_remove(UPDATED_ENV);
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // exec only returns on failure.
+        Err(relaunch.exec()).context("Could not restart Stash; start it again manually")
+    }
+    #[cfg(not(unix))]
+    {
+        let status = relaunch
+            .status()
+            .context("Could not restart Stash; start it again manually")?;
+        std::process::exit(status.code().unwrap_or(0));
+    }
+}
+
+/// Windows keeps the previous executable beside the new one until the next start.
+pub fn remove_previous_executable() {
+    #[cfg(windows)]
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::fs::remove_file(exe.with_extension("old.exe"));
+    }
 }
 
 fn valid_digest(digest: &str) -> bool {
@@ -268,16 +280,7 @@ fn checksum_for_asset(manifest: &str, asset: &str) -> anyhow::Result<String> {
     bail!("SHA256SUMS has no valid checksum for {asset}")
 }
 
-fn download(release: &Release, slot: &UpdateSlot) -> anyhow::Result<()> {
-    let current_exe =
-        std::env::current_exe().context("Cannot locate the installed Stash executable")?;
-    let current_exe = current_exe.canonicalize().context(
-        "The running Stash executable was moved or replaced; restart Stash before updating",
-    )?;
-    download_to(release, slot, &current_exe)
-}
-
-fn download_to(release: &Release, slot: &UpdateSlot, current_exe: &Path) -> anyhow::Result<()> {
+fn download_to(release: &Release, current_exe: &Path, progress: &mut dyn FnMut(u64)) -> anyhow::Result<()> {
     // Create the temporary file alongside the executable before downloading.
     // This detects directory permissions early and keeps the final rename atomic.
     let mut staged = tempfile::NamedTempFile::new_in(current_exe.parent().context("Executable has no directory")?)
@@ -313,8 +316,7 @@ fn download_to(release: &Release, slot: &UpdateSlot, current_exe: &Path) -> anyh
     {
         bail!("Update size does not match GitHub's release metadata");
     }
-    stage_download(response.into_reader(), &mut staged, release, &digest, slot)?;
-    *slot.lock().unwrap() = UpdateProgress::Replacing;
+    stage_download(response.into_reader(), &mut staged, release, &digest, progress)?;
     replace(staged, current_exe)?;
     Ok(())
 }
@@ -324,7 +326,7 @@ fn stage_download(
     staged: &mut tempfile::NamedTempFile,
     release: &Release,
     expected_digest: &str,
-    slot: &UpdateSlot,
+    progress: &mut dyn FnMut(u64),
 ) -> anyhow::Result<()> {
     let mut hasher = Sha256::new();
     let mut chunk = [0; 65536];
@@ -340,11 +342,7 @@ fn stage_download(
         }
         hasher.update(&chunk[..count]);
         staged.write_all(&chunk[..count])?;
-        *slot.lock().unwrap() = UpdateProgress::Downloading {
-            version: release.version.clone(),
-            downloaded,
-            total: release.size,
-        };
+        progress(downloaded);
     }
     if downloaded == 0 || downloaded != release.size {
         bail!("Incomplete update download");
@@ -364,9 +362,21 @@ fn replace(staged: tempfile::NamedTempFile, current_exe: &Path) -> anyhow::Resul
             .as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o755))?;
     }
+    // Windows refuses to overwrite a running executable but allows renaming it,
+    // so move the old one aside first (another Stash window may still be open).
+    #[cfg(windows)]
+    let previous = {
+        let previous = current_exe.with_extension("old.exe");
+        let _ = std::fs::remove_file(&previous);
+        std::fs::rename(current_exe, &previous)
+            .context("Could not move the current Stash executable aside")?;
+        previous
+    };
     staged.persist(current_exe).map_err(|e| {
+        #[cfg(windows)]
+        let _ = std::fs::rename(&previous, current_exe);
         // PersistError retains the temporary file; dropping it removes it.
-        anyhow::anyhow!("Could not replace Stash: {}. Check installation-directory permissions. On Windows, close Stash and run install.ps1.", e.error)
+        anyhow::anyhow!("Could not replace Stash: {}. Check installation-directory permissions.", e.error)
     })?;
     Ok(())
 }
@@ -486,24 +496,10 @@ mod tests {
     }
 
     #[test]
-    fn prevents_overlapping_updates_and_replacement_until_restart() {
+    fn prevents_overlapping_checks() {
         let slot = new_slot();
         assert!(begin_check(&slot));
         assert!(!begin_check(&slot));
-        for state in [
-            UpdateProgress::Downloading {
-                version: "v9".into(),
-                downloaded: 0,
-                total: 10,
-            },
-            UpdateProgress::Replacing,
-            UpdateProgress::Done {
-                version: "v9".into(),
-            },
-        ] {
-            *slot.lock().unwrap() = state;
-            assert!(!begin_check(&slot));
-        }
         *slot.lock().unwrap() = UpdateProgress::Error("offline".into());
         assert!(begin_check(&slot));
         assert!(
@@ -527,7 +523,7 @@ mod tests {
                     &mut staged,
                     &descriptor,
                     descriptor.digest.as_deref().unwrap(),
-                    &new_slot()
+                    &mut |_| {}
                 )
                 .is_err()
             );
@@ -556,7 +552,7 @@ mod tests {
             &mut staged,
             &descriptor,
             descriptor.digest.as_deref().unwrap(),
-            &new_slot(),
+            &mut |_| {},
         )
         .unwrap();
         replace(staged, &installed).unwrap();
@@ -589,7 +585,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let installed = dir.path().join("stash");
         std::fs::write(&installed, b"old executable").unwrap();
-        download_to(&selected, &new_slot(), &installed).unwrap();
+        download_to(&selected, &installed, &mut |_| {}).unwrap();
         assert_eq!(std::fs::metadata(&installed).unwrap().len(), selected.size);
         let hash = format!("{:x}", Sha256::digest(std::fs::read(&installed).unwrap()));
         assert_eq!(Some(hash), selected.digest);

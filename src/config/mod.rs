@@ -26,6 +26,9 @@ pub struct AppConfig {
     pub discord_app_id: Option<u64>,
     #[serde(default)]
     pub acoustid_api_key: Option<String>,
+    // Radio station slugs the user starred.
+    #[serde(default)]
+    pub radio_favorites: Vec<String>,
 }
 
 fn default_visualizer_decay() -> f32 {
@@ -49,6 +52,7 @@ impl Default for AppConfig {
             visualizer_decay: 0.88,
             discord_app_id: None,
             acoustid_api_key: None,
+            radio_favorites: Vec::new(),
         }
     }
 }

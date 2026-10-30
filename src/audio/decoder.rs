@@ -18,11 +18,29 @@ pub(super) fn open(path: &Path) -> Result<Box<dyn Source<Item = f32> + Send>, St
     }
 }
 
+// Live internet radio: always FFmpeg, which handles HTTP reconnects and ICY
+// streams. Only http(s) is accepted so a station can't name a local protocol.
+pub(super) fn open_stream(url: &str) -> Result<Box<dyn Source<Item = f32> + Send>, String> {
+    let parsed = url::Url::parse(url).map_err(|e| e.to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("Unsupported stream URL: {url}"));
+    }
+    let mut source = FfmpegSource::start(Input::Url(parsed.into()), Duration::ZERO, None)
+        .map_err(|e| e.to_string())?;
+    source.prime().map_err(|e| e.to_string())?;
+    Ok(Box::new(source))
+}
+
 const SAMPLE_RATE: u32 = 48_000;
 const CHANNELS: u16 = 2;
 
+enum Input {
+    File(PathBuf),
+    Url(String),
+}
+
 struct FfmpegSource {
-    path: PathBuf,
+    input: Input,
     child: Child,
     output: BufReader<ChildStdout>,
     first_sample: Option<f32>,
@@ -31,20 +49,34 @@ struct FfmpegSource {
 
 impl FfmpegSource {
     fn new(path: &Path) -> io::Result<Self> {
-        let mut source = Self::start(path, Duration::ZERO, probe_duration(path))?;
+        // An absolute path also prevents filenames from being treated as options
+        // or FFmpeg protocol URLs. Arguments never pass through a shell.
+        let input = Input::File(path.canonicalize()?);
+        let mut source = Self::start(input, Duration::ZERO, probe_duration(path))?;
         source.prime()?;
         Ok(source)
     }
 
-    fn start(path: &Path, position: Duration, duration: Option<Duration>) -> io::Result<Self> {
-        // An absolute path also prevents filenames from being treated as options
-        // or FFmpeg protocol URLs. Arguments never pass through a shell.
-        let path = path.canonicalize()?;
-        let mut child = Command::new("ffmpeg")
-            .args(["-nostdin", "-v", "error", "-ss"])
-            .arg(format!("{:.9}", position.as_secs_f64()))
-            .arg("-i")
-            .arg(&path)
+    fn start(input: Input, position: Duration, duration: Option<Duration>) -> io::Result<Self> {
+        let mut command = Command::new("ffmpeg");
+        command.args(["-nostdin", "-v", "error"]);
+        match &input {
+            Input::File(path) => {
+                command
+                    .arg("-ss")
+                    .arg(format!("{:.9}", position.as_secs_f64()))
+                    .arg("-i")
+                    .arg(path);
+            }
+            Input::Url(url) => {
+                // Give up on a dead connection after 15s instead of hanging silently.
+                command
+                    .args(["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"])
+                    .args(["-rw_timeout", "15000000", "-i"])
+                    .arg(url);
+            }
+        }
+        let mut child = command
             .args([
                 "-map",
                 "0:a:0",
@@ -76,7 +108,7 @@ impl FfmpegSource {
             })?;
         let output = BufReader::new(child.stdout.take().expect("piped FFmpeg stdout"));
         Ok(Self {
-            path,
+            input,
             child,
             output,
             first_sample: None,
@@ -124,10 +156,13 @@ impl Source for FfmpegSource {
     }
 
     fn try_seek(&mut self, position: Duration) -> Result<(), SeekError> {
+        let Input::File(path) = &self.input else {
+            return Err(SeekError::NotSupported { underlying_source: "live stream" });
+        };
         let position = self
             .duration
             .map_or(position, |duration| position.min(duration));
-        let mut replacement = Self::start(&self.path, position, self.duration)
+        let mut replacement = Self::start(Input::File(path.clone()), position, self.duration)
             .map_err(|e| SeekError::Other(Box::new(e)))?;
         // Seeking to the end legitimately produces no samples.
         if Some(position) != self.duration {
@@ -278,6 +313,25 @@ mod tests {
         drop(source);
         #[cfg(target_os = "linux")]
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
+    fn stream_urls_must_be_http() {
+        let error = open_stream("file:///etc/hostname").err().unwrap();
+        assert!(error.contains("Unsupported stream URL"));
+    }
+
+    #[test]
+    fn radio_stream_decodes_when_requested() {
+        let Ok(url) = std::env::var("STASH_TEST_RADIO") else {
+            return;
+        };
+        let mut source = open_stream(&url).unwrap();
+        assert_eq!(source.total_duration(), None);
+        let samples: Vec<_> = source.by_ref().take(SAMPLE_RATE as usize * 2).collect();
+        assert!(samples.iter().all(|s| s.is_finite()));
+        assert!(samples.iter().any(|s| s.abs() > 0.001));
+        assert!(source.try_seek(Duration::from_secs(1)).is_err());
     }
 
     #[test]

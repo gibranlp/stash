@@ -11,6 +11,7 @@ use crate::events::Event;
 use crate::library::{LibraryState, LibraryPanel, LibraryTrack, ScanState, TagEditorState, BulkTagEditorState, write_tags, write_bulk_tag_to_path, is_smart_playlist, start_library_watcher};
 use crate::models::{PlaybackStatus, RepeatMode, VisualizerMode};
 use crate::queue::PlaybackQueue;
+use crate::radio::STATIONS;
 use crate::search::{SearchState, matches_audio_extension, matches_image_extension, matches_text_extension};
 use crate::stats::{ListenStats, StatsTracking, unix_ts_secs};
 use crate::healer::{HealerState, HealerScreen, HealScanState, HealLookupState, HealStatus};
@@ -31,6 +32,7 @@ pub enum AppScreen {
     Queue,
     Library,
     Healer,
+    Radio,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +240,9 @@ pub struct App {
     pub file_progress: Arc<Mutex<Option<FileOperationProgress>>>,
     pub files_list_state: ListState,
     pub queue_list_state: ListState,
+    pub radio_selected_index: usize,
+    pub radio_list_state: ListState,
+    pub radio_favorites_only: bool,
     pub media_controls: Option<souvlaki::MediaControls>,
     pub last_media_status: Option<PlaybackStatus>,
     pub last_media_track: Option<PathBuf>,
@@ -287,6 +292,10 @@ pub struct App {
     pub add_coll_creating: bool, // true = "New playlist" sub-input is active in the popup
     pub update: crate::updater::UpdateSlot,
     last_update_check: std::time::Instant,
+    // Version already offered in the update popup this session.
+    prompted_update: Option<String>,
+    // Set when the user accepts an update; main installs it after the TUI closes.
+    pub pending_update: Option<crate::updater::Release>,
     pub manage_folders_index: usize,
     pub notification: Option<(String, u8)>,  // (message, ticks_remaining at 50ms each)
     pub library_track_list_state: ListState,
@@ -553,7 +562,6 @@ impl App {
         let library_watcher = start_library_watcher(&config.music_folders, event_tx.clone());
         let theme = crate::theme::Theme::load();
         let theme_watcher = crate::theme::Theme::start_watcher(event_tx.clone());
-        let auto_update = config.auto_update;
 
         Self {
             browser,
@@ -573,6 +581,9 @@ impl App {
             file_progress: Arc::new(Mutex::new(None)),
             files_list_state: ListState::default(),
             queue_list_state: ListState::default(),
+            radio_selected_index: 0,
+            radio_list_state: ListState::default(),
+            radio_favorites_only: false,
             media_controls,
             last_media_status: None,
             last_media_track: None,
@@ -622,12 +633,16 @@ impl App {
             add_coll_creating: false,
             update: {
                 let slot = crate::updater::new_slot();
-                crate::updater::spawn_check(slot.clone(), auto_update);
+                crate::updater::spawn_check(slot.clone());
                 slot
             },
             last_update_check: std::time::Instant::now(),
+            // Don't immediately offer a version that just failed to install.
+            prompted_update: std::env::var(crate::updater::FAILED_ENV).ok(),
+            pending_update: None,
             manage_folders_index: 0,
-            notification: None,
+            notification: std::env::var(crate::updater::UPDATED_ENV).ok()
+                .map(|version| (format!("Updated to {version}"), 200)),
             library_track_list_state: ListState::default(),
             bulk_tag_progress: None,
             stats: ListenStats::load(),
@@ -765,9 +780,10 @@ impl App {
             Event::Tick => {
                 let update_interval = crate::updater::check_interval(&self.update.lock().unwrap());
                 if self.last_update_check.elapsed() >= update_interval {
-                    crate::updater::spawn_check(self.update.clone(), self.config.auto_update);
+                    crate::updater::spawn_check(self.update.clone());
                     self.last_update_check = std::time::Instant::now();
                 }
+                self.offer_update();
                 // Detect 'm' key release: no 'm' press for 300ms means the key was let go.
                 // The short-tap mark action happens immediately on key press so moving the
                 // cursor during this window cannot mark a different track.
@@ -947,7 +963,9 @@ impl App {
                 self.toggle_playback();
             }
             Event::MediaNext => {
-                if self.is_queue_search_active() {
+                if self.radio_tuned() {
+                    self.radio_step(1);
+                } else if self.is_queue_search_active() {
                     if let Some(next_path) = self.next_search_result() {
                         self.audio.play(next_path);
                         self.sync_queue_selection();
@@ -964,7 +982,9 @@ impl App {
                 }
             }
             Event::MediaPrev => {
-                if self.is_queue_search_active() {
+                if self.radio_tuned() {
+                    self.radio_step(-1);
+                } else if self.is_queue_search_active() {
                     if let Some(prev_path) = self.prev_search_result() {
                         self.audio.play(prev_path);
                         self.sync_queue_selection();
@@ -1162,7 +1182,7 @@ impl App {
                 self.input_mode = InputMode::ConfirmUpdate;
                 return;
             }
-            crate::updater::spawn_check(self.update.clone(), self.config.auto_update);
+            crate::updater::spawn_check(self.update.clone());
             self.last_update_check = std::time::Instant::now();
             return;
         }
@@ -1199,6 +1219,13 @@ impl App {
                     self.search.query.clear();
                     return;
                 }
+                KeyCode::Char('5') => {
+                    self.screen = AppScreen::Radio;
+                    self.search.active = false;
+                    self.search.query.clear();
+                    self.sync_radio_selection();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -1210,6 +1237,10 @@ impl App {
 
         if self.screen == AppScreen::Healer {
             self.handle_healer_key(key);
+            return;
+        }
+
+        if self.screen == AppScreen::Radio && self.handle_radio_key(key) {
             return;
         }
 
@@ -1734,7 +1765,7 @@ impl App {
                 self.search.search_root = Some(root);
             }
             KeyCode::Char('v') => {
-                if self.screen == AppScreen::Queue {
+                if self.shows_player() {
                     self.config.visualizer_mode = match self.config.visualizer_mode {
                         VisualizerMode::Spectrum => VisualizerMode::Waveform,
                         VisualizerMode::Waveform => VisualizerMode::SignalLevels,
@@ -1775,7 +1806,7 @@ impl App {
                 }
             }
             KeyCode::Char('<') | KeyCode::Char(',') => {
-                if self.screen == AppScreen::Queue {
+                if self.shows_player() {
                     let mut current_decay = self.config.visualizer_decay;
                     current_decay = (current_decay - 0.02).max(0.50);
                     self.config.visualizer_decay = current_decay;
@@ -1786,7 +1817,7 @@ impl App {
                 }
             }
             KeyCode::Char('>') | KeyCode::Char('.') => {
-                if self.screen == AppScreen::Queue {
+                if self.shows_player() {
                     let mut current_decay = self.config.visualizer_decay;
                     current_decay = (current_decay + 0.02).min(0.99);
                     self.config.visualizer_decay = current_decay;
@@ -1856,6 +1887,8 @@ impl App {
                     self.queue_selected_index = 0;
                 } else if self.screen == AppScreen::Library {
                     self.library.track_index = 0;
+                } else if self.screen == AppScreen::Radio {
+                    self.radio_selected_index = 0;
                 }
             }
             KeyCode::Char(c) => {
@@ -1867,6 +1900,8 @@ impl App {
                     self.queue_selected_index = 0;
                 } else if self.screen == AppScreen::Library {
                     self.library.track_index = 0;
+                } else if self.screen == AppScreen::Radio {
+                    self.radio_selected_index = 0;
                 }
             }
             _ => {}
@@ -2293,12 +2328,36 @@ impl App {
         }
     }
 
+    // Opens the update popup once per new version, when nothing else needs the keyboard.
+    fn offer_update(&mut self) {
+        if !self.config.auto_update
+            || self.input_mode != InputMode::Normal
+            || self.show_help
+            || self.is_file_operation_active()
+            || self.library.tag_editor.is_some()
+            || self.library.bulk_tag_editor.is_some()
+        {
+            return;
+        }
+        let version = match &*self.update.lock().unwrap() {
+            crate::updater::UpdateProgress::Available { release } => release.version.clone(),
+            _ => return,
+        };
+        if self.prompted_update.as_ref() != Some(&version) {
+            self.prompted_update = Some(version);
+            self.input_mode = InputMode::ConfirmUpdate;
+        }
+    }
+
     fn handle_confirm_update_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 let state = self.update.lock().unwrap().clone();
                 if let crate::updater::UpdateProgress::Available { release } = state {
-                    crate::updater::spawn_download(release, self.update.clone());
+                    // Quit cleanly; main installs the update and relaunches Stash.
+                    self.pending_update = Some(release);
+                    self.save_session_on_quit();
+                    self.should_quit = true;
                 }
                 self.input_mode = InputMode::Normal;
             }
@@ -2310,15 +2369,22 @@ impl App {
     }
 
     fn toggle_playback(&self) {
-        let status = {
+        let (status, radio) = {
             let state = self.audio.shared_state.lock().unwrap();
-            state.status
+            (state.status, state.radio.as_ref().map(|r| (r.station.clone(), r.connecting)))
         };
         match status {
             PlaybackStatus::Playing => self.audio.pause(),
             PlaybackStatus::Paused => self.audio.resume(),
             PlaybackStatus::Stopped => {
-                if let Some(track) = self.queue.current_track() {
+                if let Some((station, connecting)) = radio {
+                    // Cancel a pending connection, or tune in again after a drop.
+                    if connecting {
+                        self.audio.pause();
+                    } else {
+                        self.audio.play_stream(station);
+                    }
+                } else if let Some(track) = self.queue.current_track() {
                     self.audio.play(track);
                 } else if self.screen == AppScreen::Browser && self.browser.focused_pane == PaneType::Files && !self.browser.files.is_empty() {
                     let path = self.browser.files[self.browser.file_index].path.clone();
@@ -2359,7 +2425,7 @@ impl App {
                 }
             }
             AppScreen::Library => {}
-            AppScreen::Healer => {}
+            AppScreen::Healer | AppScreen::Radio => {}
         }
     }
 
@@ -2381,7 +2447,7 @@ impl App {
                 }
             }
             AppScreen::Library => {}
-            AppScreen::Healer => {}
+            AppScreen::Healer | AppScreen::Radio => {}
         }
     }
 
@@ -2469,7 +2535,7 @@ impl App {
                 }
             }
             AppScreen::Library => {}
-            AppScreen::Healer => {}
+            AppScreen::Healer | AppScreen::Radio => {}
         }
     }
 
@@ -2536,7 +2602,7 @@ impl App {
                     }
             }
             AppScreen::Library => {}
-            AppScreen::Healer => {}
+            AppScreen::Healer | AppScreen::Radio => {}
         }
     }
 
@@ -2786,6 +2852,131 @@ impl App {
 
     pub fn queue_items_len(&self) -> usize {
         self.get_filtered_queue_indices().len()
+    }
+
+    // Screens with the audio player bar and visualizer.
+    pub fn shows_player(&self) -> bool {
+        matches!(self.screen, AppScreen::Queue | AppScreen::Radio)
+    }
+
+    fn radio_tuned(&self) -> bool {
+        self.audio.shared_state.lock().unwrap().radio.is_some()
+    }
+
+    // Station indices visible with the current favorites toggle and search filter.
+    pub fn radio_filtered_indices(&self) -> Vec<usize> {
+        let query = if self.search.active { self.search.query.to_lowercase() } else { String::new() };
+        STATIONS.iter().enumerate()
+            .filter(|(_, station)| !self.radio_favorites_only || self.config.radio_favorites.iter().any(|f| f == station.slug))
+            .filter(|(_, station)| query.is_empty()
+                || station.name.to_lowercase().contains(&query)
+                || station.genre.to_lowercase().contains(&query)
+                || station.description.to_lowercase().contains(&query))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn sync_radio_selection(&mut self) {
+        let tuned = self.audio.shared_state.lock().unwrap().radio.as_ref().map(|r| r.station.slug);
+        if let Some(slug) = tuned
+            && let Some(pos) = self.radio_filtered_indices().iter().position(|&i| STATIONS[i].slug == slug) {
+                self.radio_selected_index = pos;
+            }
+    }
+
+    fn tune_selected_station(&mut self) {
+        if let Some(&idx) = self.radio_filtered_indices().get(self.radio_selected_index) {
+            self.audio.play_stream(STATIONS[idx].clone());
+        }
+    }
+
+    // Move to the next/previous visible station and tune in, wrapping around.
+    fn radio_step(&mut self, delta: isize) {
+        let filtered = self.radio_filtered_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        let tuned = self.audio.shared_state.lock().unwrap().radio.as_ref().map(|r| r.station.slug);
+        let from = tuned
+            .and_then(|slug| filtered.iter().position(|&i| STATIONS[i].slug == slug))
+            .unwrap_or(self.radio_selected_index);
+        let len = filtered.len() as isize;
+        self.radio_selected_index = (from as isize + delta).rem_euclid(len) as usize;
+        self.tune_selected_station();
+    }
+
+    fn toggle_radio_favorite(&mut self) {
+        let Some(&idx) = self.radio_filtered_indices().get(self.radio_selected_index) else { return };
+        let station = &STATIONS[idx];
+        if let Some(pos) = self.config.radio_favorites.iter().position(|f| f == station.slug) {
+            self.config.radio_favorites.remove(pos);
+            self.notification = Some((format!("Removed {} from favorites", station.name), 50));
+        } else {
+            self.config.radio_favorites.push(station.slug.to_string());
+            self.notification = Some((format!("Added {} to favorites", station.name), 50));
+        }
+        let _ = self.config.save();
+        self.clamp_radio_selection();
+    }
+
+    fn clamp_radio_selection(&mut self) {
+        let len = self.radio_filtered_indices().len();
+        self.radio_selected_index = self.radio_selected_index.min(len.saturating_sub(1));
+    }
+
+    // Returns false for keys the Radio screen leaves to the global handler.
+    fn handle_radio_key(&mut self, key: KeyEvent) -> bool {
+        let len = self.radio_filtered_indices().len();
+        let last = len.saturating_sub(1);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.radio_selected_index = self.radio_selected_index.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.radio_selected_index = (self.radio_selected_index + 1).min(last);
+            }
+            KeyCode::PageUp => {
+                self.radio_selected_index = self.radio_selected_index.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                self.radio_selected_index = (self.radio_selected_index + 10).min(last);
+            }
+            KeyCode::Home => self.radio_selected_index = 0,
+            KeyCode::End => self.radio_selected_index = last,
+            KeyCode::Enter => self.tune_selected_station(),
+            KeyCode::Char(' ') => {
+                if self.radio_tuned() {
+                    self.toggle_playback();
+                } else {
+                    self.tune_selected_station();
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('l') | KeyCode::Right => self.radio_step(1),
+            KeyCode::Char('b') | KeyCode::Char('h') | KeyCode::Left => self.radio_step(-1),
+            KeyCode::Char('s') => self.audio.stop(),
+            KeyCode::Char('f') => self.toggle_radio_favorite(),
+            KeyCode::Char('F') => {
+                self.radio_favorites_only = !self.radio_favorites_only;
+                self.clamp_radio_selection();
+                self.sync_radio_selection();
+            }
+            KeyCode::Char('/') => {
+                self.input_mode = InputMode::Search;
+                self.search.active = true;
+                self.search.query.clear();
+                self.radio_selected_index = 0;
+            }
+            KeyCode::Esc if self.search.active || self.radio_favorites_only => {
+                self.search.active = false;
+                self.search.query.clear();
+                self.radio_favorites_only = false;
+                self.sync_radio_selection();
+            }
+            // Volume, help, visualizer, pause and screen keys work as everywhere else.
+            KeyCode::Esc | KeyCode::Char('+' | '=' | '-' | '?' | 'v' | '<' | '>' | ',' | '.' | 'p' | 'P' | 'Q') => return false,
+            _ => {}
+        }
+        true
     }
 
     fn is_queue_search_active(&self) -> bool {
@@ -3478,7 +3669,7 @@ impl App {
                 }
             }
             AppScreen::Library => {}
-            AppScreen::Healer => {}
+            AppScreen::Healer | AppScreen::Radio => {}
         }
     }
 
@@ -3494,7 +3685,7 @@ impl App {
                 }
             }
             AppScreen::Library => {}
-            AppScreen::Healer => {}
+            AppScreen::Healer | AppScreen::Radio => {}
         }
     }
 
@@ -3513,7 +3704,7 @@ impl App {
                 }
             }
             AppScreen::Library => {}
-            AppScreen::Healer => {}
+            AppScreen::Healer | AppScreen::Radio => {}
         }
     }
 
@@ -3532,7 +3723,7 @@ impl App {
                 }
             }
             AppScreen::Library => {}
-            AppScreen::Healer => {}
+            AppScreen::Healer | AppScreen::Radio => {}
         }
     }
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.0 — 2026-10-30
+
+- Add an Internet Radio screen (`5`) with the HAK.FM station lineup streamed from SomaFM through the existing audio engine, so volume, the visualizer, MPRIS and Discord activity work as for local tracks.
+- Show the song on air and the station's recently played tracks, refreshed every 30 seconds; media next/previous keys switch stations while radio plays.
+- Star favorite stations (`f`), show only favorites (`F`), and search stations by name, genre or description (`/`). Favorites persist in `config.json` as `radio_favorites`.
+- Pausing radio disconnects and resuming reconnects live; dropped streams no longer advance the playback queue.
+
+- Offer updates in a popup instead of replacing the executable in the background. Pressing `Y` closes Stash, downloads and verifies the update, installs it and reopens Stash in the new version with the same arguments; a failed install keeps the current version and reopens it.
+- Fix "access denied" when updating on Windows by moving the running executable aside before installing the new one.
+- `auto_update: false` now disables the popup only; `U` still installs updates.
+
 ## 0.8.0 — 2026-10-25
 
 - Automatically install newer stable GitHub releases in the background, with periodic checks, retryable errors, and update status on every screen. Add `auto_update: false` for manual confirmation.
