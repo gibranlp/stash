@@ -25,6 +25,8 @@ See [the changelog](CHANGELOG.md) for release notes.
 curl -fsSL https://raw.githubusercontent.com/gibranlp/stash/main/install.sh | sh
 ```
 
+This installs to `/usr/bin` on Linux and `/usr/local/bin` on macOS, asking for your password with `sudo`. A previous install in `~/.local/bin` is removed so it cannot shadow the new one.
+
 ### One-line install (Windows — PowerShell)
 
 ```powershell
@@ -57,6 +59,10 @@ Previews load in background workers. Text previews show up to 256 KiB / 5,000 li
 Stash checks GitHub for newer stable releases at startup and every six hours. When one is available, a popup offers to install it: press `Y` and Stash closes, downloads and verifies the update, replaces the installed executable and reopens with the same arguments; press `N` to skip it for now. Press `U` at any time to check again or open the prompt. Failed checks retry after 15 minutes. If installing fails, the current version is kept and Stash reopens. The installation directory must be writable; system package installations may require updating through the package manager.
 
 Set `"auto_update": false` in Stash's `config.json` to stop the popup; the footer still announces new versions and `U` installs them. Downloaded files must match the release's expected size and SHA-256 checksum; incomplete or invalid downloads leave the installed executable untouched.
+
+If Stash is installed in a system directory such as `/usr/bin`, the updater asks for your password with `sudo` (or `doas`) to install the new version.
+
+On Linux, Stash mounts USB sticks and external drives through udisks2 (`udisksctl`) when they are plugged in, or when Stash starts. Set `"auto_mount": false` in `config.json` to turn this off.
 
 ### Discord / Vesktop activity
 

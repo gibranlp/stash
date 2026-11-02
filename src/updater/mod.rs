@@ -283,8 +283,22 @@ fn checksum_for_asset(manifest: &str, asset: &str) -> anyhow::Result<String> {
 fn download_to(release: &Release, current_exe: &Path, progress: &mut dyn FnMut(u64)) -> anyhow::Result<()> {
     // Create the temporary file alongside the executable before downloading.
     // This detects directory permissions early and keeps the final rename atomic.
-    let mut staged = tempfile::NamedTempFile::new_in(current_exe.parent().context("Executable has no directory")?)
-        .context("Stash's installation directory is not writable; update it using its package manager or reinstall to ~/.local/bin")?;
+    // System-wide installs (e.g. /usr/bin) are staged in the temp directory
+    // instead and installed with administrator rights afterwards.
+    let install_dir = current_exe.parent().context("Executable has no directory")?;
+    let (mut staged, elevate) = match tempfile::NamedTempFile::new_in(install_dir) {
+        Ok(staged) => (staged, false),
+        #[cfg(unix)]
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => (
+            tempfile::NamedTempFile::new().context("Could not create a temporary file")?,
+            true,
+        ),
+        Err(error) => {
+            return Err(error).context(
+                "Stash's installation directory is not writable; update it using its package manager or reinstall with install.sh",
+            );
+        }
+    };
     let agent = agent();
     let digest = match &release.digest {
         Some(digest) => digest.clone(),
@@ -317,7 +331,50 @@ fn download_to(release: &Release, current_exe: &Path, progress: &mut dyn FnMut(u
         bail!("Update size does not match GitHub's release metadata");
     }
     stage_download(response.into_reader(), &mut staged, release, &digest, progress)?;
+    if elevate {
+        #[cfg(unix)]
+        return replace_elevated(&staged, current_exe);
+    }
     replace(staged, current_exe)?;
+    Ok(())
+}
+
+/// Installs a verified download into a directory only an administrator can
+/// write to, asking for the password with sudo (or doas) on the terminal.
+#[cfg(unix)]
+fn replace_elevated(staged: &tempfile::NamedTempFile, current_exe: &Path) -> anyhow::Result<()> {
+    let tool = ["sudo", "doas"]
+        .into_iter()
+        .find(|tool| {
+            std::env::var_os("PATH").is_some_and(|path| {
+                std::env::split_paths(&path).any(|dir| dir.join(tool).is_file())
+            })
+        })
+        .with_context(|| {
+            format!(
+                "{} needs administrator rights and neither sudo nor doas is available",
+                current_exe.display()
+            )
+        })?;
+    println!();
+    println!(
+        "  {} is in a system directory; {tool} needs your password to install the update.",
+        current_exe.display()
+    );
+    // Copy next to the target, then rename over it: atomic, and safe while
+    // other Stash windows still run the old executable. Paths are passed as
+    // arguments, never interpolated into the script.
+    let status = std::process::Command::new(tool)
+        .args(["sh", "-c"])
+        .arg(r#"set -e; tmp="$2.stash-update"; cp -- "$1" "$tmp"; chmod 755 -- "$tmp"; mv -f -- "$tmp" "$2""#)
+        .arg("sh")
+        .arg(staged.path())
+        .arg(current_exe)
+        .status()
+        .with_context(|| format!("Could not run {tool}"))?;
+    if !status.success() {
+        bail!("{tool} did not install the update (wrong password or permission denied)");
+    }
     Ok(())
 }
 

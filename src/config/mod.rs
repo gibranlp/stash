@@ -13,6 +13,9 @@ pub struct AppConfig {
     pub auto_resume: bool,
     #[serde(default = "auto_update_default")]
     pub auto_update: bool,
+    // Mount USB sticks and external drives as soon as they are plugged in.
+    #[serde(default = "auto_mount_default")]
+    pub auto_mount: bool,
     #[serde(default)]
     pub shuffle: bool,
     #[serde(default)]
@@ -37,6 +40,8 @@ fn default_visualizer_decay() -> f32 {
 
 fn auto_update_default() -> bool { true }
 
+fn auto_mount_default() -> bool { true }
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -46,6 +51,7 @@ impl Default for AppConfig {
             show_hidden: false,
             auto_resume: true,
             auto_update: true,
+            auto_mount: true,
             shuffle: false,
             repeat: RepeatMode::Off,
             visualizer_mode: VisualizerMode::Spectrum,

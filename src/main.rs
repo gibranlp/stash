@@ -1,5 +1,6 @@
 mod app;
 mod audio;
+mod automount;
 mod browser;
 mod collections;
 mod config;

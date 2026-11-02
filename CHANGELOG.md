@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.1 — 2026-11-02
+
+- Fix "permission denied" when updating a Stash installed in a system directory such as `/usr/bin`: the verified update is now installed with `sudo` (or `doas`), which asks for your password.
+- The install script now installs to `/usr/bin` on Linux and `/usr/local/bin` on macOS (asking for your password) and removes an older copy in `~/.local/bin`.
+- Automatically mount USB sticks and external drives through udisks2 when Stash starts or when they are plugged in (Linux). Set `"auto_mount": false` in `config.json` to disable.
+
 ## 0.9.0 — 2026-10-30
 
 - Add an Internet Radio screen (`5`) with the HAK.FM station lineup streamed from SomaFM through the existing audio engine, so volume, the visualizer, MPRIS and Discord activity work as for local tracks.

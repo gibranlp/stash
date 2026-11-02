@@ -284,6 +284,7 @@ pub struct App {
     pub picker: Option<ratatui_image::picker::Picker>,
     pub external_drives: Vec<PathBuf>,
     pub drive_scan_ticks: u16,
+    automount: crate::automount::AutoMounter,
     pub dest_browser: Option<DestBrowserState>,
     pub conflict_condvar: Arc<Condvar>,
     pub library: LibraryState,
@@ -625,6 +626,7 @@ impl App {
             picker,
             external_drives: scan_external_drives(),
             drive_scan_ticks: 0,
+            automount: crate::automount::AutoMounter::default(),
             dest_browser: None,
             conflict_condvar: Arc::new(Condvar::new()),
             library: LibraryState::new(),
@@ -799,6 +801,17 @@ impl App {
                 self.drive_scan_ticks += 1;
                 if self.drive_scan_ticks >= 20 {
                     self.drive_scan_ticks = 0;
+                    if self.config.auto_mount {
+                        self.automount.scan();
+                    }
+                    let mounted = self.automount.take_mounted();
+                    if !mounted.is_empty() {
+                        let names: Vec<&str> = mounted
+                            .iter()
+                            .map(|p| p.rsplit('/').next().unwrap_or(p))
+                            .collect();
+                        self.notification = Some((format!("Mounted {}", names.join(", ")), 60));
+                    }
                     let fresh = scan_external_drives();
                     if fresh != self.external_drives {
                         self.external_drives = fresh;
