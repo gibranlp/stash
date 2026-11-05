@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.2 — 2026-11-04
+
+- Open audio files directly from a file manager ("Open with Stash"), including `file://` URIs: Stash starts in the file's folder, queues it and plays the chosen track.
+- Prefer synced lyrics: keep searching LRCLIB for a synced upload when the exact match is plain, add NetEase Cloud Music as a synced source and lyrics.ovh as a last-resort plain source, and look for synced lyrics online even when the file has plain local lyrics.
+- Retry lyrics lookups after temporary failures (offline, timeouts, rate limits) with a growing delay, show a stale cached copy when services are unreachable, and re-check plain or missing lyrics after a week.
+- Parse `[mm:ss:xx]` timestamps and strip enhanced-LRC per-word marks.
+- Add a Mirror visualizer mode (`v`) and smooth the spectrum into one continuous, palette-colored shape with less flicker; the visualizer now fills the space below the queue.
+- Shuffle the queue right away when playback starts with shuffle on.
+
 ## 0.9.1 — 2026-11-02
 
 - Fix "permission denied" when updating a Stash installed in a system directory such as `/usr/bin`: the verified update is now installed with `sudo` (or `doas`), which asks for your password.

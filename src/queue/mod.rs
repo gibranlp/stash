@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use rand::seq::SliceRandom;
+use rand::Rng;
 use rand::thread_rng;
 
 pub struct PlaybackQueue {
@@ -20,6 +21,16 @@ impl PlaybackQueue {
     pub fn add(&mut self, path: PathBuf) {
         if !self.items.contains(&path) {
             self.items.push(path);
+            // Keep an existing shuffle order valid: slot the new track somewhere
+            // random after the one that is playing.
+            if !self.shuffle_indices.is_empty() {
+                let after = self
+                    .current_index
+                    .and_then(|curr| self.shuffle_indices.iter().position(|&x| x == curr))
+                    .map_or(0, |pos| pos + 1);
+                let at = thread_rng().gen_range(after..=self.shuffle_indices.len());
+                self.shuffle_indices.insert(at, self.items.len() - 1);
+            }
         }
     }
 
@@ -155,6 +166,24 @@ mod tests {
         queue.clear();
         assert_eq!(queue.items.len(), 0);
         assert_eq!(queue.current_index, None);
+    }
+
+    #[test]
+    fn shuffle_order_is_ready_before_playback_and_survives_adds() {
+        let mut queue = PlaybackQueue::new();
+        for i in 0..50 {
+            queue.add(PathBuf::from(format!("song{i}.mp3")));
+        }
+        queue.current_index = Some(10);
+        queue.shuffle_items();
+        assert_eq!(queue.shuffle_indices[0], 10);
+        assert_ne!(queue.shuffle_indices, (0..50).collect::<Vec<_>>());
+
+        queue.add(PathBuf::from("late.mp3"));
+        let mut sorted = queue.shuffle_indices.clone();
+        sorted.sort();
+        assert_eq!(sorted, (0..51).collect::<Vec<_>>());
+        assert_eq!(queue.shuffle_indices[0], 10);
     }
 
     #[test]

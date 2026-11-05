@@ -1,6 +1,6 @@
 mod lyrics;
 mod decoder;
-use lyrics::{clean_filename_title, fetch_lyrics_online, load_lyrics, non_empty_lyrics};
+use lyrics::{clean_filename_title, fetch_lyrics_online, has_synced_timestamps, load_lyrics, non_empty_lyrics};
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -55,6 +55,8 @@ pub struct AudioSharedState {
     pub shuffle: bool,
     pub metadata: Option<AudioMetadata>,
     pub lyrics_state: LyricsState,
+    // Bumped on every track start so a stale lyrics lookup for a replayed track stops.
+    pub lyrics_generation: u64,
     pub device_error: Option<String>,
     pub visualizer_data: Vec<f32>,
     pub visualizer_peaks: Vec<f32>,
@@ -83,6 +85,7 @@ impl AudioEngine {
             shuffle: default_shuffle,
             metadata: None,
             lyrics_state: LyricsState::NotFound,
+            lyrics_generation: 0,
             device_error: None,
             visualizer_data: vec![0.0; 160],
             visualizer_peaks: vec![0.0; 160],
@@ -197,6 +200,7 @@ impl AudioEngine {
                                 st.duration_secs = decoder_duration.unwrap_or(0);
                                 st.metadata = None;
                                 st.lyrics_state = LyricsState::Loading;
+                                st.lyrics_generation = st.lyrics_generation.wrapping_add(1);
                             }
                             last_tick = Instant::now();
 
@@ -204,6 +208,7 @@ impl AudioEngine {
                             // sin bloquear el loop principal de audio
                             let bg_state = Arc::clone(&state_clone);
                             let bg_path = path.clone();
+                            let bg_generation = state_clone.lock().unwrap().lyrics_generation;
                             thread::spawn(move || {
                                 let mut title = None;
                                 let mut artist = None;
@@ -282,34 +287,25 @@ impl AudioEngine {
                                     }
                                 }
 
-                                // Si no encontramos letra local ni embebida, jalamos de internet
-                                if lyrics.is_none() {
+                                // Sin letra local, o letra local sin tiempos: buscamos en línea.
+                                // Plain local lyrics stay on screen while we look for a synced copy.
+                                let synced_only = lyrics.is_some();
+                                if lyrics.as_deref().is_none_or(|text| !has_synced_timestamps(text)) {
+                                    let is_current = || {
+                                        let st = bg_state.lock().unwrap();
+                                        st.lyrics_generation == bg_generation && st.current_track.as_deref() == Some(&bg_path)
+                                    };
                                     if let Some(ref t) = resolved_title {
-                                        let result = fetch_lyrics_online(
+                                        fetch_lyrics_with_retries(
+                                            &bg_state,
+                                            &is_current,
                                             t,
                                             artist.as_deref(),
                                             album.as_deref(),
                                             duration_secs.or(decoder_duration),
-                                            || bg_state.lock().unwrap().current_track.as_deref() == Some(&bg_path),
+                                            synced_only,
                                         );
-                                        let mut st = bg_state.lock().unwrap();
-                                        if st.current_track.as_deref() == Some(&bg_path) {
-                                            match result {
-                                                Ok(Some(text)) => {
-                                                    if let Some(ref mut m) = st.metadata {
-                                                        m.lyrics = Some(text.clone());
-                                                    }
-                                                    st.lyrics_state = LyricsState::Found(text);
-                                                }
-                                                Ok(None) => {
-                                                    st.lyrics_state = LyricsState::NotFound;
-                                                }
-                                                Err(e) => {
-                                                    st.lyrics_state = LyricsState::Error(e);
-                                                }
-                                            }
-                                        }
-                                    } else {
+                                    } else if !synced_only {
                                         let mut st = bg_state.lock().unwrap();
                                         if st.current_track.as_deref() == Some(&bg_path) {
                                             st.lyrics_state = LyricsState::NotFound;
@@ -487,7 +483,7 @@ impl AudioEngine {
 
                     // Agrupamos en 160 bandas con escala logarítmica (exp 1.8)
                     // pa que los graves no se coman todo el espacio visual
-                    let num_bars = 160;
+                    let num_bars: usize = 160;
                     let mut new_bars = [0.0; 160];
                     for (i, bar) in new_bars.iter_mut().enumerate() {
                         let start = (256.0 * (i as f32 / num_bars as f32).powf(1.8)) as usize;
@@ -507,6 +503,18 @@ impl AudioEngine {
 
                     // Aplicamos el filtro de decay: cada barra baja gradualmente
                     // en lugar de caerse de golpe cuando no hay señal
+                    // Spatial smoothing (like cava's "monstercat" filter): blend each band
+                    // with its neighbours so the spectrum forms one flowing shape instead of
+                    // isolated spikes.
+                    for _ in 0..2 {
+                        let src = new_bars;
+                        for i in 0..num_bars {
+                            let l = src[i.saturating_sub(1)];
+                            let r = src[(i + 1).min(num_bars - 1)];
+                            new_bars[i] = 0.25 * l + 0.5 * src[i] + 0.25 * r;
+                        }
+                    }
+
                     let mut st = state_clone.lock().unwrap();
                     if st.visualizer_data.len() != num_bars {
                         st.visualizer_data = vec![0.0; num_bars];
@@ -516,12 +524,19 @@ impl AudioEngine {
                     // actual elapsed frames so behavior is independent of thread wake rate.
                     let frame_decay = st.visualizer_decay.powf(dt_frames);
                     let peak_decay = 0.94_f32.powf(dt_frames);
+                    // Rises ease in over a couple of frames instead of jumping instantly,
+                    // which removes most of the flicker; falls still follow the decay setting.
+                    let attack = 1.0 - 0.35_f32.powf(dt_frames);
                     let AudioSharedState { ref mut visualizer_data, ref mut visualizer_peaks, ref mut left_level, ref mut right_level, .. } = *st;
                     for ((vd, pk), &nb) in visualizer_data.iter_mut()
                         .zip(visualizer_peaks.iter_mut())
                         .zip(new_bars.iter())
                     {
-                        *vd = (*vd * frame_decay).max(nb);
+                        *vd = if nb > *vd {
+                            *vd + (nb - *vd) * attack
+                        } else {
+                            (*vd * frame_decay).max(nb)
+                        };
                         if nb > *pk {
                             *pk = nb;
                         } else {
@@ -836,6 +851,74 @@ fn fft(input: &mut [Complex]) {
             }
         }
         width *= 2;
+    }
+}
+
+// Temporary failures (offline, timeouts, rate limits) are retried with a growing delay
+// while the same track keeps playing, so lyrics appear once the service recovers.
+const LYRICS_RETRY_DELAYS_SECS: [u64; 4] = [5, 15, 30, 60];
+
+fn fetch_lyrics_with_retries(
+    state: &Arc<Mutex<AudioSharedState>>,
+    is_current: &dyn Fn() -> bool,
+    title: &str,
+    artist: Option<&str>,
+    album: Option<&str>,
+    duration: Option<u64>,
+    synced_only: bool,
+) {
+    let max_attempts = LYRICS_RETRY_DELAYS_SECS.len() as u8;
+    let mut attempt = 0u8;
+    loop {
+        let result = fetch_lyrics_online(title, artist, album, duration, synced_only, is_current);
+        if !is_current() {
+            return;
+        }
+        let error = match result {
+            Ok(Some(text)) => {
+                let mut st = state.lock().unwrap();
+                if let Some(ref mut m) = st.metadata {
+                    m.lyrics = Some(text.clone());
+                }
+                st.lyrics_state = LyricsState::Found(text);
+                return;
+            }
+            // When upgrading local plain lyrics, keep showing them.
+            Ok(None) if synced_only => return,
+            Ok(None) => {
+                state.lock().unwrap().lyrics_state = LyricsState::NotFound;
+                return;
+            }
+            Err(_) if synced_only => return,
+            Err(error) => error,
+        };
+        let Some(&base) = LYRICS_RETRY_DELAYS_SECS.get(attempt as usize) else {
+            state.lock().unwrap().lyrics_state = LyricsState::Error(error.message);
+            return;
+        };
+        attempt += 1;
+        let delay = error
+            .retry_after
+            .unwrap_or_default()
+            .max(Duration::from_secs(base))
+            .min(Duration::from_secs(300));
+        let retry_at = Instant::now() + delay;
+        state.lock().unwrap().lyrics_state = LyricsState::Retrying {
+            message: error.message,
+            retry_at,
+            attempt,
+            max_attempts,
+        };
+        while Instant::now() < retry_at {
+            if !is_current() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        if !is_current() {
+            return;
+        }
+        state.lock().unwrap().lyrics_state = LyricsState::Fetching;
     }
 }
 

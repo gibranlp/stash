@@ -448,6 +448,38 @@ fn toggle_path_selection(selected: &mut std::collections::HashSet<PathBuf>, path
     }
 }
 
+// Accepts a plain path, ~/path, or a percent-encoded file:// URI.
+fn startup_path(arg: &str) -> PathBuf {
+    let Some(rest) = arg.strip_prefix("file://") else {
+        return resolve_path(arg);
+    };
+    // Drop an optional host ("file://localhost/...").
+    let rest = &rest[rest.find('/').unwrap_or(0)..];
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some(byte) = rest.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(byte);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(out))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(&out).into_owned())
+    }
+}
+
 impl App {
     // Ojo: si estamos corriendo con sudo, hay que abrir el archivo como el usuario original
     // para que la app gráfica aparezca en el entorno correcto
@@ -482,15 +514,23 @@ impl App {
     pub fn new(event_tx: std::sync::mpsc::Sender<Event>, initial_path: Option<PathBuf>, picker: Option<ratatui_image::picker::Picker>) -> Self {
         let config = AppConfig::load();
 
-        let starting_dir = if let Some(ref path) = initial_path {
-            let resolved = resolve_path(&path.to_string_lossy());
-            if resolved.exists() {
-                resolved
-            } else {
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // A file manager ("Open with Stash") hands us a file, possibly as a file:// URI.
+        let resolved = initial_path
+            .map(|path| startup_path(&path.to_string_lossy()))
+            .filter(|path| path.exists())
+            .map(|path| std::path::absolute(&path).unwrap_or(path));
+        let mut startup_track = None;
+        let starting_dir = match resolved {
+            Some(path) if path.is_file() => {
+                let dir = path.parent().map(Path::to_path_buf).unwrap_or_else(|| cwd.clone());
+                if matches_audio_extension(&path) {
+                    startup_track = Some(path);
+                }
+                dir
             }
-        } else {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            Some(path) => path,
+            None => cwd,
         };
 
         let browser = BrowserState::new(starting_dir, config.show_hidden);
@@ -564,7 +604,7 @@ impl App {
         let theme = crate::theme::Theme::load();
         let theme_watcher = crate::theme::Theme::start_watcher(event_tx.clone());
 
-        Self {
+        let mut app = Self {
             browser,
             audio,
             queue,
@@ -661,6 +701,28 @@ impl App {
             theme,
             _theme_watcher: theme_watcher,
             event_tx,
+        };
+        if let Some(track) = startup_track {
+            app.play_startup_track(track);
+        }
+        app
+    }
+
+    // Plays a file passed on the command line, queueing the rest of its folder
+    // the same way pressing Enter on it in the browser would.
+    fn play_startup_track(&mut self, track: PathBuf) {
+        self.screen = AppScreen::Browser;
+        self.search.active = false;
+        self.browser.focused_pane = PaneType::Files;
+        if let Some(idx) = self.browser.files.iter().position(|f| f.path == track) {
+            self.browser.file_index = idx;
+            self.activate_item();
+        } else {
+            self.queue.clear();
+            self.queue.add(track.clone());
+            self.queue.current_index = Some(0);
+            self.audio.play(track);
+            self.sync_queue_selection();
         }
     }
 
@@ -1780,7 +1842,8 @@ impl App {
             KeyCode::Char('v') => {
                 if self.shows_player() {
                     self.config.visualizer_mode = match self.config.visualizer_mode {
-                        VisualizerMode::Spectrum => VisualizerMode::Waveform,
+                        VisualizerMode::Spectrum => VisualizerMode::Mirror,
+                        VisualizerMode::Mirror => VisualizerMode::Waveform,
                         VisualizerMode::Waveform => VisualizerMode::SignalLevels,
                         VisualizerMode::SignalLevels => VisualizerMode::Spectrum,
                     };
@@ -2595,6 +2658,8 @@ impl App {
                                     added_idx += 1;
                                 }
                             }
+                            // Build the shuffle order now so it is random from the start
+                            self.queue.shuffle_items();
 
                             self.audio.play(path);
                             self.sync_queue_selection();
@@ -3990,6 +4055,7 @@ impl App {
                             self.queue.add(p.clone());
                         }
                         self.queue.current_index = Some(play_idx);
+                        self.queue.shuffle_items();
                         self.audio.play(path);
                         self.sync_queue_selection();
                     }
@@ -5072,6 +5138,31 @@ mod tests {
         let indices = app.get_filtered_queue_indices();
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0], (1, 0));
+    }
+
+    #[test]
+    fn opening_a_file_queues_its_folder_and_plays_it() {
+        let (tx, _rx) = channel();
+        let test_root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_stash_open file");
+        let _ = std::fs::remove_dir_all(&test_root);
+        std::fs::create_dir_all(&test_root).unwrap();
+        for name in ["a.mp3", "b.mp3", "c.mp3", "notes.txt"] {
+            std::fs::File::create(test_root.join(name)).unwrap();
+        }
+        let target = test_root.join("b.mp3");
+
+        let uri = format!("file://{}", target.to_string_lossy().replace(' ', "%20"));
+        assert_eq!(startup_path(&uri), target);
+
+        let app = App::new(tx, Some(target.clone()), None);
+        assert_eq!(app.browser.current_dir, test_root);
+        assert_eq!(app.queue.items.len(), 3);
+        assert_eq!(app.queue.current_track(), Some(target));
+
+        let _ = std::fs::remove_dir_all(&test_root);
     }
 
     #[test]

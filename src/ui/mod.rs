@@ -21,14 +21,39 @@ struct TimedLyricLine {
     text: String,
 }
 
+// Accepts [mm:ss], [mm:ss.xx], [mm:ss.xxx] and the common [mm:ss:xx] variant.
 fn parse_lrc_timestamp(value: &str) -> Option<u64> {
     let (minutes, seconds) = value.split_once(':')?;
     let minutes = minutes.trim().parse::<u64>().ok()?;
-    let seconds = seconds.trim().parse::<f64>().ok()?;
+    let seconds = seconds.trim();
+    let seconds = match seconds.split_once(':') {
+        Some((whole, fraction)) if !fraction.contains([':', '.']) => format!("{whole}.{fraction}"),
+        Some(_) => return None,
+        None => seconds.to_string(),
+    };
+    let seconds = seconds.parse::<f64>().ok()?;
     if !(0.0..60.0).contains(&seconds) {
         return None;
     }
     Some(((minutes as f64 * 60.0 + seconds) * 1000.0).round() as u64)
+}
+
+// Enhanced LRC carries per-word <mm:ss.xx> marks; show only the words.
+fn strip_word_timestamps(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('<') {
+        let Some(close) = rest[open..].find('>').map(|offset| open + offset) else {
+            break;
+        };
+        output.push_str(&rest[..open]);
+        if parse_lrc_timestamp(&rest[open + 1..close]).is_none() {
+            output.push_str(&rest[open..=close]);
+        }
+        rest = &rest[close + 1..];
+    }
+    output.push_str(rest);
+    output.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn parse_synced_lyrics(lyrics: &str) -> Option<Vec<TimedLyricLine>> {
@@ -63,7 +88,7 @@ fn parse_synced_lyrics(lyrics: &str) -> Option<Vec<TimedLyricLine>> {
         for timestamp in timestamps {
             timed_lines.push(TimedLyricLine {
                 timestamp_ms: timestamp.saturating_add_signed(offset_ms),
-                text: remainder.trim().to_string(),
+                text: strip_word_timestamps(remainder),
             });
         }
     }
@@ -516,18 +541,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 ])
                 .split(chunks[1]);
 
-            // Split the left column: queue list on top, visualizer below
-            let left_chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(3),
-                    Constraint::Length(7),
-                ])
-                .split(queue_chunks[0]);
-            vis_rect = Some(left_chunks[1]);
-
             let queue_border_style = Style::default().fg(crate::theme::current().accent);
             let filtered_indices = app.get_filtered_queue_indices();
+
+            // Split the left column: queue list on top, visualizer fills the rest
+            let left_chunks = split_list_and_visualizer(queue_chunks[0], filtered_indices.len());
+            vis_rect = Some(left_chunks[1]);
 
             let queue_list_items: Vec<ListItem> = filtered_indices
                 .iter()
@@ -785,16 +804,47 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     LyricsState::NotFound => Paragraph::new(vec![
                         Line::from(""),
                         Line::from(Span::styled(
-                            "  We couldn't find lyrics for this track.",
+                            "  This song doesn't have lyrics.",
+                            Style::default()
+                                .fg(crate::theme::current().foreground)
+                                .add_modifier(Modifier::ITALIC),
+                        )),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "  None of the lyrics sources (LRCLIB, NetEase, lyrics.ovh) know this track.",
                             Style::default().fg(crate::theme::current().muted),
                         )),
                         Line::from(Span::styled(
-                            "  Check its title and artist, or add a matching .lrc/.txt file.",
+                            "  If it should have lyrics, check its title and artist tags, or add a matching .lrc/.txt file.",
                             Style::default().fg(crate::theme::current().muted),
                         )),
                     ])
                     .block(lyrics_block)
                     .wrap(ratatui::widgets::Wrap { trim: false }),
+                    LyricsState::Retrying { message, retry_at, attempt, max_attempts } => {
+                        let seconds = retry_at
+                            .saturating_duration_since(std::time::Instant::now())
+                            .as_secs_f32()
+                            .ceil() as u64;
+                        Paragraph::new(vec![
+                            Line::from(""),
+                            Line::from(Span::styled(
+                                "  Couldn't load lyrics yet.",
+                                Style::default().fg(crate::theme::current().warning),
+                            )),
+                            Line::from(Span::styled(
+                                format!("  {message}"),
+                                Style::default().fg(crate::theme::current().muted),
+                            )),
+                            Line::from(""),
+                            Line::from(Span::styled(
+                                format!("  Retrying in {seconds}s (attempt {attempt} of {max_attempts})..."),
+                                Style::default().fg(crate::theme::current().accent),
+                            )),
+                        ])
+                        .block(lyrics_block)
+                        .wrap(ratatui::widgets::Wrap { trim: false })
+                    }
                     LyricsState::Error(msg) => Paragraph::new(vec![
                         Line::from(""),
                         Line::from(Span::styled(
@@ -803,6 +853,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
                         )),
                         Line::from(Span::styled(
                             format!("  {msg}"),
+                            Style::default().fg(crate::theme::current().muted),
+                        )),
+                        Line::from(Span::styled(
+                            "  Play the track again to retry.",
                             Style::default().fg(crate::theme::current().muted),
                         )),
                     ])
@@ -914,7 +968,6 @@ pub fn render(f: &mut Frame, app: &mut App) {
         let player_text = player_lines;
 
         let bars = audio_state.visualizer_data.clone();
-        let raw_peaks = audio_state.visualizer_peaks.clone();
         let vis_area = vis_rect.unwrap_or_default();
         let visualizer_height = (vis_area.height.saturating_sub(2) as usize).max(3);
 
@@ -940,11 +993,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
         };
 
         let interpolated_bars = interpolate(&bars);
-        let interpolated_peaks = interpolate(&raw_peaks);
 
         let num_bars = interpolated_bars.len();
         let mode_name = match app.config.visualizer_mode {
             VisualizerMode::Spectrum => "Spectrum",
+            VisualizerMode::Mirror => "Mirror",
             VisualizerMode::Waveform => "Waveform",
             VisualizerMode::SignalLevels => "VU Meters",
         };
@@ -954,47 +1007,49 @@ pub fn render(f: &mut Frame, app: &mut App) {
             app.config.visualizer_decay
         );
 
+            // One column per terminal cell with no gaps, so the spectrum reads as a
+            // single continuous shape instead of separate bars. The bands are resampled
+            // with Catmull-Rom so the outline curves smoothly between them.
+            let width = available_width as usize;
+            let curve: Vec<f32> = if bars.is_empty() || width == 0 {
+                Vec::new()
+            } else if bars.len() == 1 || width == 1 {
+                vec![bars[0]; width]
+            } else {
+                let n = bars.len();
+                let at = |i: isize| bars[i.clamp(0, n as isize - 1) as usize];
+                (0..width).map(|x| {
+                    let pos = x as f32 / (width - 1) as f32 * (n - 1) as f32;
+                    let i = pos.floor() as isize;
+                    let t = pos - i as f32;
+                    let (p0, p1, p2, p3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+                    let t2 = t * t;
+                    let t3 = t2 * t;
+                    (0.5 * (2.0 * p1
+                        + (p2 - p0) * t
+                        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                        + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t3))
+                        .clamp(0.0, 1.0)
+                }).collect()
+            };
+
         let vis_para = match app.config.visualizer_mode {
             VisualizerMode::Spectrum => {
+                let chars = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
                 let mut lines = vec![String::new(); visualizer_height];
-                let padding_str = if num_bars > 0 {
-                    let bar_width_total = num_bars * 2;
-                    let padding_width = vis_area.width.saturating_sub(bar_width_total as u16 + 2) / 2;
-                    " ".repeat(padding_width as usize)
-                } else {
-                    String::new()
-                };
-
-                if num_bars > 0 {
-                    // Construimos el espectro fila por fila de abajo para arriba usando bloques Unicode graduales
-                    let chars = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
-                    for row in (0..visualizer_height).rev() {
-                        let mut line = String::new();
-                        for (bar_j, &val) in interpolated_bars.iter().enumerate() {
-                            let scaled_val = val * visualizer_height as f32;
-                            let row_floor = row as f32;
-                            // Peak row for this bar (0 = bottom)
-                            let peak_row = if bar_j < interpolated_peaks.len() {
-                                (interpolated_peaks[bar_j] * visualizer_height as f32) as usize
-                            } else {
-                                0
-                            };
-                            if scaled_val >= row_floor + 1.0 {
-                                line.push_str("█ ");
-                            } else if scaled_val > row_floor {
-                                let fraction = scaled_val - row_floor;
-                                let char_idx = (fraction * 8.0) as usize;
-                                let idx = char_idx.min(8);
-                                line.push_str(&format!("{} ", chars[idx]));
-                            } else if peak_row == row && peak_row > 0 {
-                                // Cava-style falling peak marker
-                                line.push_str("▀ ");
-                            } else {
-                                line.push_str("  ");
-                            }
+                for row in 0..visualizer_height {
+                    let row_floor = row as f32;
+                    let line: String = curve.iter().map(|&val| {
+                        let scaled = val * visualizer_height as f32;
+                        if scaled >= row_floor + 1.0 {
+                            '█'
+                        } else if scaled > row_floor {
+                            chars[(((scaled - row_floor) * 8.0).round() as usize).min(8)]
+                        } else {
+                            ' '
                         }
-                        lines[visualizer_height - 1 - row] = line;
-                    }
+                    }).collect();
+                    lines[visualizer_height - 1 - row] = line;
                 }
 
                 Paragraph::new(
@@ -1013,13 +1068,65 @@ pub fn render(f: &mut Frame, app: &mut App) {
                             } else {
                                 crate::theme::current().accent
                             };
-                            Line::from(vec![
-                                Span::raw(padding_str.clone()),
-                                Span::styled(l.clone(), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-                            ])
+                            Line::from(Span::styled(l.clone(), Style::default().fg(color)))
                         })
                         .collect::<Vec<_>>(),
                 )
+            }
+            VisualizerMode::Mirror => {
+                // The same smooth curve, grown up and down from the middle row so the
+                // spectrum forms one symmetric shape. The lower half needs cells filled
+                // from the top, which Unicode only offers as eighths from the bottom, so
+                // those cells draw the complementary lower block reversed: the glyph takes
+                // the terminal background and the rest of the cell takes the color.
+                let chars = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+                let height = visualizer_height;
+                let odd = height % 2 == 1;
+                let half = height / 2;
+                let theme = crate::theme::current();
+                // Color is a 2D gradient through the SpectrumOS palette: the hue sweeps
+                // across the width (bass → treble) and shifts further toward the tips, while
+                // cells hugging the center line sink toward the background for depth. Every
+                // stop comes from the live palette, so it follows wallpaper/theme changes.
+                let stops = [theme.accent, theme.accent_alt, theme.error, theme.warning, theme.success];
+                let width_f = (curve.len().max(2) - 1) as f32;
+                let color_at = |x: usize, dist: usize| {
+                    let t = if half == 0 { 0.0 } else { (dist as f32 / half as f32).min(1.0) };
+                    let pos = (x as f32 / width_f) * 0.75 + t * 0.25;
+                    let hue = palette_ramp(&stops, pos);
+                    mix_color(hue, theme.background, 0.45 * (1.0 - t).powi(2))
+                };
+                let lines: Vec<Line> = (0..height).map(|row| {
+                    // `d`: cells between this row and the center (0 = touching it).
+                    let upper = row < half;
+                    let d = if upper { half - 1 - row } else { row.saturating_sub(half + odd as usize) };
+                    let dist = if odd && row == half { 0 } else { d + odd as usize };
+                    let spans: Vec<Span> = curve.iter().enumerate().map(|(x, &val)| {
+                        let color = color_at(x, dist);
+                        let extent = val * height as f32 / 2.0;
+                        if odd && row == half {
+                            let c = if extent > 0.02 { "█" } else { " " };
+                            return Span::styled(c, Style::default().fg(color));
+                        }
+                        let base = if odd { 0.5 } else { 0.0 };
+                        let fill = (extent - base - d as f32).clamp(0.0, 1.0);
+                        let eighths = ((fill * 8.0).round() as usize).min(8);
+                        if eighths == 0 {
+                            Span::raw(" ")
+                        } else if eighths == 8 {
+                            Span::styled("█", Style::default().fg(color))
+                        } else if upper {
+                            Span::styled(chars[eighths].to_string(), Style::default().fg(color))
+                        } else {
+                            Span::styled(
+                                chars[8 - eighths].to_string(),
+                                Style::default().fg(color).add_modifier(Modifier::REVERSED),
+                            )
+                        }
+                    }).collect();
+                    Line::from(spans)
+                }).collect();
+                Paragraph::new(lines)
             }
             VisualizerMode::Waveform => {
                 let mut lines = vec![String::new(); visualizer_height];
@@ -1898,6 +2005,17 @@ fn render_add_to_collection_popup(f: &mut Frame, app: &mut App) {
 // Radio tab: station list + visualizer on the left like the Player tab, then
 // station details and the station's recently played songs. Returns the
 // visualizer area, which the shared player code draws into.
+// The list only takes the rows it needs (up to 60% of the column, at least
+// 5 rows); the visualizer below expands into all the remaining space.
+fn split_list_and_visualizer(area: Rect, list_rows: usize) -> std::rc::Rc<[Rect]> {
+    let max_list = (area.height as usize * 3 / 5).max(5);
+    let list_height = (list_rows + 2).clamp(5, max_list) as u16;
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(list_height), Constraint::Min(7)])
+        .split(area)
+}
+
 fn render_radio(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
     use crate::radio::STATIONS;
     let theme = crate::theme::current();
@@ -1915,12 +2033,8 @@ fn render_radio(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
             Constraint::Percentage(25),
         ])
         .split(area);
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(7)])
-        .split(columns[0]);
-
     let filtered = app.radio_filtered_indices();
+    let left = split_list_and_visualizer(columns[0], filtered.len());
     let name_width = STATIONS.iter().map(|s| s.name.width()).max().unwrap_or(0) + 2;
     let items: Vec<ListItem> = filtered
         .iter()
@@ -2144,7 +2258,7 @@ fn render_help_popup(f: &mut Frame, scroll: u16) {
         Line::from(vec![k("  d / x             "), d("Remove selected item")]),
         Line::from(vec![k("  K / J  Ctrl+↑/↓   "), d("Move item up / down")]),
         Line::from(vec![k("  C                 "), d("Clear entire queue")]),
-        Line::from(vec![k("  v                 "), d("Cycle visualizer: Spectrum → Waveform → Levels")]),
+        Line::from(vec![k("  v                 "), d("Cycle visualizer: Spectrum → Mirror → Waveform → Levels")]),
         Line::from(vec![k("  [ / ]             "), d("Visualizer decay slower / faster")]),
         Line::from(vec![k("  PgUp / PgDn       "), d("Scroll plain lyrics / browser")]),
         Line::from(""),
@@ -3761,8 +3875,61 @@ fn render_healer_editor(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+// Approximate RGB for the named colors used by the fallback theme, so gradients can
+// blend them the same way they blend a SpectrumOS palette's hex colors.
+fn color_rgb(c: Color) -> Option<(f32, f32, f32)> {
+    let (r, g, b) = match c {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Black => (0, 0, 0),
+        Color::Red => (205, 49, 49),
+        Color::Green => (13, 188, 121),
+        Color::Yellow => (229, 229, 16),
+        Color::Blue => (36, 114, 200),
+        Color::Magenta => (188, 63, 188),
+        Color::Cyan => (17, 168, 205),
+        Color::Gray => (204, 204, 204),
+        Color::DarkGray => (102, 102, 102),
+        Color::White => (229, 229, 229),
+        _ => return None,
+    };
+    Some((r as f32, g as f32, b as f32))
+}
+
+/// Linear blend from `a` toward `b` by `t` (0 = a, 1 = b). Colors without a known RGB
+/// value can't be blended, so the nearer endpoint is returned instead.
+fn mix_color(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    match (color_rgb(a), color_rgb(b)) {
+        (Some((ar, ag, ab)), Some((br, bg, bb))) => Color::Rgb(
+            (ar + (br - ar) * t).round() as u8,
+            (ag + (bg - ag) * t).round() as u8,
+            (ab + (bb - ab) * t).round() as u8,
+        ),
+        _ => if t < 0.5 { a } else { b },
+    }
+}
+
+/// Samples a smooth gradient through `stops` at `pos` in [0, 1].
+fn palette_ramp(stops: &[Color], pos: f32) -> Color {
+    if stops.len() == 1 {
+        return stops[0];
+    }
+    let scaled = pos.clamp(0.0, 1.0) * (stops.len() - 1) as f32;
+    let i = (scaled.floor() as usize).min(stops.len() - 2);
+    mix_color(stops[i], stops[i + 1], scaled - i as f32)
+}
+
 #[cfg(test)]
 mod synced_lyrics_tests {
+    #[test]
+    fn parses_colon_centiseconds_and_strips_word_marks() {
+        assert_eq!(super::parse_lrc_timestamp("01:02:50"), Some(62_500));
+        assert_eq!(super::parse_lrc_timestamp("01:02"), Some(62_000));
+        let parsed = super::parse_synced_lyrics("[00:01:00]<00:01.00>Hello <00:01.50>world").unwrap();
+        assert_eq!(parsed[0].timestamp_ms, 1_000);
+        assert_eq!(parsed[0].text, "Hello world");
+    }
+
     use super::*;
 
     #[test]
@@ -3795,3 +3962,4 @@ mod synced_lyrics_tests {
         assert_eq!(parsed[1].timestamp_ms, 2_750);
     }
 }
+

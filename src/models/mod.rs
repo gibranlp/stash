@@ -54,6 +54,13 @@ pub enum LyricsState {
     Fetching,
     Found(String),
     NotFound,
+    // A lookup failed for a temporary reason; another attempt runs at `retry_at`.
+    Retrying {
+        message: String,
+        retry_at: std::time::Instant,
+        attempt: u8,
+        max_attempts: u8,
+    },
     Error(String),
 }
 
@@ -61,6 +68,7 @@ pub enum LyricsState {
 pub enum VisualizerMode {
     #[default]
     Spectrum,
+    Mirror,
     Waveform,
     SignalLevels,
 }
