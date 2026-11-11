@@ -215,9 +215,13 @@ pub fn install_and_restart(release: &Release) -> anyhow::Result<std::convert::In
     let current_exe = std::env::current_exe()
         .and_then(|exe| exe.canonicalize())
         .context("Cannot locate the installed Stash executable")?;
+    #[cfg(target_os = "linux")]
+    let install_path = std::path::PathBuf::from("/usr/bin/stash");
+    #[cfg(not(target_os = "linux"))]
+    let install_path = current_exe.clone();
     println!("Updating Stash {CURRENT_VERSION} → {}", release.version);
     let mut last_pct = None;
-    let result = download_to(release, &current_exe, &mut |downloaded| {
+    let result = download_to(release, &install_path, &mut |downloaded| {
         let pct = downloaded.saturating_mul(100).checked_div(release.size).unwrap_or(0);
         if last_pct != Some(pct) {
             last_pct = Some(pct);
@@ -230,6 +234,17 @@ pub fn install_and_restart(release: &Release) -> anyhow::Result<std::convert::In
     relaunch.args(std::env::args_os().skip(1));
     match result {
         Ok(()) => {
+            relaunch = std::process::Command::new(&install_path);
+            relaunch.args(std::env::args_os().skip(1));
+            // Remove the old per-user copy so it cannot shadow /usr/bin/stash.
+            #[cfg(target_os = "linux")]
+            if dirs::home_dir().is_some_and(|home| current_exe == home.join(".local/bin/stash"))
+                && current_exe != install_path
+            {
+                if let Err(error) = std::fs::remove_file(&current_exe) {
+                    eprintln!("  Could not remove the old copy at {}: {error}", current_exe.display());
+                }
+            }
             println!("  Installed {}. Restarting Stash...", release.version);
             relaunch.env(UPDATED_ENV, &release.version).env_remove(FAILED_ENV);
         }

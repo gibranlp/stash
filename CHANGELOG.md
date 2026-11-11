@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.3 — 2026-11-10
+
+- Install Linux updates to `/usr/bin/stash`, including updates from older installation locations.
+- Recognize Ghostty's Kitty graphics support so image previews and album covers render as images instead of pixelated text blocks.
+
 ## 0.9.2 — 2026-11-04
 
 - Open audio files directly from a file manager ("Open with Stash"), including `file://` URIs: Stash starts in the file's folder, queues it and plays the chosen track.

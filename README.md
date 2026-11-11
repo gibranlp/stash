@@ -60,7 +60,7 @@ Stash checks GitHub for newer stable releases at startup and every six hours. Wh
 
 Set `"auto_update": false` in Stash's `config.json` to stop the popup; the footer still announces new versions and `U` installs them. Downloaded files must match the release's expected size and SHA-256 checksum; incomplete or invalid downloads leave the installed executable untouched.
 
-If Stash is installed in a system directory such as `/usr/bin`, the updater asks for your password with `sudo` (or `doas`) to install the new version.
+Linux updates install to `/usr/bin/stash` and remove an older copy in `~/.local/bin`. When administrator rights are required, the updater asks for your password with `sudo` (or `doas`) to install the new version.
 
 On Linux, Stash mounts USB sticks and external drives through udisks2 (`udisksctl`) when they are plugged in, or when Stash starts. Set `"auto_mount": false` in `config.json` to turn this off.
 

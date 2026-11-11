@@ -30,6 +30,33 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use app::App;
 
+fn supports_kitty_graphics(term: &str, term_program: &str, kitty_window: bool) -> bool {
+    kitty_window
+        || term.contains("kitty")
+        || term == "xterm-ghostty"
+        || matches!(term_program, "WezTerm" | "ghostty")
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::supports_kitty_graphics;
+
+    #[test]
+    fn detects_graphics_terminals_without_enabling_generic_xterm() {
+        for (term, program, window) in [
+            ("xterm-ghostty", "", false),
+            ("xterm-256color", "ghostty", false),
+            ("xterm-kitty", "", false),
+            ("xterm-256color", "WezTerm", false),
+            ("xterm-256color", "", true),
+        ] {
+            assert!(supports_kitty_graphics(term, program, window));
+        }
+        assert!(!supports_kitty_graphics("xterm-256color", "", false));
+        assert!(!supports_kitty_graphics("xterm-256color", "Apple_Terminal", false));
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ojo con esto: si truena el programa, hay que dejar el terminal como estaba
     // o se queda cagado sin echo ni nada
@@ -63,10 +90,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let term = std::env::var("TERM").unwrap_or_default();
     let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
 
-    // Kitty graphics protocol: Kitty terminal and WezTerm both support it.
-    let is_kitty = std::env::var("KITTY_WINDOW_ID").is_ok()
-        || term.contains("kitty")
-        || term_program == "WezTerm";
+    // Kitty, WezTerm and Ghostty support the Kitty graphics protocol.
+    let is_kitty = supports_kitty_graphics(
+        &term,
+        &term_program,
+        std::env::var("KITTY_WINDOW_ID").is_ok(),
+    );
 
     // Sixel: only terminals known to support it. foot, mlterm, yaft, Windows Terminal
     // (WT_SESSION), and iTerm2 (TERM_PROGRAM or ITERM_SESSION_ID).
