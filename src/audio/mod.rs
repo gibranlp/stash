@@ -20,6 +20,7 @@ pub enum AudioCommand {
     Pause,
     Resume,
     Stop,
+    Shutdown,
     SetVolume(u32),
     Seek(Duration),
 }
@@ -123,18 +124,30 @@ impl AudioEngine {
             let mut last_tick = Instant::now();
             let mut elapsed_millis: u128 = 0;
             let (visualizer_tx, visualizer_rx) = sync_channel::<VisualizerFrame>(2);
-            let mut sliding_buffer = vec![0.0; 512];
+            let hann: [f32; 512] = std::array::from_fn(|i|
+                0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / 511.0).cos()));
+            let band_ranges: [(usize, usize); 160] = std::array::from_fn(|i| (
+                (256.0 * (i as f32 / 160.0).powf(1.8)) as usize,
+                (256.0 * ((i + 1) as f32 / 160.0).powf(1.8)) as usize));
             // Bumped on every play/stop so late stream connections are discarded.
             let mut stream_generation: u64 = 0;
 
+            let mut pending_command = None;
             loop {
                 loop {
-                    let cmd = match command_rx.try_recv() {
+                    let cmd = if let Some(command) = pending_command.take() { command } else { match command_rx.try_recv() {
                         Ok(cmd) => cmd,
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
-                    };
+                    } };
                     match cmd {
+                        AudioCommand::Shutdown => {
+                            let mut state = state_clone.lock().unwrap();
+                            state.status = PlaybackStatus::Stopped;
+                            state.radio = None;
+                            state.lyrics_generation = state.lyrics_generation.wrapping_add(1);
+                            return;
+                        }
                         AudioCommand::Play(path) => {
                             if let Some(ref s) = sink {
                                 s.stop();
@@ -465,13 +478,10 @@ impl AudioEngine {
                 }
 
                 if let Some(frame) = latest_frame {
-                    sliding_buffer.copy_from_slice(&frame.samples);
-
                     // Ventana de Hanning pa reducir el spectral leakage antes del FFT
                     let mut fft_input = [Complex::new(0.0, 0.0); 512];
                     for i in 0..512 {
-                        let multiplier = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / 511.0).cos());
-                        fft_input[i] = Complex::new(sliding_buffer[i] * multiplier, 0.0);
+                        fft_input[i] = Complex::new(frame.samples[i] * hann[i], 0.0);
                     }
                     fft(&mut fft_input);
 
@@ -486,8 +496,7 @@ impl AudioEngine {
                     let num_bars: usize = 160;
                     let mut new_bars = [0.0; 160];
                     for (i, bar) in new_bars.iter_mut().enumerate() {
-                        let start = (256.0 * (i as f32 / num_bars as f32).powf(1.8)) as usize;
-                        let end = (256.0 * ((i + 1) as f32 / num_bars as f32).powf(1.8)) as usize;
+                        let (start, end) = band_ranges[i];
                         let end = end.min(256).max(start + 1);
 
                         let sum: f32 = magnitudes[start..end].iter().sum();
@@ -612,8 +621,15 @@ impl AudioEngine {
                     let _ = event_tx.send(crate::events::Event::AudioFinished);
                 }
 
-                // 16ms = ~60 FPS audio state updates
-                thread::sleep(Duration::from_millis(16));
+                // Sleep on the command channel while idle; play/pause/seek wake
+                // immediately, and active playback still updates at ~60 Hz.
+                let playing = state_clone.lock().unwrap().status == PlaybackStatus::Playing;
+                let timeout = Duration::from_millis(if playing { 16 } else { 250 });
+                match command_rx.recv_timeout(timeout) {
+                    Ok(command) => pending_command = Some(command),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {},
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                }
             }
         });
 
@@ -649,6 +665,14 @@ impl AudioEngine {
 
     pub fn seek(&self, position: Duration) {
         let _ = self.command_tx.send(AudioCommand::Seek(position));
+    }
+}
+
+impl Drop for AudioEngine {
+    fn drop(&mut self) {
+        // The stream worker owns a sender for connection callbacks, so channel
+        // disconnection alone cannot release it when an App is dropped.
+        let _ = self.command_tx.send(AudioCommand::Shutdown);
     }
 }
 
@@ -963,5 +987,22 @@ mod performance_tests {
             assert!((result.re - expected.re).abs() < 0.001);
             assert!((result.im - expected.im).abs() < 0.001);
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    #[test]
+    fn dropping_engine_releases_the_worker_and_shared_state() {
+        let (tx, _rx) = channel();
+        let engine = AudioEngine::new(tx, 0, RepeatMode::Off, false, 0.88);
+        let weak = Arc::downgrade(&engine.shared_state);
+        drop(engine);
+        let started = Instant::now();
+        while weak.strong_count() != 0 && started.elapsed() < Duration::from_secs(3) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(weak.strong_count(), 0, "Audio worker retained state after shutdown");
     }
 }

@@ -13,7 +13,7 @@ See [the changelog](CHANGELOG.md) for release notes.
 - **Discord Rich Presence**: Shows “Listening to Stash” with the song, artist, and playback progress in Discord or Vesktop on Linux/macOS. Reconnects automatically and clears the activity when playback pauses, stops, or Stash exits.
 - **Library**: Scans your music folders into one searchable, sortable list. Organize tracks into playlists and edit tags inline.
 - **Library Healer**: Finds tracks with missing or broken metadata and proposes fixes from the filename or online lookups, so you can review and apply them with one key.
-- **Internet Radio**: Tab `5` tunes in to the HAK.FM station lineup (SomaFM streams) with the same player bar, volume, spectrum visualizer, MPRIS and Discord activity as local tracks. Shows the song on air and the station's recently played tracks; star favorites with `f`, filter them with `F`, and search with `/`.
+- **Internet Radio**: Tab `3` tunes in to the HAK.FM station lineup (SomaFM streams) with the same player bar, volume, spectrum visualizer, MPRIS and Discord activity as local tracks. Shows the song on air and the station's recently played tracks; star favorites with `f`, filter them with `F`, and search with `/`.
 
 ---
 
@@ -79,3 +79,27 @@ See [the performance and release review](PERFORMANCE_REVIEW.md) for validation r
 - **gibranlp**
 - Homepage: [gibranlp.dev](https://gibranlp.dev)
 - Repository: [github.com/gibranlp/stash](https://github.com/gibranlp/stash)
+
+### Automatic album covers
+
+As you play local music, Stash checks for cover.jpg, folder.jpg, front.jpg (or PNG), then embedded artwork. If none is available, it searches MusicBrainz using the album and album artist (or track artist) tags, and downloads a matching front cover from the Cover Art Archive. Songs without album and artist tags are skipped. Covers are cached for offline playback and shared by tracks from the same album; failed lookups retry after an hour when a track is played again.
+
+Stash also embeds available covers in supported writable music files, including MP3, FLAC, Ogg Vorbis, and M4A, preserving existing embedded artwork and other tags. It edits a temporary copy before replacing the original so playback can continue. Read-only files, symbolic links, and hard links keep using the displayed cover without being modified. Downloaded covers stay in Stash's cache rather than creating a shared cover.jpg in folders that may contain multiple albums.
+
+Both features are enabled by default. Set `"download_album_art": false` or `"embed_album_art": false` in `config.json` and restart Stash to disable either behavior. Online lookups send album and artist names to MusicBrainz.
+
+### Podcasts (4)
+
+Press `4` for Podcasts. Use `/` to search the public Apple Podcasts directory, or `a` to paste an HTTP(S) podcast RSS feed URL. Adding a valid feed URL subscribes to it automatically; use `f` to subscribe or unsubscribe from a selected search result or opened podcast. `F` focuses your subscriptions. Subscriptions are local to Stash and persist across restarts.
+
+The left column has search results above a permanent subscriptions list. Use `Tab` or the left/right arrows to switch between search results, subscriptions, and episodes; `j`/`k` or the up/down arrows select an item. `Enter` opens a podcast, or downloads and plays an episode. `d` downloads an episode without playing it, `R` refreshes the selected feed, `Space` pauses/resumes, and `s` stops playback. In Episodes, `o` cycles newest first, oldest first, title A–Z, and title Z–A while keeping the selected episode highlighted. Download confirmations disappear after four seconds. A `↓` marks downloaded episodes.
+
+Stash creates `~/Podcasts` when you open this tab. Episodes go into named podcast subfolders there; subscriptions are stored in `~/Podcasts/subscriptions.json`, and cached feeds in `~/Podcasts/.feeds`. Existing episode downloads are reused, and cached feeds remain usable offline. Subscribing does not download an entire back catalog: choose the episodes you want with `Enter` or `d`.
+
+### Tabs and shared playback shortcuts
+
+Tabs use the same order everywhere: **1 Browser · 2 Player · 3 Radio · 4 Podcasts · 5 Library · 6 Healer**. Tab numbers do not switch screens while you are typing in a search field or dialog.
+
+Player, Radio, and Podcasts share `Space` / `p` for play/pause, `s` to stop, `n` / `b` for next/previous, `+` / `-` for volume, `/` to search, and `?` for help. `Enter` activates the highlighted item. For tracks and downloaded podcast episodes, `H` / `L` or `Shift+Left` / `Shift+Right` seek five seconds; live radio cannot seek. Next/previous on Podcasts follows the opened episode list and downloads an episode if needed. Stopping cancels pending podcast autoplay while letting a download finish.
+
+Use `f` to favorite a radio station or subscribe to a podcast; `F` filters radio favorites or focuses podcast subscriptions. Podcasts use `R` to refresh and `o` to sort episodes. Library also accepts `o` to sort. `r` cycles repeat for tracks/episodes and `z` shuffles the Player queue; unavailable live-radio operations show a notice. `v` cycles the visualizer in Player/Radio, and `[` / `]` adjust its decay (`<` / `>` remain aliases). Browser selection/file operations and Healer editing retain their contextual keys.

@@ -353,22 +353,13 @@ impl LibraryState {
                 }
                 "By Artist" => {
                     let mut result: Vec<&LibraryTrack> = self.tracks.iter().collect();
-                    result.sort_by(|a, b| {
-                        a.artist.as_deref().unwrap_or("").to_lowercase()
-                            .cmp(&b.artist.as_deref().unwrap_or("").to_lowercase())
-                            .then(a.album.as_deref().unwrap_or("").to_lowercase()
-                                .cmp(&b.album.as_deref().unwrap_or("").to_lowercase()))
-                            .then(a.track.unwrap_or(u32::MAX).cmp(&b.track.unwrap_or(u32::MAX)))
-                    });
+                    result.sort_by_cached_key(|t| (t.artist.as_deref().unwrap_or("").to_lowercase(),
+                        t.album.as_deref().unwrap_or("").to_lowercase(), t.track.unwrap_or(u32::MAX)));
                     result
                 }
                 "By Album" => {
                     let mut result: Vec<&LibraryTrack> = self.tracks.iter().collect();
-                    result.sort_by(|a, b| {
-                        a.album.as_deref().unwrap_or("").to_lowercase()
-                            .cmp(&b.album.as_deref().unwrap_or("").to_lowercase())
-                            .then(a.track.unwrap_or(u32::MAX).cmp(&b.track.unwrap_or(u32::MAX)))
-                    });
+                    result.sort_by_cached_key(|t| (t.album.as_deref().unwrap_or("").to_lowercase(), t.track.unwrap_or(u32::MAX)));
                     result
                 }
                 "Stats" => Vec::new(),
@@ -413,25 +404,15 @@ impl LibraryState {
         );
         let _ = &playlist_name; // used above
         if !keep_smart_sort && self.sort != LibrarySort::Default {
-            result.sort_by(|a, b| {
-                // None fields sort after all real values
-                let key = |s: Option<&str>| s.map(|v| v.to_lowercase()).unwrap_or_else(|| "\u{FFFF}".to_string());
-                match self.sort {
-                    LibrarySort::Title => key(a.title.as_deref()).cmp(&key(b.title.as_deref()))
-                        .then(key(a.artist.as_deref()).cmp(&key(b.artist.as_deref())))
-                        .then(a.track.unwrap_or(u32::MAX).cmp(&b.track.unwrap_or(u32::MAX))),
-                    LibrarySort::Artist => key(a.artist.as_deref()).cmp(&key(b.artist.as_deref()))
-                        .then(key(a.album.as_deref()).cmp(&key(b.album.as_deref())))
-                        .then(a.track.unwrap_or(u32::MAX).cmp(&b.track.unwrap_or(u32::MAX))),
-                    LibrarySort::Album => key(a.album.as_deref()).cmp(&key(b.album.as_deref()))
-                        .then(a.track.unwrap_or(u32::MAX).cmp(&b.track.unwrap_or(u32::MAX))),
-                    LibrarySort::Year => a.year.unwrap_or(u32::MAX).cmp(&b.year.unwrap_or(u32::MAX))
-                        .then(key(a.album.as_deref()).cmp(&key(b.album.as_deref())))
-                        .then(a.track.unwrap_or(u32::MAX).cmp(&b.track.unwrap_or(u32::MAX))),
-                    LibrarySort::Duration => a.duration_secs.unwrap_or(u64::MAX).cmp(&b.duration_secs.unwrap_or(u64::MAX)),
-                    LibrarySort::Default => std::cmp::Ordering::Equal,
-                }
-            });
+            let key = |s: Option<&str>| s.map(|v| v.to_lowercase()).unwrap_or_else(|| "\u{FFFF}".to_string());
+            match self.sort {
+                LibrarySort::Title => result.sort_by_cached_key(|t| (key(t.title.as_deref()), key(t.artist.as_deref()), t.track.unwrap_or(u32::MAX))),
+                LibrarySort::Artist => result.sort_by_cached_key(|t| (key(t.artist.as_deref()), key(t.album.as_deref()), t.track.unwrap_or(u32::MAX))),
+                LibrarySort::Album => result.sort_by_cached_key(|t| (key(t.album.as_deref()), t.track.unwrap_or(u32::MAX))),
+                LibrarySort::Year => result.sort_by_cached_key(|t| (t.year.unwrap_or(u32::MAX), key(t.album.as_deref()), t.track.unwrap_or(u32::MAX))),
+                LibrarySort::Duration => result.sort_by_key(|t| t.duration_secs.unwrap_or(u64::MAX)),
+                LibrarySort::Default => {}
+            }
         }
 
         result
@@ -811,5 +792,40 @@ fn apply_tag_fields(tag: &mut lofty::tag::Tag, editor: &TagEditorState) {
         tag.remove_year();
     } else if let Ok(n) = year_str.parse::<u32>() {
         tag.set_year(n);
+    }
+}
+
+#[cfg(test)]
+mod sorting_tests {
+    use super::*;
+    #[test]
+    fn cached_sort_keys_preserve_case_insensitive_order_and_missing_values() {
+        let mut library = LibraryState::new();
+        library.tracks = [
+            ("a", Some("Zulu"), Some("alpha"), Some("Beta"), Some(2), Some(2020), Some(300)),
+            ("b", Some("alpha"), Some("Beta"), Some("alpha"), Some(1), Some(2010), Some(100)),
+            ("c", Some("Alpha"), Some("alpha"), Some("Beta"), Some(1), None, None),
+            ("d", None, None, None, None, None, Some(0)),
+        ].into_iter().map(|(path, title, artist, album, track, year, duration_secs)| LibraryTrack {
+            path: path.into(), title: title.map(str::to_owned), artist: artist.map(str::to_owned), album: album.map(str::to_owned),
+            track, year, duration_secs, genre: None,
+        }).collect();
+        let collections = Collections::default();
+        let stats = ListenStats::default();
+        for (sort, expected) in [
+            (LibrarySort::Default, ["a", "b", "c", "d"]), (LibrarySort::Title, ["c", "b", "a", "d"]),
+            (LibrarySort::Artist, ["c", "a", "b", "d"]), (LibrarySort::Album, ["b", "c", "a", "d"]),
+            (LibrarySort::Year, ["b", "a", "c", "d"]), (LibrarySort::Duration, ["d", "b", "a", "c"]),
+        ] {
+            library.sort = sort;
+            let paths: Vec<_> = library.visible_tracks(&collections, "", &stats).iter().map(|t| t.path.to_string_lossy().into_owned()).collect();
+            assert_eq!(paths, expected, "{sort:?}");
+        }
+        library.sort = LibrarySort::Default;
+        for (name, expected) in [("By Artist", ["d", "c", "a", "b"]), ("By Album", ["d", "b", "c", "a"])] {
+            library.playlist_index = LibraryState::playlist_names(&collections).iter().position(|n| n == name).unwrap();
+            let paths: Vec<_> = library.visible_tracks(&collections, "", &stats).iter().map(|t| t.path.to_string_lossy().into_owned()).collect();
+            assert_eq!(paths, expected, "{name}");
+        }
     }
 }

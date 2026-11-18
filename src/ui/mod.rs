@@ -116,11 +116,50 @@ fn synced_lyrics_scroll(lines: &[Line<'_>], active: Option<usize>, inner: Rect) 
 }
 
 
+// Bass at both outside edges, rising toward treble in the center. Keep a
+// stable frequency order rather than sorting bars by each frame's loudness.
+fn balanced_spectrum_curve(bars: &[f32], width: usize) -> Vec<f32> {
+    if bars.is_empty() || width == 0 { return Vec::new(); }
+    if bars.len() == 1 || width <= 2 { return vec![bars[0]; width]; }
+    let n = bars.len();
+    let half = (width - 1) / 2;
+    let at = |i: isize| bars[i.clamp(0, n as isize - 1) as usize];
+    (0..width).map(|x| {
+        let from_edge = x.min(width - 1 - x);
+        let pos = from_edge as f32 / half as f32 * (n - 1) as f32;
+        let i = pos.floor() as isize;
+        let t = pos - i as f32;
+        let (p0, p1, p2, p3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+        let t2 = t * t;
+        let t3 = t2 * t;
+        (0.5 * (2.0 * p1 + (p2 - p0) * t
+            + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+            + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t3)).clamp(0.0, 1.0)
+    }).collect()
+}
+
+/// Single-line lists only construct the rows the terminal can display.
+fn centered_list_window(total: usize, selected: usize, height: usize) -> std::ops::Range<usize> {
+    let selected = selected.min(total.saturating_sub(1));
+    let start = selected.saturating_sub(height / 2).min(total.saturating_sub(height));
+    start..start.saturating_add(height).min(total)
+}
+
+fn render_list_window(f: &mut Frame, list: List<'_>, area: Rect,
+    state: &mut ratatui::widgets::ListState, window: &std::ops::Range<usize>) {
+    *state.offset_mut() = window.start;
+    let selected = state.selected().filter(|i| window.contains(i)).map(|i| i - window.start);
+    let mut local = ratatui::widgets::ListState::default().with_selected(selected);
+    f.render_stateful_widget(list, area, &mut local);
+}
+
 pub fn render(f: &mut Frame, app: &mut App) {
     // Snapshot the active SpectrumOS-derived theme for this frame so every render
     // helper below (many take no `App` at all — popups, the help screen, ...) can
     // read it via `crate::theme::current()`.
     crate::theme::set_current(app.theme);
+    let playing = app.audio.shared_state.lock().unwrap().status == PlaybackStatus::Playing;
+    app.vinyl_clock.update(std::time::Instant::now(), playing);
     let show_player_and_vis = app.shows_player();
     let show_header = app.screen == AppScreen::Browser;
 
@@ -130,21 +169,21 @@ pub fn render(f: &mut Frame, app: &mut App) {
             Constraint::Length(0),
             Constraint::Min(5),
             Constraint::Length(5),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ]
     } else if show_header {
         vec![
             Constraint::Length(3),
             Constraint::Min(5),
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ]
     } else {
         vec![
             Constraint::Length(0),
             Constraint::Min(5),
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ]
     };
 
@@ -288,9 +327,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
             // Sacamos selected_paths antes del closure para evitar conflicto de borrows con files_to_render
             let selected_paths = &app.browser.selected_paths;
 
+            let file_window = centered_list_window(files_to_render.len(), file_index_to_use,
+                tree_area.height.saturating_sub(2) as usize);
             let file_list_items: Vec<ListItem> = files_to_render
                 .iter()
                 .enumerate()
+                .skip(file_window.start).take(file_window.len())
                 .map(|(idx, file)| {
                     let is_highlighted = idx == file_index_to_use;
                     let is_now_playing = current_playing_path.as_ref().map(|p| p == &file.path).unwrap_or(false);
@@ -373,7 +415,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 .collect();
 
             let pane_title = if app.search.active {
-                format!(" Search Results (query: {}) ", app.search.query)
+                format!(" Search Results{} (query: {}) ", if app.search.loading { " — searching…" } else { "" }, app.search.query)
             } else {
                 format!(" Explorer: {} ", app.browser.current_dir.to_string_lossy())
             };
@@ -387,24 +429,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
                         .title(pane_title),
                 );
 
-            // Centramos el scroll para que el elemento seleccionado siempre quede a la mitad de la vista
-            let h = tree_area.height.saturating_sub(2) as usize;
-            let total = files_to_render.len();
-            let target_offset = if total <= h {
-                0
-            } else {
-                let half = h / 2;
-                if file_index_to_use < half {
-                    0
-                } else if file_index_to_use >= total.saturating_sub(half) {
-                    total.saturating_sub(h)
-                } else {
-                    file_index_to_use.saturating_sub(half)
-                }
-            };
-            *app.files_list_state.offset_mut() = target_offset;
             app.files_list_state.select(Some(file_index_to_use));
-            f.render_stateful_widget(files_list, tree_area, &mut app.files_list_state);
+            render_list_window(f, files_list, tree_area, &mut app.files_list_state, &file_window);
 
             if let Some(panel_area) = devices_panel_area {
                 let drives = &app.external_drives;
@@ -535,8 +561,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
             let queue_chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Percentage(50),
                     Constraint::Percentage(25),
+                    Constraint::Percentage(50),
                     Constraint::Percentage(25),
                 ])
                 .split(chunks[1]);
@@ -544,13 +570,16 @@ pub fn render(f: &mut Frame, app: &mut App) {
             let queue_border_style = Style::default().fg(crate::theme::current().accent);
             let filtered_indices = app.get_filtered_queue_indices();
 
-            // Split the left column: queue list on top, visualizer fills the rest
-            let left_chunks = split_list_and_visualizer(queue_chunks[0], filtered_indices.len());
-            vis_rect = Some(left_chunks[1]);
+            // Center column: queue list on top, visualizer fills the rest
+            let center_chunks = split_list_and_visualizer(queue_chunks[1], filtered_indices.len());
+            vis_rect = Some(center_chunks[1]);
 
+            let queue_window = centered_list_window(filtered_indices.len(), app.queue_selected_index,
+                center_chunks[0].height.saturating_sub(2) as usize);
             let queue_list_items: Vec<ListItem> = filtered_indices
                 .iter()
                 .enumerate()
+                .skip(queue_window.start).take(queue_window.len())
                 .map(|(idx, &(base_idx, orig_idx))| {
                     let path = &app.queue.items[orig_idx];
                     let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Unknown".to_string());
@@ -592,24 +621,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
                         .title(pane_title),
                 );
 
-            // Mismo truco del scroll centrado que en el browser
-            let h = left_chunks[0].height.saturating_sub(2) as usize;
-            let total = filtered_indices.len();
-            let target_offset = if total <= h {
-                0
-            } else {
-                let half = h / 2;
-                if app.queue_selected_index < half {
-                    0
-                } else if app.queue_selected_index >= total.saturating_sub(half) {
-                    total.saturating_sub(h)
-                } else {
-                    app.queue_selected_index.saturating_sub(half)
-                }
-            };
-            *app.queue_list_state.offset_mut() = target_offset;
             app.queue_list_state.select(Some(app.queue_selected_index));
-            f.render_stateful_widget(queue_list, left_chunks[0], &mut app.queue_list_state);
+            render_list_window(f, queue_list, center_chunks[0], &mut app.queue_list_state, &queue_window);
 
             let info_block = Block::default()
                 .borders(Borders::ALL)
@@ -617,8 +630,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 .border_style(Style::default().fg(crate::theme::current().accent_alt))
                 .title(" Track Information ");
 
-            let info_inner = info_block.inner(queue_chunks[1]);
-            f.render_widget(info_block, queue_chunks[1]);
+            let info_inner = info_block.inner(queue_chunks[0]);
+            f.render_widget(info_block, queue_chunks[0]);
 
             if active_track.is_some() {
                 let info_subchunks = Layout::default()
@@ -878,6 +891,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
         AppScreen::Healer => {
             render_healer(f, app, chunks[1]);
         }
+        AppScreen::Podcasts => {
+            render_podcasts(f, app, chunks[1]);
+        }
         AppScreen::Radio => {
             vis_rect = Some(render_radio(f, app, chunks[1]));
         }
@@ -967,8 +983,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
         let player_text = player_lines;
 
+        if let Some(vis_area) = vis_rect {
         let bars = audio_state.visualizer_data.clone();
-        let vis_area = vis_rect.unwrap_or_default();
         let visualizer_height = (vis_area.height.saturating_sub(2) as usize).max(3);
 
         // Interpolamos las barras del visualizador para que llenen el ancho disponible de la terminal
@@ -1007,31 +1023,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
             app.config.visualizer_decay
         );
 
-            // One column per terminal cell with no gaps, so the spectrum reads as a
-            // single continuous shape instead of separate bars. The bands are resampled
-            // with Catmull-Rom so the outline curves smoothly between them.
-            let width = available_width as usize;
-            let curve: Vec<f32> = if bars.is_empty() || width == 0 {
-                Vec::new()
-            } else if bars.len() == 1 || width == 1 {
-                vec![bars[0]; width]
-            } else {
-                let n = bars.len();
-                let at = |i: isize| bars[i.clamp(0, n as isize - 1) as usize];
-                (0..width).map(|x| {
-                    let pos = x as f32 / (width - 1) as f32 * (n - 1) as f32;
-                    let i = pos.floor() as isize;
-                    let t = pos - i as f32;
-                    let (p0, p1, p2, p3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
-                    let t2 = t * t;
-                    let t3 = t2 * t;
-                    (0.5 * (2.0 * p1
-                        + (p2 - p0) * t
-                        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
-                        + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t3))
-                        .clamp(0.0, 1.0)
-                }).collect()
-            };
+        // A continuous, smoothly interpolated spectrum on each side, with the
+        // usually quieter high frequencies meeting in the middle.
+        let curve = balanced_spectrum_curve(&bars, available_width as usize);
 
         let vis_para = match app.config.visualizer_mode {
             VisualizerMode::Spectrum => {
@@ -1085,14 +1079,15 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 let half = height / 2;
                 let theme = crate::theme::current();
                 // Color is a 2D gradient through the SpectrumOS palette: the hue sweeps
-                // across the width (bass → treble) and shifts further toward the tips, while
+                // from the outside edges (bass) to the center (treble), and toward the tips, while
                 // cells hugging the center line sink toward the background for depth. Every
                 // stop comes from the live palette, so it follows wallpaper/theme changes.
                 let stops = [theme.accent, theme.accent_alt, theme.error, theme.warning, theme.success];
-                let width_f = (curve.len().max(2) - 1) as f32;
+                let half_width = ((curve.len().saturating_sub(1)) / 2).max(1) as f32;
                 let color_at = |x: usize, dist: usize| {
                     let t = if half == 0 { 0.0 } else { (dist as f32 / half as f32).min(1.0) };
-                    let pos = (x as f32 / width_f) * 0.75 + t * 0.25;
+                    let from_edge = x.min(curve.len().saturating_sub(1).saturating_sub(x));
+                    let pos = (from_edge as f32 / half_width) * 0.75 + t * 0.25;
                     let hue = palette_ramp(&stops, pos);
                     mix_color(hue, theme.background, 0.45 * (1.0 - t).powi(2))
                 };
@@ -1232,6 +1227,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 .title(vis_title),
         );
         f.render_widget(vis_para, vis_area);
+        }
 
         let player_widget = Paragraph::new(player_text).block(
             Block::default()
@@ -1243,88 +1239,42 @@ pub fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(player_widget, chunks[2]);
     }
 
-    // Active screen tab: bright key + white label.  Inactive: dim number + dim label.
-    let ak  = |s: &'static str| Span::styled(s, Style::default().fg(crate::theme::current().background).bg(crate::theme::current().accent));
-    let al  = |s: &'static str| Span::styled(s, Style::default().fg(crate::theme::current().foreground).add_modifier(Modifier::BOLD));
-    let ik  = |s: &'static str| Span::styled(s, Style::default().fg(crate::theme::current().muted));
-    let sep = || Span::styled("  │  ", Style::default().fg(crate::theme::current().muted));
-    let ck  = |s: &'static str| Span::styled(s, Style::default().fg(crate::theme::current().background).bg(crate::theme::current().accent));
-    let cl  = |s: &'static str| Span::styled(s, Style::default().fg(crate::theme::current().foreground));
-
-    let help_bar_spans = match app.screen {
-        AppScreen::Browser => vec![
-            ak(" 1 "), al(" Browser "),
-            ik(" 2 "),
-            ik(" 3 "),
-            ik(" 4 "),
-            ik(" 5 "),
-            sep(),
-            ck(" Space "), cl(" Select "),
-            ck(" q "), cl(" Queue "),
-            ck(" v "), cl(" Copy "),
-            ck(" a "), cl(" Playlist "),
-            ck(" / "), cl(" Search "),
-            ck(" ? "), cl(" Help "),
-        ],
-        AppScreen::Queue => vec![
-            ik(" 1 "),
-            ak(" 2 "), al(" Player "),
-            ik(" 3 "),
-            ik(" 4 "),
-            ik(" 5 "),
-            sep(),
-            ck(" Space "), cl(" Play/Pause "),
-            ck(" n/b "), cl(" Next/Prev "),
-            ck(" s "), cl(" Stop "),
-            ck(" C "), cl(" Clear "),
-            ck(" / "), cl(" Search "),
-            ck(" ? "), cl(" Help "),
-        ],
-        AppScreen::Library => vec![
-            ik(" 1 "),
-            ik(" 2 "),
-            ak(" 3 "), al(" Library "),
-            ik(" 4 "),
-            ik(" 5 "),
-            sep(),
-            ck(" Tab "), cl(" Panels "),
-            ck(" Enter "), cl(" Play All "),
-            ck(" e "), cl(" Edit Tags "),
-            ck(" s "), cl(" Sort "),
-            ck(" / "), cl(" Filter "),
-            ck(" ? "), cl(" Help "),
-        ],
-        AppScreen::Healer => vec![
-            ik(" 1 "),
-            ik(" 2 "),
-            ik(" 3 "),
-            ak(" 4 "), al(" Healer "),
-            ik(" 5 "),
-            sep(),
-            ck(" s "), cl(" Scan "),
-            ck(" l "), cl(" Lookup "),
-            ck(" Enter "), cl(" Apply "),
-            ck(" Esc "), cl(" Back "),
-            ck(" ? "), cl(" Help "),
-        ],
-        AppScreen::Radio => vec![
-            ik(" 1 "),
-            ik(" 2 "),
-            ik(" 3 "),
-            ik(" 4 "),
-            ak(" 5 "), al(" Radio "),
-            sep(),
-            ck(" Enter "), cl(" Tune In "),
-            ck(" Space "), cl(" Play/Pause "),
-            ck(" n/b "), cl(" Next/Prev "),
-            ck(" f "), cl(" Favorite "),
-            ck(" / "), cl(" Search "),
-            ck(" ? "), cl(" Help "),
-        ],
+    let theme = crate::theme::current();
+    let key = |text: &'static str| Span::styled(text, Style::default().fg(theme.background).bg(theme.accent));
+    let label = |text: &'static str| Span::styled(text, Style::default().fg(theme.foreground));
+    let mut tabs = Vec::new();
+    for (number, name, screen) in AppScreen::TABS {
+        let active = app.screen == screen;
+        tabs.push(Span::styled(format!(" {number} "), if active {
+            Style::default().fg(theme.background).bg(theme.accent)
+        } else { Style::default().fg(theme.muted) }));
+        if active {
+            tabs.push(Span::styled(format!(" {name} "), Style::default().fg(if active { theme.foreground } else { theme.muted })));
+        }
+    }
+    let actions = if app.shows_player() {
+        let mut actions = vec![key(" Space/p "), label(" ▶/Ⅱ "), key(" s "), label(" ■ "),
+            key(" n/b "), label(" »/« "), key(" +/- "), label(" ♪ "), key(" / "), label(" ⌕ ")];
+        match app.screen {
+            AppScreen::Queue => actions.extend([key(" r/z "), label(" ↻/⤨ "), key(" v "), label(" ▂▄▆ ")]),
+            AppScreen::Radio => actions.extend([key(" f/F "), label(" ★/≡ "), key(" v "), label(" ▂▄▆ ")]),
+            AppScreen::Podcasts => actions.extend([key(" f/F "), label(" ★/≡ "), key(" R "), label(" ↻ "),
+                key(" o "), label(" ↕ "), key(" a "), label(" +↗ "), key(" d "), label(" ↓ ")]),
+            _ => {}
+        }
+        actions.extend([key(" ? "), label(" ? ")]); actions
+    } else {
+        match app.screen {
+            AppScreen::Browser => vec![key(" Space "), label(" ✓ "), key(" Q "), label(" ▶ "),
+                key(" v "), label(" ⧉ "), key(" a "), label(" ≡ "), key(" / "), label(" ⌕ "), key(" ? "), label(" ? ")],
+            AppScreen::Library => vec![key(" Tab "), label(" ▥ "), key(" Enter "), label(" ▶▶ "),
+                key(" e "), label(" ✎ "), key(" o "), label(" ↕ "), key(" / "), label(" ⌕ "), key(" ? "), label(" ? ")],
+            AppScreen::Healer => vec![key(" s "), label(" ⌕ "), key(" l "), label(" ↗ "),
+                key(" Enter "), label(" ✓ "), key(" Esc "), label(" ← "), key(" ? "), label(" ? ")],
+            _ => Vec::new(),
+        }
     };
-
-    let help_bar = Paragraph::new(Line::from(help_bar_spans));
-    f.render_widget(help_bar, chunks[3]);
+    f.render_widget(Paragraph::new(vec![Line::from(tabs), Line::from(actions)]), chunks[3]);
 
     let update_state = app.update.lock().unwrap().clone();
     if !show_player_and_vis || !matches!(update_state, crate::updater::UpdateProgress::Idle) {
@@ -1370,7 +1320,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 }
             }
         };
-        let update_area = if show_player_and_vis { chunks[3] } else { chunks[2] };
+        let update_area = if show_player_and_vis {
+            Rect::new(chunks[3].x, chunks[3].y.saturating_add(1), chunks[3].width, 1)
+        } else { chunks[2] };
         f.render_widget(Paragraph::new(sep_line), update_area);
     }
 
@@ -2002,6 +1954,77 @@ fn render_add_to_collection_popup(f: &mut Frame, app: &mut App) {
     f.render_widget(ratatui::widgets::Paragraph::new(hint), vchunks[2]);
 }
 
+fn render_podcasts(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::podcasts::PodcastPane;
+    let theme = crate::theme::current();
+    let p = &mut app.podcasts;
+    let rows = Layout::default().direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(if p.prompt.is_some() { 3 } else { 2 })]).split(area);
+    let columns = Layout::default().direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(45), Constraint::Percentage(25)]).split(rows[0]);
+    let left = Layout::default().direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)]).split(columns[0]);
+    let border = |focused| Style::default().fg(if focused { theme.accent } else { theme.muted });
+    let show_window = centered_list_window(p.shows.len(), p.show_index, left[0].height.saturating_sub(2) as usize);
+    let subscription_window = centered_list_window(p.subscriptions.len(), p.subscription_index, left[1].height.saturating_sub(2) as usize);
+    let episode_window = centered_list_window(p.feed.as_ref().map_or(0, |feed| feed.episodes.len()), p.episode_index,
+        columns[1].height.saturating_sub(2) as usize);
+    let shows: Vec<ListItem> = p.shows.iter().skip(show_window.start).take(show_window.len()).map(|show| {
+        ListItem::new(format!("{} {}", if p.subscribed(show) { "★" } else { " " }, show.title))
+    }).collect();
+    let shows_title = " Podcast Search Results [/] ";
+    p.show_list_state.select((!p.shows.is_empty()).then_some(p.show_index));
+    render_list_window(f, List::new(shows).block(Block::default().borders(Borders::ALL)
+        .title(shows_title).border_style(border(p.focus == PodcastPane::Discover)))
+        .highlight_style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)).highlight_symbol("› "), left[0], &mut p.show_list_state, &show_window);
+    let subscriptions: Vec<ListItem> = p.subscriptions.iter().skip(subscription_window.start).take(subscription_window.len()).map(|show| ListItem::new(format!("★ {}", show.title))).collect();
+    p.subscription_list_state.select((!p.subscriptions.is_empty()).then_some(p.subscription_index));
+    let subscriptions_title = format!(" Subscriptions [{}] ", p.subscriptions.len());
+    render_list_window(f, List::new(subscriptions).block(Block::default().borders(Borders::ALL)
+        .title(subscriptions_title).border_style(border(p.focus == PodcastPane::Subscriptions)))
+        .highlight_style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)).highlight_symbol("› "), left[1], &mut p.subscription_list_state, &subscription_window);
+    if p.subscriptions.is_empty() {
+        let inner = Block::default().borders(Borders::ALL).inner(left[1]);
+        f.render_widget(Paragraph::new("No subscriptions yet.
+Search with / or add a feed with a.").wrap(ratatui::widgets::Wrap { trim: true }).style(Style::default().fg(theme.muted)), inner);
+    }
+    let items: Vec<ListItem> = p.feed.as_ref().map(|feed| feed.episodes.iter().skip(episode_window.start).take(episode_window.len()).map(|e| {
+        ListItem::new(format!("{} {}", if p.downloaded.contains(&e.url) { "↓" } else { " " }, e.title))
+    }).collect()).unwrap_or_default();
+    p.episode_list_state.select(p.feed.as_ref().filter(|feed| !feed.episodes.is_empty()).map(|_| p.episode_index));
+    let episodes_title = p.feed.as_ref().map(|feed| format!(" {} — Episodes · {} [o] ", feed.show.title, p.episode_sort.label())).unwrap_or_else(|| " Episodes ".into());
+    render_list_window(f, List::new(items).block(Block::default().borders(Borders::ALL)
+        .title(episodes_title).border_style(border(p.focus == PodcastPane::Episodes)))
+        .highlight_style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)).highlight_symbol("› "), columns[1], &mut p.episode_list_state, &episode_window);
+    let mut details = Vec::new();
+    if let Some(feed) = &p.feed {
+        details.push(Line::from(Span::styled(feed.show.title.clone(), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))));
+        details.push(Line::from(feed.show.author.clone()));
+        details.push(Line::from(""));
+        if let Some(e) = feed.episodes.get(p.episode_index) {
+            details.push(Line::from(Span::styled(e.title.clone(), Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD))));
+            details.push(Line::from(e.date.clone()));
+            if !e.duration.is_empty() { details.push(Line::from(format!("Duration: {}", e.duration))); }
+            details.push(Line::from(""));
+            details.push(Line::from(e.description.clone()));
+        } else { details.push(Line::from(feed.description.clone())); }
+    } else {
+        details.push(Line::from("Discover podcasts with /"));
+        details.push(Line::from("Add an RSS feed with a"));
+        details.push(Line::from("Subscribe with f"));
+        details.push(Line::from("Tab switches lists"));
+        details.push(Line::from("Enter downloads and plays"));
+        details.push(Line::from("d downloads for later"));
+    }
+    f.render_widget(Paragraph::new(details).wrap(ratatui::widgets::Wrap { trim: true })
+        .block(Block::default().borders(Borders::ALL).title(" Podcast Details ").border_style(border(false))), columns[2]);
+    let status = if let Some(prompt) = p.prompt {
+        format!("{}: {}▏  [Enter submits · Esc cancels]", if prompt == crate::podcasts::Prompt::Search { "Search podcasts" } else { "Podcast RSS feed URL" }, p.input)
+    } else { format!("{}  |  / Search · a Add URL · f Subscribe · F Subscriptions · R Refresh · o Sort episodes · s Stop", p.progress_text()) };
+    f.render_widget(Paragraph::new(status).style(Style::default().fg(if p.busy { theme.warning } else { theme.accent_alt }))
+        .wrap(ratatui::widgets::Wrap { trim: false }), rows[1]);
+}
+
 // Radio tab: station list + visualizer on the left like the Player tab, then
 // station details and the station's recently played songs. Returns the
 // visualizer area, which the shared player code draws into.
@@ -2192,7 +2215,7 @@ fn render_help_popup(f: &mut Frame, scroll: u16) {
 
     let help_text = vec![
         Line::from(h("── Screens ────────────────────────────────────────────────")),
-        Line::from(vec![k("  1 / 2 / 3 / 4 / 5 "), d("Browser / Queue / Library / Healer / Radio")]),
+        Line::from(vec![k("  1 / 2 / 3 / 4 / 5 / 6 "), d("Browser / Player / Radio / Podcasts / Library / Healer")]),
         Line::from(vec![k("  Q                "), d("Toggle Queue overlay from any screen")]),
         Line::from(""),
         Line::from(h("── Browser — Navigation ───────────────────────────────────")),
@@ -2221,14 +2244,14 @@ fn render_help_popup(f: &mut Frame, scroll: u16) {
         Line::from(vec![k("  E                 "), d("Jump to external drives")]),
         Line::from(vec![k("  /                 "), d("Search files")]),
         Line::from(""),
-        Line::from(h("── Library ────────────────────────────────────────────────")),
+        Line::from(h("── Library (5) ────────────────────────────────────────────────")),
         Line::from(vec![k("  Tab / Shift+Tab   "), d("Switch Playlists ↔ Tracks panel")]),
         Line::from(vec![k("  j / k  ↑ / ↓     "), d("Navigate")]),
         Line::from(vec![k("  PgUp / PgDn       "), d("Jump 10 rows")]),
         Line::from(vec![k("  Enter             "), d("Play all visible tracks from cursor")]),
         Line::from(vec![k("  Space             "), d("Append track to queue")]),
         Line::from(vec![k("  e                 "), d("Open tag editor for selected track")]),
-        Line::from(vec![k("  s                 "), d("Cycle sort: Default → Title → Artist → Album → Year → Duration")]),
+        Line::from(vec![k("  o                 "), d("Cycle sort: Default → Title → Artist → Album → Year → Duration")]),
         Line::from(vec![k("  a                 "), d("Add track to a playlist")]),
         Line::from(vec![k("  N                 "), d("New playlist (Playlists panel)")]),
         Line::from(vec![k("  D                 "), d("Delete playlist (with confirmation)")]),
@@ -2243,18 +2266,17 @@ fn render_help_popup(f: &mut Frame, scroll: u16) {
         Line::from(vec![k("  Esc               "), d("Stop typing / close editor")]),
         Line::from(vec![k("  w                 "), d("Save tags to file")]),
         Line::from(""),
-        Line::from(h("── Playback ───────────────────────────────────────────────")),
-        Line::from(vec![k("  Space  (Queue)    "), d("Pause / Resume")]),
-        Line::from(vec![k("  p / P             "), d("Pause / Resume (any screen)")]),
-        Line::from(vec![k("  n / b             "), d("Next / Previous track")]),
-        Line::from(vec![k("  s                 "), d("Stop playback (Browser / Queue)")]),
+        Line::from(h("── Shared Playback ───────────────────────────────────────────────")),
+        Line::from(vec![k("  Space / p / P     "), d("Play / pause (Player / Radio / Podcasts)")]),
+        Line::from(vec![k("  n / b             "), d("Next / previous track, station or episode")]),
+        Line::from(vec![k("  s                 "), d("Stop playback (Player / Radio / Podcasts)")]),
         Line::from(vec![k("  Shift+← / →       "), d("Seek −5 / +5 seconds")]),
         Line::from(vec![k("  H / L             "), d("Seek −5 / +5 seconds (Vim style)")]),
         Line::from(vec![k("  + / -             "), d("Volume up / down")]),
         Line::from(vec![k("  r                 "), d("Cycle Repeat: Off → All → One")]),
         Line::from(vec![k("  z                 "), d("Toggle Shuffle")]),
         Line::from(""),
-        Line::from(h("── Queue ──────────────────────────────────────────────────")),
+        Line::from(h("── Player (2) ──────────────────────────────────────────────────")),
         Line::from(vec![k("  d / x             "), d("Remove selected item")]),
         Line::from(vec![k("  K / J  Ctrl+↑/↓   "), d("Move item up / down")]),
         Line::from(vec![k("  C                 "), d("Clear entire queue")]),
@@ -2262,11 +2284,19 @@ fn render_help_popup(f: &mut Frame, scroll: u16) {
         Line::from(vec![k("  [ / ]             "), d("Visualizer decay slower / faster")]),
         Line::from(vec![k("  PgUp / PgDn       "), d("Scroll plain lyrics / browser")]),
         Line::from(""),
-        Line::from(h("── Radio (5) ──────────────────────────────────────────────")),
+        Line::from(h("── Podcasts (4) ──────────────────────────────────────────")),
+        Line::from(vec![k("  / / a             "), d("Search podcasts / add and subscribe to RSS feed URL")]),
+        Line::from(vec![k("  Tab / ← / →       "), d("Cycle search results, subscriptions and episodes")]),
+        Line::from(vec![k("  Enter / d         "), d("Open show or download and play episode / download only")]),
+        Line::from(vec![k("  f / F / R         "), d("Subscribe or unsubscribe / focus subscriptions / refresh feed")]),
+        Line::from(vec![k("  o                 "), d("Sort episodes: newest / oldest / title A–Z / title Z–A")]),
+        Line::from(vec![k("  Space / s         "), d("Pause or resume / stop; episodes saved in ~/Podcasts")]),
+        Line::from(""),
+        Line::from(h("── Radio (3) ──────────────────────────────────────────────")),
         Line::from(vec![k("  j / k  ↑ / ↓     "), d("Move through stations")]),
         Line::from(vec![k("  Enter             "), d("Tune in to highlighted station")]),
         Line::from(vec![k("  Space             "), d("Pause / resume live (reconnects on resume)")]),
-        Line::from(vec![k("  n / b  l / h      "), d("Next / previous station")]),
+        Line::from(vec![k("  n / b             "), d("Next / previous station")]),
         Line::from(vec![k("  s                 "), d("Stop radio")]),
         Line::from(vec![k("  f                 "), d("Toggle favorite station")]),
         Line::from(vec![k("  F                 "), d("Show favorites only")]),
@@ -2274,7 +2304,7 @@ fn render_help_popup(f: &mut Frame, scroll: u16) {
         Line::from(vec![k("  Esc               "), d("Clear filters")]),
         Line::from(vec![k("  v  [ / ]          "), d("Visualizer mode / decay")]),
         Line::from(""),
-        Line::from(h("── Library Healer (4) ─────────────────────────────────────")),
+        Line::from(h("── Library Healer (6) ─────────────────────────────────────")),
         Line::from(vec![k("  s / Enter         "), d("Start scan  (Menu)")]),
         Line::from(vec![k("  r                 "), d("View report  (Menu)")]),
         Line::from(vec![k("  f                 "), d("Go to file list  (Menu / Report)")]),
@@ -2421,7 +2451,7 @@ fn render_image_preview(f: &mut Frame, app: &mut App, area: Rect, path: &PathBuf
             && let Some((_, image)) = &app.current_image_data {
                 app.image_graphics.request(Some(crate::preview::GraphicsRequest {
                     path: path.clone(), width: area.width, height: area.height,
-                    image: std::sync::Arc::clone(image), picker, kitty_id: 1,
+                    image: std::sync::Arc::clone(image), picker, kitty_id: 1, vinyl_phase: None,
                 }));
                 app.image_graphics_request = Some(key);
                 app.current_image_protocol = None;
@@ -2494,10 +2524,23 @@ fn render_image_preview(f: &mut Frame, app: &mut App, area: Rect, path: &PathBuf
     }
 }
 
+fn cover_background(app: &App) -> [u8; 3] {
+    match crate::theme::current().background {
+        Color::Rgb(r, g, b) => [r, g, b],
+        _ => app.picker.and_then(|p| p.background_color).map(|c| c.0).unwrap_or([0, 0, 0]),
+    }
+}
+
 fn render_cover_preview(f: &mut Frame, app: &mut App, area: Rect, path: &PathBuf) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+
+    // Keep the record compact in roomy player panes while still shrinking to
+    // fit small windows. Both graphics and half-block renderers share this cap.
+    let cover_height = area.height.min(10);
+    let area = Rect::new(area.x, area.y + (area.height - cover_height) / 2,
+        area.width, cover_height);
 
     if let Some(error) = &app.cover_error {
         f.render_widget(Paragraph::new(format!("Preview unavailable: {error}")), area);
@@ -2511,81 +2554,79 @@ fn render_cover_preview(f: &mut Frame, app: &mut App, area: Rect, path: &PathBuf
         return;
     }
 
-    if let Some(picker) = app.picker.filter(|p| p.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks) {
-        let key = (path.clone(), area.width, area.height);
-        if app.cover_graphics_request.as_ref() != Some(&key)
-            && let Some((_, image)) = &app.current_cover_data {
-                app.cover_graphics.request(Some(crate::preview::GraphicsRequest {
-                    path: path.clone(), width: area.width, height: area.height,
-                    image: std::sync::Arc::clone(image), picker, kitty_id: 2,
-                }));
-                app.cover_graphics_request = Some(key);
-                app.current_cover_protocol = None;
-        }
+    let phase = app.vinyl_clock.phase(std::time::Duration::ZERO);
+    if let Some(mut picker) = app.picker.filter(|p| p.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks) {
+        picker.background_color = Some(image::Rgb(cover_background(app)));
+        // Terminal cells are taller than they are wide. Size in physical pixels
+        // first so the disc remains round, then center its cell rectangle.
+        let (fw, fh) = picker.font_size;
+        let side = (u32::from(area.width) * u32::from(fw))
+            .min(u32::from(area.height) * u32::from(fh));
+        let width = (side / u32::from(fw.max(1))) as u16;
+        let height = (side / u32::from(fh.max(1))) as u16;
+        if width == 0 || height == 0 { return; }
+        let disc_area = Rect::new(area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2, width, height);
+        // Finish the current frame before requesting another. Slow terminal
+        // encoders keep their last complete frame instead of starving the worker.
         if let Some((request, result)) = app.cover_graphics.poll() {
+            app.cover_frame_pending = false;
             match result {
                 Ok(protocol) => app.current_cover_protocol = Some((request.path, request.width, request.height, protocol)),
                 Err(error) => app.cover_error = Some(error),
             }
         }
-        if let Some((_, _, _, protocol)) = &mut app.current_cover_protocol {
-            // Already resized and encoded by the worker; render without encoding again.
-            protocol.render(area, f.buffer_mut());
-        } else {
-            f.render_widget(Paragraph::new("Preparing preview..."), area);
+        // Pipeline the next display instant. At each 60 Hz deadline, show the
+        // completed frame and prepare the next instead of waiting another tick.
+        let phase = app.vinyl_clock.phase(crate::preview::VINYL_FRAME_INTERVAL);
+        let key = (path.clone(), width, height, phase);
+        if !app.cover_frame_pending && app.cover_graphics_request.as_ref() != Some(&key)
+            && let Some((_, image)) = &app.current_cover_data {
+                app.cover_graphics.request(Some(crate::preview::GraphicsRequest {
+                    path: path.clone(), width, height,
+                    image: std::sync::Arc::clone(image), picker, kitty_id: app.cover_next_kitty_id,
+                    vinyl_phase: Some(phase),
+                }));
+                app.cover_graphics_request = Some(key);
+                app.cover_frame_pending = true;
+                // Upload into the hidden slot; never replace the visible image
+                // while the terminal is still receiving its next frame.
+                app.cover_next_kitty_id = if app.cover_next_kitty_id == 2 { 3 } else { 2 };
+        }
+        if let Some((_, w, h, protocol)) = &mut app.current_cover_protocol
+            && *w == width && *h == height {
+            protocol.render(disc_area, f.buffer_mut());
         }
         return;
     }
 
-    // Mismo fallback halfblock que render_image_preview
     let cached = app.current_cover_lines.as_ref()
-        .map(|(p, w, h, _)| p == path && *w == area.width && *h == area.height)
+        .map(|(p, w, h, angle, _)| p == path && *w == area.width && *h == area.height && *angle == phase)
         .unwrap_or(false);
-
-    if cached {
-        if let Some((_, _, _, ref lines)) = app.current_cover_lines {
-            let res_w = lines.first().map(|l| l.width() as u16).unwrap_or(0);
-            let res_h = lines.len() as u16;
-            let dx = area.x + (area.width.saturating_sub(res_w)) / 2;
-            let dy = area.y + (area.height.saturating_sub(res_h)) / 2;
-            for (y, line) in lines.iter().enumerate() {
-                f.render_widget(Paragraph::new(line.clone()), Rect::new(dx, dy + y as u16, res_w, 1));
-            }
-        }
-        return;
-    }
-
-    if let Some((_, ref img)) = app.current_cover_data {
-        use image::GenericImageView;
-        let area_w = area.width as u32;
-        let area_h = (area.height as u32).saturating_mul(2);
-        let resized = img.resize(area_w, area_h, image::imageops::FilterType::Triangle);
-        let res_w = resized.width() as u16;
-        let res_h = resized.height() as u16;
-        let dx = area.x + (area.width.saturating_sub(res_w)) / 2;
-        let dy = area.y + (area.height.saturating_sub(res_h / 2)) / 2;
+    if !cached && let Some((_, image)) = &app.current_cover_data {
+        let side = u32::from(area.width).min(u32::from(area.height) * 2);
+        let image = crate::preview::vinyl_frame(image, side, phase);
+        let background = cover_background(app);
+        let rgb = |pixel: image::Rgba<u8>| {
+            let a = u16::from(pixel[3]);
+            let channel = |i: usize| ((u16::from(pixel[i]) * a + u16::from(background[i]) * (255 - a)) / 255) as u8;
+            Color::Rgb(channel(0), channel(1), channel(2))
+        };
         let mut lines = Vec::new();
-        for y in 0..(res_h / 2) {
-            let mut spans = Vec::with_capacity(res_w as usize);
-            for x in 0..res_w {
-                let p_top = resized.get_pixel(x as u32, y as u32 * 2);
-                let p_bot = if y as u32 * 2 + 1 < res_h as u32 {
-                    resized.get_pixel(x as u32, y as u32 * 2 + 1)
-                } else {
-                    p_top
-                };
-                spans.push(Span::styled(
-                    "▄",
-                    Style::default()
-                        .fg(Color::Rgb(p_bot[0], p_bot[1], p_bot[2]))
-                        .bg(Color::Rgb(p_top[0], p_top[1], p_top[2])),
-                ));
-            }
+        for y in 0..(side / 2) {
+            let spans: Vec<_> = (0..side).map(|x| Span::styled("▄", Style::default()
+                .fg(rgb(image.get_pixel(x, y * 2 + 1)))
+                .bg(rgb(image.get_pixel(x, y * 2))))).collect();
             lines.push(Line::from(spans));
         }
-        app.current_cover_lines = Some((path.clone(), area.width, area.height, lines.clone()));
+        app.current_cover_lines = Some((path.clone(), area.width, area.height, phase, lines));
+    }
+    if let Some((_, _, _, _, lines)) = &app.current_cover_lines {
+        let width = lines.first().map(|l| l.width() as u16).unwrap_or(0);
+        let dx = area.x + area.width.saturating_sub(width) / 2;
+        let dy = area.y + area.height.saturating_sub(lines.len() as u16) / 2;
         for (y, line) in lines.iter().enumerate() {
-            f.render_widget(Paragraph::new(line.clone()), Rect::new(dx, dy + y as u16, res_w, 1));
+            f.render_widget(Paragraph::new(line.clone()), Rect::new(dx, dy + y as u16, width, 1));
         }
     }
 }
@@ -3070,7 +3111,7 @@ fn render_library_tracks(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         String::new()
     };
-    let title = format!(" Library — {} tracks{}{}{}{}  [s] Sort  [m] Mark ", app.library.tracks.len(), filter_suffix, sort_label, scan_suffix, marked_label);
+    let title = format!(" Library — {} tracks{}{}{}{}  [o] Sort  [m] Mark ", app.library.tracks.len(), filter_suffix, sort_label, scan_suffix, marked_label);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3131,7 +3172,9 @@ fn render_library_tracks(f: &mut Frame, app: &mut App, area: Rect) {
     )));
     f.render_widget(header, track_chunks[0]);
 
-    let items: Vec<ListItem> = visible.iter().enumerate().map(|(i, track)| {
+    let list_area = track_chunks[1];
+    let track_window = centered_list_window(visible.len(), app.library.track_index, list_area.height as usize);
+    let items: Vec<ListItem> = visible.iter().enumerate().skip(track_window.start).take(track_window.len()).map(|(i, track)| {
         let is_sel = i == app.library.track_index;
         let is_playing = active_track.as_ref().map(|p| p == &track.path).unwrap_or(false);
         let is_marked = app.library.selected_tracks.contains(&track.path);
@@ -3190,26 +3233,8 @@ fn render_library_tracks(f: &mut Frame, app: &mut App, area: Rect) {
 
     let list = List::new(items);
 
-    // Centered scroll: keep selected track in the middle of the visible area
-    let list_area = track_chunks[1];
-    let h = list_area.height as usize;
-    let total = visible.len();
-    let sel = app.library.track_index;
-    let target_offset = if total <= h {
-        0
-    } else {
-        let half = h / 2;
-        if sel < half {
-            0
-        } else if sel >= total.saturating_sub(half) {
-            total.saturating_sub(h)
-        } else {
-            sel.saturating_sub(half)
-        }
-    };
-    *app.library_track_list_state.offset_mut() = target_offset;
-    app.library_track_list_state.select(Some(sel));
-    f.render_stateful_widget(list, list_area, &mut app.library_track_list_state);
+    app.library_track_list_state.select(Some(app.library.track_index));
+    render_list_window(f, list, list_area, &mut app.library_track_list_state, &track_window);
 }
 
 fn library_track_column_widths(total_width: usize) -> (usize, usize, usize) {
@@ -3963,3 +3988,61 @@ mod synced_lyrics_tests {
     }
 }
 
+
+#[cfg(test)]
+mod balanced_spectrum_tests {
+    use super::balanced_spectrum_curve;
+
+    #[test]
+    fn bass_is_balanced_at_both_edges_and_treble_meets_in_the_center() {
+        for width in [3, 4, 9, 10, 79, 80] {
+            let curve = balanced_spectrum_curve(&[1.0, 0.7, 0.3, 0.05], width);
+            assert_eq!(curve.len(), width);
+            assert_eq!(curve[0], 1.0);
+            assert_eq!(curve[width - 1], 1.0);
+            assert!((curve[width / 2] - 0.05).abs() < 0.00001);
+            for x in 0..width {
+                assert_eq!(curve[x], curve[width - 1 - x]);
+                assert!((0.0..=1.0).contains(&curve[x]));
+            }
+        }
+    }
+
+    #[test]
+    fn handles_empty_and_narrow_visualizers() {
+        assert!(balanced_spectrum_curve(&[], 10).is_empty());
+        assert!(balanced_spectrum_curve(&[1.0], 0).is_empty());
+        assert_eq!(balanced_spectrum_curve(&[0.5], 4), vec![0.5; 4]);
+        assert_eq!(balanced_spectrum_curve(&[0.8, 0.1], 1), vec![0.8]);
+        assert_eq!(balanced_spectrum_curve(&[0.8, 0.1], 2), vec![0.8; 2]);
+    }
+}
+
+#[cfg(test)]
+mod viewport_tests {
+    use super::*;
+    #[test]
+    fn virtual_rows_preserve_full_list_output_and_absolute_selection() {
+        use ratatui::{backend::TestBackend, Terminal, widgets::ListState};
+        for height in [2, 3, 6, 12] {
+            for selected in [0, 1, 50, 98, 99] {
+                let window = centered_list_window(100, selected, height as usize - 2);
+                let list = |range: std::ops::Range<usize>| List::new(range.map(|i| format!("Row {i:03}")).collect::<Vec<_>>())
+                    .block(Block::default().borders(Borders::ALL)).highlight_symbol("› ")
+                    .highlight_style(Style::default().fg(Color::Cyan));
+                let mut full = Terminal::new(TestBackend::new(20, height)).unwrap();
+                let mut full_state = ListState::default().with_selected(Some(selected));
+                *full_state.offset_mut() = window.start;
+                full.draw(|f| f.render_stateful_widget(list(0..100), f.size(), &mut full_state)).unwrap();
+                let mut sliced = Terminal::new(TestBackend::new(20, height)).unwrap();
+                let mut sliced_state = ListState::default().with_selected(Some(selected));
+                sliced.draw(|f| render_list_window(f, list(window.clone()), f.size(), &mut sliced_state, &window)).unwrap();
+                assert_eq!(full.backend().buffer(), sliced.backend().buffer(), "height={height}, selected={selected}");
+                assert_eq!(sliced_state.selected(), Some(selected));
+                assert_eq!(sliced_state.offset(), window.start);
+            }
+        }
+        assert_eq!(centered_list_window(0, 0, 10), 0..0);
+        assert_eq!(centered_list_window(100, 200, 10), 90..100);
+    }
+}

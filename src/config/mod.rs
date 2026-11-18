@@ -16,6 +16,10 @@ pub struct AppConfig {
     // Mount USB sticks and external drives as soon as they are plugged in.
     #[serde(default = "auto_mount_default")]
     pub auto_mount: bool,
+    #[serde(default = "auto_update_default")]
+    pub download_album_art: bool,
+    #[serde(default = "auto_update_default")]
+    pub embed_album_art: bool,
     #[serde(default)]
     pub shuffle: bool,
     #[serde(default)]
@@ -52,6 +56,8 @@ impl Default for AppConfig {
             auto_resume: true,
             auto_update: true,
             auto_mount: true,
+            download_album_art: true,
+            embed_album_art: true,
             shuffle: false,
             repeat: RepeatMode::Off,
             visualizer_mode: VisualizerMode::Spectrum,

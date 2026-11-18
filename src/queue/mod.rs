@@ -19,24 +19,26 @@ impl PlaybackQueue {
     }
 
     pub fn add(&mut self, path: PathBuf) {
-        if !self.items.contains(&path) {
-            self.items.push(path);
-            // Keep an existing shuffle order valid: slot the new track somewhere
-            // random after the one that is playing.
-            if !self.shuffle_indices.is_empty() {
-                let after = self
-                    .current_index
-                    .and_then(|curr| self.shuffle_indices.iter().position(|&x| x == curr))
-                    .map_or(0, |pos| pos + 1);
-                let at = thread_rng().gen_range(after..=self.shuffle_indices.len());
-                self.shuffle_indices.insert(at, self.items.len() - 1);
-            }
+        if !self.items.contains(&path) { self.append_unique(path); }
+    }
+
+    fn append_unique(&mut self, path: PathBuf) {
+        self.items.push(path);
+        if !self.shuffle_indices.is_empty() {
+            let after = self.current_index
+                .and_then(|curr| self.shuffle_indices.iter().position(|&x| x == curr))
+                .map_or(0, |pos| pos + 1);
+            let at = thread_rng().gen_range(after..=self.shuffle_indices.len());
+            self.shuffle_indices.insert(at, self.items.len() - 1);
         }
     }
 
     pub fn add_many(&mut self, paths: Vec<PathBuf>) {
+        // One membership index per batch replaces a full queue scan per file.
+        let mut seen: std::collections::HashSet<PathBuf> = self.items.iter().cloned().collect();
+        self.items.reserve(paths.len());
         for path in paths {
-            self.add(path);
+            if seen.insert(path.clone()) { self.append_unique(path); }
         }
     }
 
@@ -204,5 +206,36 @@ mod tests {
 
         queue.current_index = Some(2);
         assert_eq!(queue.next(false), None);
+    }
+}
+
+#[cfg(test)]
+mod batch_performance_tests {
+    use super::*;
+    #[test]
+    fn batches_deduplicate_and_preserve_the_current_shuffle_prefix() {
+        let mut queue = PlaybackQueue::new();
+        queue.add_many(vec!["a".into(), "b".into(), "a".into()]);
+        queue.current_index = Some(1);
+        queue.regenerate_shuffle_indices();
+        let position = queue.shuffle_indices.iter().position(|&i| i == 1).unwrap();
+        let prefix = queue.shuffle_indices[..=position].to_vec();
+        queue.add_many(vec!["b".into(), "c".into(), "c".into(), "d".into()]);
+        assert_eq!(queue.items, [PathBuf::from("a"), "b".into(), "c".into(), "d".into()]);
+        assert_eq!(queue.current_track(), Some(PathBuf::from("b")));
+        assert_eq!(queue.shuffle_indices[..prefix.len()], prefix);
+        let mut sorted = queue.shuffle_indices.clone(); sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    #[ignore = "manual bulk queue benchmark"]
+    fn bulk_enqueue_probe() {
+        let paths = (0..10_000).map(|i| PathBuf::from(format!("/music/album/track-{i:05}.mp3"))).collect();
+        let mut queue = PlaybackQueue::new();
+        let start = std::time::Instant::now();
+        queue.add_many(paths);
+        eprintln!("enqueue-10000: {:.3} ms", start.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(queue.items.len(), 10_000);
     }
 }

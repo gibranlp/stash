@@ -1,4 +1,5 @@
 mod app;
+mod artwork;
 mod audio;
 mod automount;
 mod browser;
@@ -12,7 +13,9 @@ mod models;
 mod queue;
 mod preview;
 mod radio;
+mod podcasts;
 mod search;
+mod shortcuts;
 mod stats;
 mod theme;
 mod ui;
@@ -21,10 +24,10 @@ mod updater;
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc::channel;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use crossterm::{
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, BeginSynchronizedUpdate, EndSynchronizedUpdate},
     cursor::{Hide, Show},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
@@ -37,32 +40,13 @@ fn supports_kitty_graphics(term: &str, term_program: &str, kitty_window: bool) -
         || matches!(term_program, "WezTerm" | "ghostty")
 }
 
-#[cfg(test)]
-mod terminal_tests {
-    use super::supports_kitty_graphics;
-
-    #[test]
-    fn detects_graphics_terminals_without_enabling_generic_xterm() {
-        for (term, program, window) in [
-            ("xterm-ghostty", "", false),
-            ("xterm-256color", "ghostty", false),
-            ("xterm-kitty", "", false),
-            ("xterm-256color", "WezTerm", false),
-            ("xterm-256color", "", true),
-        ] {
-            assert!(supports_kitty_graphics(term, program, window));
-        }
-        assert!(!supports_kitty_graphics("xterm-256color", "", false));
-        assert!(!supports_kitty_graphics("xterm-256color", "Apple_Terminal", false));
-    }
-}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ojo con esto: si truena el programa, hay que dejar el terminal como estaba
     // o se queda cagado sin echo ni nada
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
+        let _ = execute!(io::stdout(), EndSynchronizedUpdate, crossterm::event::DisableBracketedPaste);
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
         let _ = execute!(stdout, LeaveAlternateScreen, Show);
@@ -131,8 +115,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App::new(tx, initial_path, picker);
 
-    // Draw on events, with a 30 FPS fallback during playback. Bound event batches
-    // so an input burst cannot starve rendering.
+    // Present one complete animation frame per 60 Hz deadline. The worker
+    // prepares the following frame in parallel; input never changes the cadence.
+    let mut next_player_frame = Instant::now();
     while !app.should_quit {
         // souvlaki's macOS backend (MPRemoteCommandCenter/MPNowPlayingInfoCenter) talks to
         // mediaremoted/nowplayingd over an XPC connection scheduled on this thread's run
@@ -146,7 +131,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             true,
         );
 
-        if let Ok(event) = rx.recv_timeout(Duration::from_millis(33)) {
+        let animated_player = app.screen == app::AppScreen::Queue
+            && app.audio.shared_state.lock().unwrap().status == models::PlaybackStatus::Playing;
+        let frame_interval = crate::preview::VINYL_FRAME_INTERVAL;
+        let wait = if animated_player {
+            next_player_frame.saturating_duration_since(Instant::now())
+        } else {
+            Duration::from_millis(33)
+        };
+        if let Ok(event) = rx.recv_timeout(wait) {
             app.handle_event(event);
             for e in rx.try_iter().take(255) {
                 app.handle_event(e);
@@ -154,7 +147,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else if app.audio.shared_state.lock().unwrap().status != models::PlaybackStatus::Playing {
             continue;
         }
-        terminal.draw(|f| ui::render(f, &mut app))?;
+        if animated_player {
+            let now = Instant::now();
+            if now < next_player_frame { continue; }
+            next_player_frame += frame_interval;
+            if next_player_frame <= now {
+                next_player_frame = now + frame_interval;
+            }
+        } else {
+            next_player_frame = Instant::now();
+        }
+        // Commit image uploads and text changes together. Otherwise a terminal
+        // can display a partly replaced image while processing a large frame.
+        execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+        let draw_result = terminal.draw(|f| ui::render(f, &mut app)).map(|_| ());
+        let end_result = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+        draw_result?;
+        end_result?;
     }
 
     disable_raw_mode()?;
@@ -172,4 +181,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::supports_kitty_graphics;
+
+    #[test]
+    fn detects_graphics_terminals_without_enabling_generic_xterm() {
+        for (term, program, window) in [
+            ("xterm-ghostty", "", false),
+            ("xterm-256color", "ghostty", false),
+            ("xterm-kitty", "", false),
+            ("xterm-256color", "WezTerm", false),
+            ("xterm-256color", "", true),
+        ] {
+            assert!(supports_kitty_graphics(term, program, window));
+        }
+        assert!(!supports_kitty_graphics("xterm-256color", "", false));
+        assert!(!supports_kitty_graphics("xterm-256color", "Apple_Terminal", false));
+    }
 }

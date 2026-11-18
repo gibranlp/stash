@@ -30,9 +30,18 @@ use crate::preview::{PreviewLoader, LatestLoader, GraphicsRequest, GraphicsProto
 pub enum AppScreen {
     Browser,
     Queue,
+    Radio,
+    Podcasts,
     Library,
     Healer,
-    Radio,
+}
+
+impl AppScreen {
+    pub const TABS: [(char, &'static str, Self); 6] = [
+        ('1', "Browser", Self::Browser), ('2', "Player", Self::Queue),
+        ('3', "Radio", Self::Radio), ('4', "Podcasts", Self::Podcasts),
+        ('5', "Library", Self::Library), ('6', "Healer", Self::Healer),
+    ];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +249,7 @@ pub struct App {
     pub file_progress: Arc<Mutex<Option<FileOperationProgress>>>,
     pub files_list_state: ListState,
     pub queue_list_state: ListState,
+    pub podcasts: crate::podcasts::PodcastState,
     pub radio_selected_index: usize,
     pub radio_list_state: ListState,
     pub radio_favorites_only: bool,
@@ -266,13 +276,16 @@ pub struct App {
     pub current_cover_path: Option<PathBuf>,
     pub current_cover_data: Option<(PathBuf, Arc<image::DynamicImage>)>,
     pub cover_graphics: LatestLoader<GraphicsRequest, GraphicsProtocol>,
-    pub cover_graphics_request: Option<(PathBuf, u16, u16)>,
+    pub cover_graphics_request: Option<(PathBuf, u16, u16, u16)>,
+    pub cover_frame_pending: bool,
+    pub cover_next_kitty_id: u8,
+    pub vinyl_clock: crate::preview::VinylClock,
     pub loading_cover: PreviewLoader<image::DynamicImage>,
     pub cover_error: Option<String>,
     cover_lookup: PreviewLoader<Option<PathBuf>>,
     cover_track: Option<PathBuf>,
     pub current_cover_protocol: Option<(PathBuf, u16, u16, Box<dyn ratatui_image::protocol::ResizeProtocol>)>,
-    pub current_cover_lines: Option<(PathBuf, u16, u16, Vec<ratatui::text::Line<'static>>)>,
+    pub current_cover_lines: Option<(PathBuf, u16, u16, u16, Vec<ratatui::text::Line<'static>>)>,
     pub last_cover_file: Option<PathBuf>,
     pub text_scroll_offset: usize,
     pub current_text_data: Option<(PathBuf, Vec<String>)>,
@@ -513,6 +526,8 @@ impl App {
 
     pub fn new(event_tx: std::sync::mpsc::Sender<Event>, initial_path: Option<PathBuf>, picker: Option<ratatui_image::picker::Picker>) -> Self {
         let config = AppConfig::load();
+        let download_art = config.download_album_art;
+        let embed_art = config.embed_album_art;
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         // A file manager ("Open with Stash") hands us a file, possibly as a file:// URI.
@@ -622,6 +637,7 @@ impl App {
             file_progress: Arc::new(Mutex::new(None)),
             files_list_state: ListState::default(),
             queue_list_state: ListState::default(),
+            podcasts: crate::podcasts::PodcastState::new(),
             radio_selected_index: 0,
             radio_list_state: ListState::default(),
             radio_favorites_only: false,
@@ -648,10 +664,15 @@ impl App {
             current_cover_path: None,
             current_cover_data: None,
             loading_cover: PreviewLoader::new(|p| crate::preview::load_image(p)),
-            cover_graphics: LatestLoader::new(crate::preview::prepare_graphics),
+            cover_graphics: LatestLoader::new(crate::preview::graphics_encoder()),
             cover_graphics_request: None,
+            cover_frame_pending: false,
+            cover_next_kitty_id: 2,
+            vinyl_clock: crate::preview::VinylClock::default(),
             cover_error: None,
-            cover_lookup: PreviewLoader::new(|path| Ok(Self::find_cover_art(path))),
+            cover_lookup: PreviewLoader::new(move |path| {
+                Ok(crate::artwork::resolve(path, download_art, embed_art))
+            }),
             cover_track: None,
             current_cover_protocol: None,
             current_cover_lines: None,
@@ -842,6 +863,13 @@ impl App {
             Event::Key(key) => self.handle_key(key),
             Event::Paste(content) => self.handle_paste(content),
             Event::Tick => {
+                self.search.poll();
+                self.podcasts.poll();
+                if let Some(path) = self.podcasts.play_ready.take() {
+                    self.queue.add(path.clone());
+                    self.queue.current_index = self.queue.items.iter().position(|p| p == &path);
+                    self.audio.play(path);
+                }
                 let update_interval = crate::updater::check_interval(&self.update.lock().unwrap());
                 if self.last_update_check.elapsed() >= update_interval {
                     crate::updater::spawn_check(self.update.clone());
@@ -966,6 +994,7 @@ impl App {
                     self.current_cover_data = None;
                     self.current_cover_protocol = None;
                     self.cover_graphics_request = None;
+                    self.cover_frame_pending = false;
                     self.cover_graphics.request(None);
                     self.current_cover_lines = None;
                     self.cover_error = None;
@@ -1161,6 +1190,11 @@ impl App {
             return;
         }
 
+        if self.screen == AppScreen::Podcasts && self.input_mode == InputMode::Normal && self.podcasts.prompt.is_some() {
+            self.podcasts.edit_key(key);
+            return;
+        }
+
         if self.input_mode == InputMode::Normal
             && key.code == KeyCode::Char('q') {
                 self.save_session_on_quit();
@@ -1262,48 +1296,22 @@ impl App {
             return;
         }
 
-        // Number keys switch screens from anywhere
-        if key.modifiers.is_empty() {
-            match key.code {
-                KeyCode::Char('1') => {
-                    self.screen = AppScreen::Browser;
-                    self.search.active = false;
-                    self.search.query.clear();
-                    return;
-                }
-                KeyCode::Char('2') => {
-                    self.screen = AppScreen::Queue;
-                    self.search.active = false;
-                    self.search.query.clear();
-                    self.queue_selected_index = 0;
-                    self.sync_queue_selection();
-                    return;
-                }
-                KeyCode::Char('3') => {
-                    self.screen = AppScreen::Library;
-                    self.search.active = false;
-                    self.search.query.clear();
-                    if self.library.scan_state == ScanState::Idle {
-                        self.library.start_scan(&self.config.music_folders);
-                    }
-                    return;
-                }
-                KeyCode::Char('4') => {
-                    self.screen = AppScreen::Healer;
-                    self.search.active = false;
-                    self.search.query.clear();
-                    return;
-                }
-                KeyCode::Char('5') => {
-                    self.screen = AppScreen::Radio;
-                    self.search.active = false;
-                    self.search.query.clear();
-                    self.sync_radio_selection();
-                    return;
-                }
+        if key.modifiers.is_empty() && let KeyCode::Char(code) = key.code
+            && let Some(&(_, _, screen)) = AppScreen::TABS.iter().find(|(number, _, _)| *number == code) {
+            self.screen = screen;
+            self.search.active = false;
+            self.search.query.clear();
+            match screen {
+                AppScreen::Queue => { self.queue_selected_index = 0; self.sync_queue_selection(); }
+                AppScreen::Radio => self.sync_radio_selection(),
+                AppScreen::Podcasts => self.podcasts.open(),
+                AppScreen::Library if self.library.scan_state == ScanState::Idle => self.library.start_scan(&self.config.music_folders),
                 _ => {}
             }
+            return;
         }
+
+        if self.shows_player() && self.handle_shared_playback_key(key) { return; }
 
         if self.screen == AppScreen::Library {
             self.handle_library_normal_key(key);
@@ -1314,6 +1322,8 @@ impl App {
             self.handle_healer_key(key);
             return;
         }
+
+        if self.screen == AppScreen::Podcasts && self.podcasts.key(key) { return; }
 
         if self.screen == AppScreen::Radio && self.handle_radio_key(key) {
             return;
@@ -2501,7 +2511,7 @@ impl App {
                 }
             }
             AppScreen::Library => {}
-            AppScreen::Healer | AppScreen::Radio => {}
+            AppScreen::Healer | AppScreen::Radio | AppScreen::Podcasts => {}
         }
     }
 
@@ -2523,7 +2533,7 @@ impl App {
                 }
             }
             AppScreen::Library => {}
-            AppScreen::Healer | AppScreen::Radio => {}
+            AppScreen::Healer | AppScreen::Radio | AppScreen::Podcasts => {}
         }
     }
 
@@ -2611,7 +2621,7 @@ impl App {
                 }
             }
             AppScreen::Library => {}
-            AppScreen::Healer | AppScreen::Radio => {}
+            AppScreen::Healer | AppScreen::Radio | AppScreen::Podcasts => {}
         }
     }
 
@@ -2680,7 +2690,7 @@ impl App {
                     }
             }
             AppScreen::Library => {}
-            AppScreen::Healer | AppScreen::Radio => {}
+            AppScreen::Healer | AppScreen::Radio | AppScreen::Podcasts => {}
         }
     }
 
@@ -2864,7 +2874,7 @@ impl App {
         }
 
         // Si no hay imagen en disco, intentamos extraerla del tag del archivo y cacheamos en disco
-        if let Ok(tagged_file) = Probe::open(track_path).and_then(|p| p.read())
+        if let Ok(tagged_file) = Probe::open(track_path).and_then(|p| p.options(lofty::config::ParseOptions::new().read_properties(false)).read())
             && let Some(picture) = tagged_file.tags().iter().flat_map(|tag| tag.pictures()).next() {
                     let data = picture.data();
                     if let Some(cache_dir) = dirs::cache_dir() {
@@ -2934,7 +2944,98 @@ impl App {
 
     // Screens with the audio player bar and visualizer.
     pub fn shows_player(&self) -> bool {
-        matches!(self.screen, AppScreen::Queue | AppScreen::Radio)
+        matches!(self.screen, AppScreen::Queue | AppScreen::Radio | AppScreen::Podcasts)
+    }
+
+    fn handle_shared_playback_key(&mut self, key: KeyEvent) -> bool {
+        use crate::shortcuts::{playback_action, PlaybackAction};
+        let Some(action) = playback_action(key) else {
+            // Modified playback keys must not fall through to legacy/context
+            // handlers and accidentally stop, seek, or start another source.
+            let plain = KeyEvent::new(key.code, key.modifiers & KeyModifiers::SHIFT);
+            return playback_action(plain).is_some();
+        };
+        match action {
+            PlaybackAction::Toggle => {
+                let (stopped, connecting) = { let state = self.audio.shared_state.lock().unwrap();
+                    (state.status == PlaybackStatus::Stopped, state.radio.as_ref().is_some_and(|r| r.connecting)) };
+                if stopped && !connecting {
+                    match self.screen {
+                        AppScreen::Queue => self.activate_item(),
+                        AppScreen::Radio => self.tune_selected_station(),
+                        AppScreen::Podcasts => self.podcasts.play_selected(),
+                        _ => {}
+                    }
+                } else { self.toggle_playback(); }
+            }
+            PlaybackAction::Stop => {
+                self.podcasts.cancel_pending_playback();
+                self.audio.stop(); self.queue.current_index = None;
+            }
+            PlaybackAction::Next => self.step_playback(1),
+            PlaybackAction::Previous => self.step_playback(-1),
+            PlaybackAction::Volume(delta) => {
+                let volume = self.audio.shared_state.lock().unwrap().volume;
+                let volume = (volume as i32 + delta).clamp(0, 100) as u32;
+                self.audio.set_volume(volume); self.config.default_volume = volume;
+                let _ = self.config.save();
+            }
+            PlaybackAction::Seek(seconds) => {
+                if self.radio_tuned() { self.notification = Some(("Live radio cannot seek".into(), 40)); }
+                else { self.seek_relative(seconds); }
+            }
+            PlaybackAction::Repeat => {
+                if self.screen == AppScreen::Radio { self.notification = Some(("Repeat is unavailable for live radio".into(), 40)); }
+                else {
+                    let repeat = { let mut state = self.audio.shared_state.lock().unwrap();
+                        state.repeat = match state.repeat { RepeatMode::Off => RepeatMode::All, RepeatMode::All => RepeatMode::One, RepeatMode::One => RepeatMode::Off }; state.repeat };
+                    self.config.repeat = repeat; let _ = self.config.save();
+                }
+            }
+            PlaybackAction::Shuffle => {
+                if self.screen != AppScreen::Queue { self.notification = Some(("Shuffle applies to the Player queue".into(), 40)); }
+                else {
+                    let shuffle = { let mut state = self.audio.shared_state.lock().unwrap(); state.shuffle = !state.shuffle; state.shuffle };
+                    if shuffle { self.queue.shuffle_items(); } self.sync_queue_selection();
+                    self.config.shuffle = shuffle; let _ = self.config.save();
+                }
+            }
+            PlaybackAction::Visualizer | PlaybackAction::Decay(_) if self.screen == AppScreen::Podcasts => {
+                self.notification = Some(("Visualizer controls are available in Player and Radio".into(), 40));
+            }
+            PlaybackAction::Visualizer => {
+                self.config.visualizer_mode = match self.config.visualizer_mode {
+                    VisualizerMode::Spectrum => VisualizerMode::Mirror, VisualizerMode::Mirror => VisualizerMode::Waveform,
+                    VisualizerMode::Waveform => VisualizerMode::SignalLevels, VisualizerMode::SignalLevels => VisualizerMode::Spectrum };
+                let _ = self.config.save();
+            }
+            PlaybackAction::Decay(delta) => {
+                let decay = (self.config.visualizer_decay + delta).clamp(0.50, 0.99);
+                self.config.visualizer_decay = decay;
+                self.audio.shared_state.lock().unwrap().visualizer_decay = decay;
+                let _ = self.config.save();
+            }
+        }
+        true
+    }
+
+    fn step_playback(&mut self, delta: isize) {
+        match self.screen {
+            AppScreen::Radio => self.radio_step(delta),
+            AppScreen::Podcasts => {
+                let current = self.audio.shared_state.lock().unwrap().current_track.clone();
+                self.podcasts.step_episode(delta, current.as_deref());
+            }
+            _ => {
+                let path = if self.is_queue_search_active() {
+                    if delta > 0 { self.next_search_result() } else { self.prev_search_result() }
+                } else {
+                    let shuffle = self.audio.shared_state.lock().unwrap().shuffle;
+                    if delta > 0 { self.queue.next(shuffle) } else { self.queue.prev(shuffle) }
+                };
+                if let Some(path) = path { self.podcasts.cancel_pending_playback(); self.audio.play(path); self.sync_queue_selection(); }
+            }
+        }
     }
 
     fn radio_tuned(&self) -> bool {
@@ -3022,16 +3123,8 @@ impl App {
             KeyCode::Home => self.radio_selected_index = 0,
             KeyCode::End => self.radio_selected_index = last,
             KeyCode::Enter => self.tune_selected_station(),
-            KeyCode::Char(' ') => {
-                if self.radio_tuned() {
-                    self.toggle_playback();
-                } else {
-                    self.tune_selected_station();
-                }
-            }
-            KeyCode::Char('n') | KeyCode::Char('l') | KeyCode::Right => self.radio_step(1),
-            KeyCode::Char('b') | KeyCode::Char('h') | KeyCode::Left => self.radio_step(-1),
-            KeyCode::Char('s') => self.audio.stop(),
+            KeyCode::Char('l') | KeyCode::Right => self.radio_step(1),
+            KeyCode::Char('h') | KeyCode::Left => self.radio_step(-1),
             KeyCode::Char('f') => self.toggle_radio_favorite(),
             KeyCode::Char('F') => {
                 self.radio_favorites_only = !self.radio_favorites_only;
@@ -3396,6 +3489,11 @@ impl App {
     }
 
     fn handle_paste(&mut self, content: String) {
+        if self.screen == AppScreen::Podcasts && self.input_mode == InputMode::Normal && self.podcasts.prompt.is_some() {
+            self.podcasts.paste(&content);
+            return;
+        }
+
         match self.input_mode {
             InputMode::CreateCollection
             | InputMode::AddToCollectionList
@@ -3747,7 +3845,7 @@ impl App {
                 }
             }
             AppScreen::Library => {}
-            AppScreen::Healer | AppScreen::Radio => {}
+            AppScreen::Healer | AppScreen::Radio | AppScreen::Podcasts => {}
         }
     }
 
@@ -3763,7 +3861,7 @@ impl App {
                 }
             }
             AppScreen::Library => {}
-            AppScreen::Healer | AppScreen::Radio => {}
+            AppScreen::Healer | AppScreen::Radio | AppScreen::Podcasts => {}
         }
     }
 
@@ -3782,7 +3880,7 @@ impl App {
                 }
             }
             AppScreen::Library => {}
-            AppScreen::Healer | AppScreen::Radio => {}
+            AppScreen::Healer | AppScreen::Radio | AppScreen::Podcasts => {}
         }
     }
 
@@ -3801,7 +3899,7 @@ impl App {
                 }
             }
             AppScreen::Library => {}
-            AppScreen::Healer | AppScreen::Radio => {}
+            AppScreen::Healer | AppScreen::Radio | AppScreen::Podcasts => {}
         }
     }
 
@@ -3959,7 +4057,7 @@ impl App {
                 self.queue_selected_index = 0;
                 self.sync_queue_selection();
             }
-            KeyCode::Char('3') => {}
+            KeyCode::Char('5') => {}
             KeyCode::Char('?') => { self.show_help = true; self.help_scroll = 0; }
             KeyCode::Tab | KeyCode::BackTab => {
                 self.library.focused_panel = match self.library.focused_panel {
@@ -4170,7 +4268,7 @@ impl App {
                     self.library_remove_from_playlist();
                 }
             }
-            KeyCode::Char('s') => {
+            KeyCode::Char('o') | KeyCode::Char('s') => {
                 self.library.sort = self.library.sort.next();
                 self.library.track_index = 0;
             }
@@ -5092,6 +5190,160 @@ impl App {
 mod tests {
     use super::*;
     use std::sync::mpsc::channel;
+
+    fn mock_audio(app: &mut App) -> std::sync::mpsc::Receiver<crate::audio::AudioCommand> {
+        let snapshot = app.audio.shared_state.lock().unwrap().clone();
+        let (command_tx, rx) = channel();
+        app.audio = AudioEngine { command_tx, shared_state: Arc::new(Mutex::new(snapshot)) };
+        rx
+    }
+
+    #[test]
+    fn tabs_follow_the_registry_and_text_entry_keeps_number_keys() {
+        let root = tempfile::tempdir().unwrap();
+        let (tx, _rx) = channel();
+        let mut app = App::new(tx, Some(root.path().into()), None);
+        app.config.music_folders.clear();
+        app.podcasts = crate::podcasts::PodcastState::at(root.path().join("Podcasts"));
+        for (number, _, screen) in AppScreen::TABS {
+            app.handle_key(KeyEvent::new(KeyCode::Char(number), KeyModifiers::NONE));
+            assert_eq!(app.screen, screen, "tab {number}");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+        assert_eq!(app.screen, AppScreen::Podcasts);
+        assert_eq!(app.podcasts.input, "5");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
+        assert_eq!(app.screen, AppScreen::Radio);
+        assert_eq!(app.search.query, "6");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 45)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let tabs: String = terminal.backend().buffer().content.iter().skip(43 * 160).take(160).map(|c| c.symbol()).collect();
+        assert!(tabs.contains("Radio"));
+        for name in ["Browser", "Player", "Podcasts", "Library", "Healer"] { assert!(!tabs.contains(name)); }
+        let positions: Vec<_> = ['1', '2', '3', '4', '5', '6'].iter().map(|number| tabs.find(*number).unwrap()).collect();
+        assert!(positions.windows(2).all(|p| p[0] < p[1]));
+    }
+
+    #[test]
+    fn shared_media_shortcuts_pause_stop_seek_and_step_the_correct_source() {
+        use crate::audio::AudioCommand;
+        let root = tempfile::tempdir().unwrap(); let (tx, _rx) = channel();
+        let mut app = App::new(tx, Some(root.path().into()), None);
+        app.podcasts = crate::podcasts::PodcastState::at(root.path().join("Podcasts"));
+        let rx = mock_audio(&mut app);
+        for screen in [AppScreen::Queue, AppScreen::Radio, AppScreen::Podcasts] {
+            app.screen = screen;
+            for c in [' ', 'p', 'P'] {
+                app.audio.shared_state.lock().unwrap().status = PlaybackStatus::Playing;
+                app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+                assert!(matches!(rx.try_recv().unwrap(), AudioCommand::Pause));
+                app.audio.shared_state.lock().unwrap().status = PlaybackStatus::Paused;
+                app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+                assert!(matches!(rx.try_recv().unwrap(), AudioCommand::Resume));
+            }
+            app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+            assert!(matches!(rx.try_recv().unwrap(), AudioCommand::Stop));
+            assert!(app.podcasts.subscriptions.is_empty(), "Stop must not subscribe");
+            app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+            assert!(rx.try_recv().is_err(), "Ctrl+S is not the shared Stop shortcut");
+            { let mut state = app.audio.shared_state.lock().unwrap(); state.elapsed_secs = 10; state.duration_secs = 100; }
+            app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+            assert!(matches!(rx.try_recv().unwrap(), AudioCommand::Seek(d) if d.as_secs() == 15));
+        }
+        app.screen = AppScreen::Queue;
+        app.queue.items = vec!["a.mp3".into(), "b.mp3".into()]; app.queue.current_index = Some(0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(matches!(rx.try_recv().unwrap(), AudioCommand::Play(path) if path == Path::new("b.mp3")));
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert!(matches!(rx.try_recv().unwrap(), AudioCommand::Play(path) if path == Path::new("a.mp3")));
+        app.screen = AppScreen::Radio; app.radio_selected_index = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(matches!(rx.try_recv().unwrap(), AudioCommand::PlayStream(station) if station == STATIONS[1]));
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert!(matches!(rx.try_recv().unwrap(), AudioCommand::PlayStream(station) if station == STATIONS[0]));
+    }
+
+    #[test]
+    #[ignore = "manual large-list rendering benchmark"]
+    fn performance_render_probe() {
+        let (tx, _rx) = channel();
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::new(tx, Some(root.path().to_path_buf()), None);
+        app.queue.items = (0..10_000).map(|i| PathBuf::from(format!("/music/Artist {}/Album {}/Track {i:05}.mp3", i % 100, i % 300))).collect();
+        app.queue_selected_index = 5000;
+        app.browser.files = app.queue.items.iter().map(|path| crate::models::FileItem {
+            path: path.clone(), name: path.file_name().unwrap().to_string_lossy().into_owned(),
+            size: 5_000_000, is_dir: false, modified: None, is_selected: false, metadata: None, depth: 0, is_expanded: false,
+        }).collect();
+        app.browser.file_index = 5000;
+        app.library.tracks = app.queue.items.iter().enumerate().map(|(i, path)| LibraryTrack {
+            path: path.clone(), title: Some(format!("Track {i:05}")), artist: Some(format!("Artist {}", i % 100)),
+            album: Some(format!("Album {}", i % 300)), track: Some(i as u32 % 12), year: Some(2000 + i as u32 % 25),
+            genre: None, duration_secs: Some(240),
+        }).collect();
+        app.library.sort = crate::library::LibrarySort::Artist;
+        app.library.scan_state = ScanState::Done;
+        app.library.track_index = 5000;
+        app.podcasts = crate::podcasts::PodcastState::at(root.path().join("Podcasts"));
+        let show = crate::podcasts::Show { title: "Benchmark podcast".into(), author: "Publisher".into(), url: "https://example.com/feed".into() };
+        app.podcasts.feed = Some(crate::podcasts::Feed { show, description: "Description".into(), episodes: (0..2000).map(|i| crate::podcasts::Episode {
+            title: format!("Podcast episode {i:04}"), url: format!("https://example.com/{i}.mp3"), date: "".into(), description: "Episode description".repeat(20), mime: "audio/mpeg".into(), duration: "30:00".into(),
+        }).collect() });
+        app.podcasts.episode_index = 1000;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 45)).unwrap();
+        for (name, screen) in [("browser-10000", AppScreen::Browser), ("queue-10000", AppScreen::Queue),
+            ("library-10000-artist", AppScreen::Library), ("podcasts-2000", AppScreen::Podcasts)] {
+            app.screen = screen;
+            terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+            let start = std::time::Instant::now();
+            for _ in 0..30 { terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap(); }
+            eprintln!("{name}: {:.3} ms/frame", start.elapsed().as_secs_f64() * 1000.0 / 30.0);
+        }
+    }
+
+    #[test]
+    fn podcasts_tab_routes_input_and_renders_in_small_and_large_windows() {
+        let (tx, _rx) = channel();
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::new(tx, Some(root.path().to_path_buf()), None);
+        app.podcasts = crate::podcasts::PodcastState::at(root.path().join("Podcasts"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        assert_eq!(app.screen, AppScreen::Podcasts);
+        assert!(app.podcasts.root.is_dir());
+        assert!(app.shows_player());
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.should_quit, "Typing into the feed prompt must not quit");
+        assert_eq!(app.podcasts.input, "q");
+        app.handle_paste("https://example.com/rss".into());
+        assert!(app.podcasts.input.ends_with("https://example.com/rss"));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.podcasts.subscriptions.push(crate::podcasts::Show { title: "Subscribed Example".into(),
+            author: "Publisher".into(), url: "https://example.com/feed".into() });
+        app.podcasts.shows.push(crate::podcasts::Show { title: "Search Example".into(),
+            author: "Publisher".into(), url: "https://example.com/search".into() });
+        for (width, height) in [(45, 12), (160, 45)] {
+            let backend = ratatui::backend::TestBackend::new(width, height);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|frame| crate::ui::render(frame, &mut app)).unwrap();
+            let text: String = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect();
+            assert!(text.contains("Podcast"));
+            assert!(!text.contains("Visualizer"));
+            if width >= 100 {
+                assert!(text.contains("Subscriptions"));
+                assert!(text.contains("Subscribed Example"));
+                assert!(text.contains("Search Example"));
+            }
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert_eq!(app.screen, AppScreen::Radio);
+    }
 
     #[test]
     fn test_queue_search_filtering() {

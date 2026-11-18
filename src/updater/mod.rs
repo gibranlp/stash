@@ -240,10 +240,8 @@ pub fn install_and_restart(release: &Release) -> anyhow::Result<std::convert::In
             #[cfg(target_os = "linux")]
             if dirs::home_dir().is_some_and(|home| current_exe == home.join(".local/bin/stash"))
                 && current_exe != install_path
-            {
-                if let Err(error) = std::fs::remove_file(&current_exe) {
+                && let Err(error) = std::fs::remove_file(&current_exe) {
                     eprintln!("  Could not remove the old copy at {}: {error}", current_exe.display());
-                }
             }
             println!("  Installed {}. Restarting Stash...", release.version);
             relaunch.env(UPDATED_ENV, &release.version).env_remove(FAILED_ENV);

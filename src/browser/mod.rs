@@ -279,7 +279,7 @@ pub fn build_tree(
                 continue;
             }
 
-            if entry_path.is_dir() {
+            if entry.file_type().map(|t| t.is_dir() || (t.is_symlink() && entry_path.is_dir())).unwrap_or(false) {
                 directories.push((name, entry_path));
             } else {
                 let metadata = entry.metadata().ok();
@@ -301,8 +301,8 @@ pub fn build_tree(
         }
     }
 
-    directories.sort_by_key(|a| a.0.to_lowercase());
-    files.sort_by_key(|a| a.name.to_lowercase());
+    directories.sort_by_cached_key(|a| a.0.to_lowercase());
+    files.sort_by_cached_key(|a| a.name.to_lowercase());
 
     for (name, entry_path) in directories {
         let is_expanded = expanded_paths.contains(&entry_path);

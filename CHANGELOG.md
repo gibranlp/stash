@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.0 — 2026-11-18
+
+- Add Podcasts with directory search, persistent RSS subscriptions, feed URLs, cached episode lists, episode sorting, and atomic downloads to `~/Podcasts` for offline playback.
+- Download missing album covers from MusicBrainz/Cover Art Archive and embed artwork in supported writable audio files, preserving existing covers and caching downloads for offline use.
+- Move Track Information to the left and the playback queue/visualizer to the center; show album art as a compact, centered vinyl record with smooth rotation and a matching background.
+- Balance Spectrum and Mirror visualizers across both sides, with bass at the outer edges and treble meeting in the center.
+- Reorder tabs to 1 Browser, 2 Player, 3 Radio, 4 Podcasts, 5 Library, 6 Healer. Show only the active tab's name and use compact icon shortcut hints.
+- Standardize Player, Radio and Podcasts playback keys. Use `s` to stop, `f` for radio favorites/podcast subscriptions, `R` to refresh podcasts, and `o` to sort episodes. Stopping cancels pending podcast autoplay.
+- Improve large-list rendering and sorting, batch queue insertion, cancellable background file searches, embedded-art lookup, and audio-worker idle usage and cleanup. Add regression tests and reproducible performance probes.
+
 ## 0.9.3 — 2026-11-10
 
 - Install Linux updates to `/usr/bin/stash`, including updates from older installation locations.
