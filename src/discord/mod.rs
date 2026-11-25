@@ -19,6 +19,7 @@ mod imp {
 
     impl DiscordPresence {
         pub fn new(client_id: u64) -> Self {
+            if crate::shared_player_client() { return Self { tx: None, worker: None }; }
             let (tx, rx) = mpsc::channel();
             let worker = thread::Builder::new()
                 .name("discord-rpc".to_string())

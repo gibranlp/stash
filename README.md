@@ -9,7 +9,7 @@ See [the changelog](CHANGELOG.md) for release notes.
 ## Features
 
 - **File Browser**: Dual-pane navigation with file previews. Copy, move, and delete files in the background with a live progress bar. Select multiple files, search by name, and jump pages with `PageUp` / `PageDown`.
-- **Music Player**: Play any track with `Enter`, queue up songs, skip, seek, adjust volume, and toggle shuffle/repeat. Shows embedded lyrics with an automatic online fallback. Online lookup tolerates featured artists, release suffixes, and artist/title filenames, and caches successful results for offline replay. Timestamped lyrics follow playback automatically and highlight the current line; `PageUp` / `PageDown` scroll plain lyrics. Publishes track metadata and album artwork to desktop MPRIS clients.
+- **Music Player**: Play any track with `Enter`, queue up songs, skip, seek, adjust volume, and toggle shuffle/repeat. Shows embedded lyrics with an automatic online fallback. Online lookup tolerates featured artists, release suffixes, and artist/title filenames, and caches successful results for offline replay. Timestamped lyrics follow playback automatically and highlight the current line; `PageUp` / `PageDown` move through the playback queue by 10 songs, and `Home` / `End` select the first / last song; `Shift+PageUp` / `Shift+PageDown` scroll plain lyrics. Publishes track metadata and album artwork to desktop MPRIS clients.
 - **Discord Rich Presence**: Shows “Listening to Stash” with the song, artist, and playback progress in Discord or Vesktop on Linux/macOS. Reconnects automatically and clears the activity when playback pauses, stops, or Stash exits.
 - **Library**: Scans your music folders into one searchable, sortable list. Organize tracks into playlists and edit tags inline.
 - **Library Healer**: Finds tracks with missing or broken metadata and proposes fixes from the filename or online lookups, so you can review and apply them with one key.
@@ -97,6 +97,10 @@ The left column has search results above a permanent subscriptions list. Use `Ta
 Stash creates `~/Podcasts` when you open this tab. Episodes go into named podcast subfolders there; subscriptions are stored in `~/Podcasts/subscriptions.json`, and cached feeds in `~/Podcasts/.feeds`. Existing episode downloads are reused, and cached feeds remain usable offline. Subscribing does not download an entire back catalog: choose the episodes you want with `Enter` or `d`.
 
 ### Tabs and shared playback shortcuts
+
+In Browser, press `Enter` on a folder to replace the playback queue with all music inside it, including subfolders, and start playback. Shuffle follows the displayed randomized order when enabled. Use the arrow keys to expand and collapse folders without starting playback. Folders without music leave the current queue playing.
+
+In the playback queue, `Insert` marks or unmarks a song, `Shift+Up` / `Shift+Down` select songs as you move, and `*` selects or deselects the visible list. Press `c` to copy marked songs using the destination browser, then `c` again to confirm the destination. With no songs marked, it copies the highlighted song. Marked songs remain selected across searches and shuffle changes; copying includes all marked songs still in the queue.
 
 Tabs use the same order everywhere: **1 Browser · 2 Player · 3 Radio · 4 Podcasts · 5 Library · 6 Healer**. Tab numbers do not switch screens while you are typing in a search field or dialog.
 

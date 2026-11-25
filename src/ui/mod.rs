@@ -580,7 +580,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 .iter()
                 .enumerate()
                 .skip(queue_window.start).take(queue_window.len())
-                .map(|(idx, &(base_idx, orig_idx))| {
+                .map(|(idx, &(_, orig_idx))| {
                     let path = &app.queue.items[orig_idx];
                     let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Unknown".to_string());
                     let is_highlighted = idx == app.queue_selected_index;
@@ -600,7 +600,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     ListItem::new(Line::from(vec![
                         Span::styled(prefix, Style::default().fg(crate::theme::current().accent)),
                         Span::styled(playing_marker, Style::default().fg(crate::theme::current().success)),
-                        Span::styled(format!("{}. ", base_idx + 1), Style::default().fg(crate::theme::current().muted)),
+                        Span::styled(if app.queue_selected_paths.contains(path) { "[*] " } else { "    " }, Style::default().fg(crate::theme::current().accent)),
+                        Span::styled(format!("{:03}. ", orig_idx + 1), Style::default().fg(crate::theme::current().muted)),
                         Span::styled(name, text_style),
                     ]))
                 })
@@ -2248,7 +2249,7 @@ fn render_help_popup(f: &mut Frame, scroll: u16) {
         Line::from(vec![k("  Tab / Shift+Tab   "), d("Switch Playlists ↔ Tracks panel")]),
         Line::from(vec![k("  j / k  ↑ / ↓     "), d("Navigate")]),
         Line::from(vec![k("  PgUp / PgDn       "), d("Jump 10 rows")]),
-        Line::from(vec![k("  Enter             "), d("Play all visible tracks from cursor")]),
+        Line::from(vec![k("  Enter             "), d("Play folder recursively / tracks from cursor")]),
         Line::from(vec![k("  Space             "), d("Append track to queue")]),
         Line::from(vec![k("  e                 "), d("Open tag editor for selected track")]),
         Line::from(vec![k("  o                 "), d("Cycle sort: Default → Title → Artist → Album → Year → Duration")]),
@@ -2282,7 +2283,11 @@ fn render_help_popup(f: &mut Frame, scroll: u16) {
         Line::from(vec![k("  C                 "), d("Clear entire queue")]),
         Line::from(vec![k("  v                 "), d("Cycle visualizer: Spectrum → Mirror → Waveform → Levels")]),
         Line::from(vec![k("  [ / ]             "), d("Visualizer decay slower / faster")]),
-        Line::from(vec![k("  PgUp / PgDn       "), d("Scroll plain lyrics / browser")]),
+        Line::from(vec![k("  PgUp / PgDn       "), d("Jump 10 songs / browser rows")]),
+        Line::from(vec![k("  Home / End        "), d("First / last song in queue")]),
+        Line::from(vec![k("  Insert / Shift+↑↓ "), d("Toggle selection / select while moving")]),
+        Line::from(vec![k("  * / c             "), d("Select all visible / copy selected songs")]),
+        Line::from(vec![k("  Shift+PgUp/PgDn   "), d("Scroll plain lyrics")]),
         Line::from(""),
         Line::from(h("── Podcasts (4) ──────────────────────────────────────────")),
         Line::from(vec![k("  / / a             "), d("Search podcasts / add and subscribe to RSS feed URL")]),

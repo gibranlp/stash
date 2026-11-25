@@ -246,6 +246,7 @@ pub struct App {
     pub should_quit: bool,
     pub selected_add_collection_index: usize,
     pub queue_selected_index: usize,
+    pub queue_selected_paths: std::collections::HashSet<PathBuf>,
     pub file_progress: Arc<Mutex<Option<FileOperationProgress>>>,
     pub files_list_state: ListState,
     pub queue_list_state: ListState,
@@ -559,7 +560,7 @@ impl App {
         );
 
         // Inicializa MPRIS para que los controles de media del sistema operativo jalen
-        let media_controls = {
+        let media_controls = if crate::shared_player_client() { None } else {
             #[cfg(not(target_os = "windows"))]
             let hwnd = None;
             #[cfg(target_os = "windows")]
@@ -580,9 +581,9 @@ impl App {
                             let _ = writeln!(f, "Received MPRIS event: {:?}", event);
                         }
                         match event {
-                            souvlaki::MediaControlEvent::Play | souvlaki::MediaControlEvent::Pause | souvlaki::MediaControlEvent::Toggle => {
-                                let _ = tx_clone.send(Event::MediaPlayPause);
-                            }
+                            souvlaki::MediaControlEvent::Play => { let _ = tx_clone.send(Event::MediaPlay); }
+                            souvlaki::MediaControlEvent::Pause => { let _ = tx_clone.send(Event::MediaPause); }
+                            souvlaki::MediaControlEvent::Toggle => { let _ = tx_clone.send(Event::MediaPlayPause); }
                             souvlaki::MediaControlEvent::Next => {
                                 let _ = tx_clone.send(Event::MediaNext);
                             }
@@ -634,6 +635,7 @@ impl App {
             should_quit: false,
             selected_add_collection_index: 0,
             queue_selected_index: 0,
+            queue_selected_paths: std::collections::HashSet::new(),
             file_progress: Arc::new(Mutex::new(None)),
             files_list_state: ListState::default(),
             queue_list_state: ListState::default(),
@@ -891,7 +893,7 @@ impl App {
                 self.drive_scan_ticks += 1;
                 if self.drive_scan_ticks >= 20 {
                     self.drive_scan_ticks = 0;
-                    if self.config.auto_mount {
+                    if self.config.auto_mount && !crate::shared_player_client() {
                         self.automount.scan();
                     }
                     let mounted = self.automount.take_mounted();
@@ -1031,6 +1033,7 @@ impl App {
                     self.healer.poll_lookup();
                 }
 
+                if !crate::shared_player_client() {
                 // Detect track changes to record play/skip stats
                 let (new_track, new_elapsed, new_duration) = {
                     let state = self.audio.shared_state.lock().unwrap();
@@ -1059,12 +1062,23 @@ impl App {
                 }
                 self.stats_tracking.last_elapsed = new_elapsed;
                 self.stats_tracking.last_duration = new_duration;
+                }
             }
             Event::AudioFinished => {
                 self.handle_audio_finished();
             }
             Event::MediaPlayPause => {
                 self.toggle_playback();
+            }
+            Event::MediaPlay => {
+                if self.audio.shared_state.lock().unwrap().status != PlaybackStatus::Playing {
+                    self.toggle_playback();
+                }
+            }
+            Event::MediaPause => {
+                if self.audio.shared_state.lock().unwrap().status == PlaybackStatus::Playing {
+                    self.audio.pause();
+                }
             }
             Event::MediaNext => {
                 if self.radio_tuned() {
@@ -1185,8 +1199,7 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.save_session_on_quit();
-            self.should_quit = true;
+            self.quit();
             return;
         }
 
@@ -1197,8 +1210,7 @@ impl App {
 
         if self.input_mode == InputMode::Normal
             && key.code == KeyCode::Char('q') {
-                self.save_session_on_quit();
-                self.should_quit = true;
+                self.quit();
                 return;
             }
 
@@ -1236,7 +1248,8 @@ impl App {
             }
             if dismiss {
                 *self.file_progress.lock().unwrap() = None;
-                self.browser.clear_selections();
+                if self.screen == AppScreen::Queue { self.queue_selected_paths.clear(); }
+                else { self.browser.clear_selections(); }
                 self.browser.refresh();
             }
             return;
@@ -1311,6 +1324,7 @@ impl App {
             return;
         }
 
+        if self.screen == AppScreen::Queue && self.handle_queue_selection_key(key) { return; }
         if self.shows_player() && self.handle_shared_playback_key(key) { return; }
 
         if self.screen == AppScreen::Library {
@@ -1501,7 +1515,7 @@ impl App {
                 }
             }
             KeyCode::PageUp => {
-                if self.screen == AppScreen::Queue {
+                if self.screen == AppScreen::Queue && key.modifiers.contains(KeyModifiers::SHIFT) {
                     self.lyrics_scroll_offset = self.lyrics_scroll_offset.saturating_sub(10);
                 } else {
                     if self.screen == AppScreen::Browser {
@@ -1511,7 +1525,7 @@ impl App {
                 }
             }
             KeyCode::PageDown => {
-                if self.screen == AppScreen::Queue {
+                if self.screen == AppScreen::Queue && key.modifiers.contains(KeyModifiers::SHIFT) {
                     self.lyrics_scroll_offset += 10;
                 } else {
                     if self.screen == AppScreen::Browser {
@@ -2442,8 +2456,7 @@ impl App {
                 if let crate::updater::UpdateProgress::Available { release } = state {
                     // Quit cleanly; main installs the update and relaunches Stash.
                     self.pending_update = Some(release);
-                    self.save_session_on_quit();
-                    self.should_quit = true;
+                    self.quit();
                 }
                 self.input_mode = InputMode::Normal;
             }
@@ -2492,6 +2505,47 @@ impl App {
         } else {
             self.browser.move_down();
         }
+    }
+
+    fn queue_copy_paths(&self) -> Vec<PathBuf> {
+        let selected: Vec<PathBuf> = self.queue.items.iter()
+            .filter(|path| self.queue_selected_paths.contains(*path)).cloned().collect();
+        if !selected.is_empty() { return selected; }
+        self.get_filtered_queue_indices().get(self.queue_selected_index)
+            .map(|&(_, index)| vec![self.queue.items[index].clone()]).unwrap_or_default()
+    }
+
+    fn handle_queue_selection_key(&mut self, key: KeyEvent) -> bool {
+        let visible = self.get_filtered_queue_indices();
+        match key.code {
+            KeyCode::Insert => {
+                if let Some(&(_, index)) = visible.get(self.queue_selected_index) {
+                    let path = self.queue.items[index].clone();
+                    if !self.queue_selected_paths.remove(&path) { self.queue_selected_paths.insert(path); }
+                }
+            }
+            KeyCode::Up | KeyCode::Down if key.modifiers == KeyModifiers::SHIFT => {
+                if let Some(&(_, index)) = visible.get(self.queue_selected_index) {
+                    self.queue_selected_paths.insert(self.queue.items[index].clone());
+                    if key.code == KeyCode::Up { self.navigate_up(); } else { self.navigate_down(); }
+                    if let Some(&(_, index)) = visible.get(self.queue_selected_index) {
+                        self.queue_selected_paths.insert(self.queue.items[index].clone());
+                    }
+                }
+            }
+            KeyCode::Char('*') => {
+                let all_selected = visible.iter().all(|&(_, index)| self.queue_selected_paths.contains(&self.queue.items[index]));
+                for (_, index) in visible {
+                    let path = self.queue.items[index].clone();
+                    if all_selected { self.queue_selected_paths.remove(&path); } else { self.queue_selected_paths.insert(path); }
+                }
+            }
+            KeyCode::Char('c') if key.modifiers.is_empty() => {
+                if !self.queue_copy_paths().is_empty() { self.open_dest_browser(false); }
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn navigate_up(&mut self) {
@@ -2625,13 +2679,39 @@ impl App {
         }
     }
 
+    fn play_folder(&mut self, folder: &Path) {
+        let mut paths: Vec<PathBuf> = walkdir::WalkDir::new(folder)
+            .into_iter()
+            .filter_entry(|entry| entry.depth() == 0 || !entry.file_name().to_string_lossy().starts_with('.'))
+            .flatten()
+            .filter(|entry| entry.file_type().is_file() && matches_audio_extension(entry.path()))
+            .map(|entry| entry.into_path())
+            .collect();
+        paths.sort();
+        if paths.is_empty() {
+            self.notification = Some(("No music found in this folder or its subfolders".into(), 60));
+            return;
+        }
+        self.podcasts.cancel_pending_playback();
+        self.queue.clear();
+        self.queue.add_many(paths);
+        let shuffle = self.audio.shared_state.lock().unwrap().shuffle;
+        if shuffle { self.queue.shuffle_items(); }
+        if let Some(path) = self.queue.next(shuffle) {
+            self.audio.play(path);
+            self.sync_queue_selection();
+        }
+    }
+
     fn activate_item(&mut self) {
         match self.screen {
             AppScreen::Browser => {
                 if self.search.active {
                     if !self.search.results.is_empty() {
                         let path = self.search.results[self.search.selected_index].path.clone();
-                        if matches_audio_extension(&path) {
+                        if path.is_dir() {
+                            self.play_folder(&path);
+                        } else if matches_audio_extension(&path) {
                             self.queue.clear();
                             self.queue.add(path.clone());
                             self.queue.current_index = Some(0);
@@ -2645,13 +2725,7 @@ impl App {
                     if !self.browser.files.is_empty() {
                         let path = self.browser.files[self.browser.file_index].path.clone();
                         if self.browser.files[self.browser.file_index].is_dir {
-                            let is_expanded = self.browser.files[self.browser.file_index].is_expanded;
-                            if is_expanded {
-                                self.browser.expanded_paths.remove(&path);
-                            } else {
-                                self.browser.expanded_paths.insert(path);
-                            }
-                            self.browser.refresh();
+                            self.play_folder(&path);
                             return;
                         }
                         if matches_audio_extension(&path) {
@@ -3197,7 +3271,15 @@ impl App {
         self.file_progress.lock().map(|g| g.is_some()).unwrap_or(false)
     }
 
+    pub fn quit(&mut self) {
+        self.save_session_on_quit();
+        self.podcasts.cancel_pending_playback();
+        self.audio.stop();
+        self.should_quit = true;
+    }
+
     fn save_session_on_quit(&mut self) {
+        if crate::shared_player_client() { return; }
         if self.stats_tracking.session_start_ts > 0 {
             let duration = self.stats_tracking.session_listen_secs;
             let tracks = self.stats_tracking.session_tracks;
@@ -3529,7 +3611,11 @@ impl App {
         // and its contents (via toggle_folder_select) would copy everything twice.
         // Pre-collect dirs with N stat() calls; the filter then only does string prefix checks.
         let paths: Vec<PathBuf> = {
-            let all: Vec<PathBuf> = self.browser.selected_paths.iter().cloned().collect();
+            let all: Vec<PathBuf> = if self.screen == AppScreen::Queue && !is_move {
+                self.queue_copy_paths()
+            } else {
+                self.browser.selected_paths.iter().cloned().collect()
+            };
             let selected_dirs: Vec<PathBuf> = all.iter().filter(|p| p.is_dir()).cloned().collect();
             if selected_dirs.is_empty() {
                 all
@@ -3876,7 +3962,6 @@ impl App {
                 let filtered = self.get_filtered_queue_indices();
                 if !filtered.is_empty() {
                     self.queue_selected_index = 0;
-                    self.sync_queue_selection();
                 }
             }
             AppScreen::Library => {}
@@ -3895,7 +3980,6 @@ impl App {
                 let filtered = self.get_filtered_queue_indices();
                 if !filtered.is_empty() {
                     self.queue_selected_index = filtered.len() - 1;
-                    self.sync_queue_selection();
                 }
             }
             AppScreen::Library => {}
@@ -5196,6 +5280,194 @@ mod tests {
         let (command_tx, rx) = channel();
         app.audio = AudioEngine { command_tx, shared_state: Arc::new(Mutex::new(snapshot)) };
         rx
+    }
+
+    #[test]
+    fn queue_selection_copies_marked_files_without_using_browser_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let (tx, _rx) = channel();
+        let mut app = App::new(tx, Some(root.path().into()), None);
+        let commands = mock_audio(&mut app);
+        app.screen = AppScreen::Queue;
+        app.queue.clear();
+        let paths: Vec<PathBuf> = ["a.mp3", "b.mp3", "c.mp3"].iter().map(|name| root.path().join(name)).collect();
+        for (index, path) in paths.iter().enumerate() { std::fs::write(path, format!("audio-{index}")).unwrap(); }
+        app.queue.add_many(paths.clone());
+        app.queue.shuffle_indices = vec![2,0,1];
+        app.queue.current_index = Some(1);
+        app.audio.shared_state.lock().unwrap().shuffle = true;
+        app.queue_selected_index = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Insert, KeyModifiers::NONE));
+        assert_eq!(app.queue_copy_paths(), vec![paths[2].clone()]);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(app.queue_selected_paths.len(), 2);
+        app.handle_key(KeyEvent::new(KeyCode::Insert, KeyModifiers::NONE));
+        assert_eq!(app.queue_selected_paths.len(), 1);
+        app.search.active = true;
+        app.search.query = "a.mp3".into();
+        app.queue_selected_index = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Char('*'), KeyModifiers::NONE));
+        assert_eq!(app.queue_selected_paths.len(), 2);
+        app.handle_key(KeyEvent::new(KeyCode::Char('*'), KeyModifiers::NONE));
+        assert_eq!(app.queue_copy_paths(), vec![paths[2].clone()]);
+        app.browser.selected_paths.insert(paths[1].clone());
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(app.input_mode, InputMode::CopyPath);
+        let destination = root.path().join("copied");
+        app.dest_browser.as_mut().unwrap().current_dir = destination.clone();
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let finished = app.file_progress.lock().unwrap().as_ref().is_some_and(|progress| progress.finished);
+            if finished { break; }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read(destination.join("c.mp3")).unwrap(), b"audio-2");
+        assert!(!destination.join("b.mp3").exists());
+        assert_eq!(app.queue.current_index, Some(1));
+        assert!(commands.try_recv().is_err());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.queue_selected_paths.is_empty());
+        assert!(app.browser.selected_paths.contains(&paths[1]));
+        assert_eq!(app.queue_copy_paths(), vec![paths[0].clone()]);
+    }
+
+    #[test]
+    fn queue_home_and_end_select_visible_boundaries_without_changing_playback() {
+        let root = tempfile::tempdir().unwrap();
+        let (tx, _rx) = channel();
+        let mut app = App::new(tx, Some(root.path().into()), None);
+        let commands = mock_audio(&mut app);
+        app.screen = AppScreen::Queue;
+        app.queue.clear();
+        app.queue.add_many((0..25).map(|i| PathBuf::from(format!("song{i:02}.mp3"))).collect());
+        app.queue.current_index = Some(12);
+        for shuffle in [false, true] {
+            app.queue.shuffle_indices = (0..25).rev().collect();
+            app.audio.shared_state.lock().unwrap().shuffle = shuffle;
+            for query in ["", "song1", "missing"] {
+                app.search.active = !query.is_empty();
+                app.search.query = query.into();
+                app.queue_selected_index = 0;
+                let last = app.queue_items_len().saturating_sub(1);
+                app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+                assert_eq!(app.queue_selected_index, last);
+                app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+                assert_eq!(app.queue_selected_index, 0);
+                assert_eq!(app.queue.current_index, Some(12));
+            }
+        }
+        app.queue.clear();
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.queue_selected_index, 0);
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn queue_page_keys_navigate_filtered_shuffle_and_shift_scrolls_lyrics() {
+        let root = tempfile::tempdir().unwrap();
+        let (tx, _rx) = channel();
+        let mut app = App::new(tx, Some(root.path().into()), None);
+        let commands = mock_audio(&mut app);
+        app.screen = AppScreen::Queue;
+        app.queue.clear();
+        app.queue.add_many((0..25).map(|i| PathBuf::from(format!("song{i:02}.mp3"))).collect());
+        app.queue.shuffle_indices = (0..25).rev().collect();
+        app.queue.current_index = Some(24);
+        app.audio.shared_state.lock().unwrap().shuffle = true;
+        app.queue_selected_index = 0;
+        for expected in [10, 20, 24] {
+            app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+            assert_eq!(app.queue_selected_index, expected);
+        }
+        for expected in [14, 4, 0, 0] {
+            app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+            assert_eq!(app.queue_selected_index, expected);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT));
+        assert_eq!(app.lyrics_scroll_offset, 10);
+        assert_eq!(app.queue_selected_index, 0);
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT));
+        assert_eq!(app.lyrics_scroll_offset, 0);
+        app.search.active = true;
+        app.search.query = "song1".into();
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.queue_selected_index, 9);
+        app.search.query = "missing".into();
+        app.queue_selected_index = 0;
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.queue_selected_index, 0);
+        assert_eq!(app.queue.current_index, Some(24));
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn enter_on_folder_plays_nested_music_and_arrows_only_navigate() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("Album");
+        std::fs::create_dir_all(folder.join("Disc 2")).unwrap();
+        std::fs::create_dir_all(folder.join(".hidden")).unwrap();
+        for name in ["a.mp3", "Disc 2/b.flac", "notes.txt", ".hidden/skip.mp3"] {
+            std::fs::write(folder.join(name), []).unwrap();
+        }
+        for shuffle in [false, true] {
+            let (tx, _rx) = channel();
+            let mut app = App::new(tx, Some(root.path().into()), None);
+            let rx = mock_audio(&mut app);
+            app.screen = AppScreen::Browser;
+            app.search.active = false;
+            app.browser.focused_pane = PaneType::Files;
+            app.browser.file_index = app.browser.files.iter().position(|item| item.path == folder).unwrap();
+            app.audio.shared_state.lock().unwrap().shuffle = shuffle;
+            app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+            assert!(app.browser.expanded_paths.contains(&folder));
+            assert!(rx.try_recv().is_err());
+            app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+            assert!(!app.browser.expanded_paths.contains(&folder));
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(app.queue.items, vec![folder.join("Disc 2/b.flac"), folder.join("a.mp3")]);
+            assert_eq!(app.browser.current_dir, root.path());
+            assert!(!app.browser.expanded_paths.contains(&folder));
+            let first = if shuffle { app.queue.shuffle_indices[0] } else { 0 };
+            assert_eq!(app.queue.current_index, Some(first));
+            assert!(matches!(rx.try_recv(), Ok(crate::audio::AudioCommand::Play(path)) if path == app.queue.items[first]));
+            let previous_queue = app.queue.items.clone();
+            app.play_folder(&folder.join(".hidden/nonexistent"));
+            assert_eq!(app.queue.items, previous_queue);
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn quitting_stops_playback_with_q_and_ctrl_c() {
+        let root = tempfile::tempdir().unwrap();
+        for key in [KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)] {
+            let (tx, _rx) = channel();
+            let mut app = App::new(tx, Some(root.path().into()), None);
+            let rx = mock_audio(&mut app);
+            app.handle_event(Event::Key(key));
+            assert!(app.should_quit);
+            assert!(matches!(rx.try_recv(), Ok(crate::audio::AudioCommand::Stop)));
+        }
+    }
+
+    #[test]
+    fn explicit_media_play_and_pause_are_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let (tx, _rx) = channel();
+        let mut app = App::new(tx, Some(root.path().into()), None);
+        let rx = mock_audio(&mut app);
+        app.audio.shared_state.lock().unwrap().status = PlaybackStatus::Paused;
+        app.handle_event(Event::MediaPause);
+        assert!(rx.try_recv().is_err());
+        app.audio.shared_state.lock().unwrap().status = PlaybackStatus::Playing;
+        app.handle_event(Event::MediaPlay);
+        assert!(rx.try_recv().is_err());
+        app.handle_event(Event::MediaPause);
+        assert!(matches!(rx.try_recv().unwrap(), crate::audio::AudioCommand::Pause));
     }
 
     #[test]

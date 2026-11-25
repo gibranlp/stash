@@ -9,6 +9,8 @@ pub enum Event {
     Tick,
     AudioFinished,
     MediaPlayPause,
+    MediaPlay,
+    MediaPause,
     MediaNext,
     MediaPrev,
     MediaSeek(souvlaki::SeekDirection, std::time::Duration),

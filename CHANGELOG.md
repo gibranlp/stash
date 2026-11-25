@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.1 — 2026-11-23
+
+- Select playback queue songs with `Insert`, `Shift+Up/Down`, or `*`, then copy them with `c` using the destination browser.
+- Fix `Home` / `End` in the playback queue and preserve manual selection during unchanged shared-player updates.
+- Navigate the playback queue with `PageUp` / `PageDown`; use `Shift+PageUp` / `Shift+PageDown` to scroll plain lyrics.
+- Play all music in a folder and its subfolders with `Enter`; use arrow keys to expand and collapse folders.
+- Keep the displayed shuffle order synchronized with the shared player so playback follows the randomized list sequentially.
+- Preserve each song’s original queue number when shuffled, with three-digit numbering.
+- Stop playback and shut down the shared background player when quitting with `q` or Ctrl+C.
+
 ## 1.0.0 — 2026-11-18
 
 - Add Podcasts with directory search, persistent RSS subscriptions, feed URLs, cached episode lists, episode sorting, and atomic downloads to `~/Podcasts` for offline playback.

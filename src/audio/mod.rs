@@ -95,6 +95,12 @@ impl AudioEngine {
             right_level: 0.0,
         }));
 
+        #[cfg(target_os = "linux")]
+        if crate::shared_player_client() {
+            crate::ipc::remote_audio(command_rx, Arc::clone(&shared_state));
+            return Self { command_tx, shared_state };
+        }
+
         let state_clone = Arc::clone(&shared_state);
         let stream_tx = command_tx.clone();
         thread::spawn(move || {

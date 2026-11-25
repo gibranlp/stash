@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+mod ipc;
 mod app;
 mod artwork;
 mod audio;
@@ -41,7 +43,41 @@ fn supports_kitty_graphics(term: &str, term_program: &str, kitty_window: bool) -
 }
 
 
+fn shared_player_client() -> bool {
+    #[cfg(target_os = "linux")]
+    { ipc::remote_mode() }
+    #[cfg(not(target_os = "linux"))]
+    { false }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "linux")]
+    let _instance_guard = {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from).ok_or("XDG_RUNTIME_DIR is required for Stash")?;
+        let file = std::fs::OpenOptions::new().create(true).read(true).write(true)
+            .truncate(false).open(runtime.join("stash-player.lock"))?;
+        match file.try_lock() {
+            Ok(()) => Some(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if std::env::args().any(|argument| argument == "--service") { return Ok(()); }
+                ipc::set_remote_mode();
+                None
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+
+    #[cfg(target_os = "linux")]
+    let ipc_server = if ipc::remote_mode() { None } else { Some(ipc::Server::bind()?) };
+    #[cfg(target_os = "linux")]
+    if std::env::args().any(|argument| argument == "--service") {
+        return ipc::run(ipc_server.unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    if ipc::remote_mode() { ipc::ensure_compatible_service()?; }
+
     // Ojo con esto: si truena el programa, hay que dejar el terminal como estaba
     // o se queda cagado sin echo ni nada
     let original_hook = std::panic::take_hook();
@@ -107,18 +143,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let args: Vec<String> = std::env::args().collect();
-    let initial_path = args.get(1).map(PathBuf::from);
+    let initial_path = args.iter().skip(1).find(|argument| argument.as_str() != "--client").map(PathBuf::from);
 
     let (tx, rx) = channel();
 
     events::spawn_event_handler(tx.clone());
 
     let mut app = App::new(tx, initial_path, picker);
+    #[cfg(target_os = "linux")]
+    let mut remote_view = if ipc::remote_mode() {
+        match ipc::RemoteView::attach(&mut app) {
+            Ok(view) => Some(view),
+            Err(error) => {
+                disable_raw_mode()?;
+                execute!(terminal.backend_mut(), LeaveAlternateScreen, Show)?;
+                return Err(error);
+            }
+        }
+    } else { None };
 
     // Present one complete animation frame per 60 Hz deadline. The worker
     // prepares the following frame in parallel; input never changes the cadence.
     let mut next_player_frame = Instant::now();
     while !app.should_quit {
+        #[cfg(target_os = "linux")]
+        if let Some(server)=&ipc_server { server.poll(&mut app); }
+        #[cfg(target_os = "linux")]
+        if let Some(view)=&mut remote_view { view.poll(&mut app); }
         // souvlaki's macOS backend (MPRemoteCommandCenter/MPNowPlayingInfoCenter) talks to
         // mediaremoted/nowplayingd over an XPC connection scheduled on this thread's run
         // loop. Since we never run a Cocoa/CFRunLoop (no NSApplication, no winit), incoming
@@ -166,6 +217,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         end_result?;
     }
 
+    #[cfg(target_os = "linux")]
+    let shutdown_result = if remote_view.is_some() {
+        ipc::client_request(&serde_json::json!({"action":"native-shutdown"})).and_then(|reply| {
+            if let Some(error) = reply["error"].as_str() { Err(error.to_string().into()) } else { Ok(()) }
+        })
+    } else { Ok(()) };
+
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -174,9 +232,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Show
     )?;
 
+    #[cfg(target_os = "linux")]
+    shutdown_result?;
+
     if let Some(release) = app.pending_update.take() {
         app.audio.stop();
         drop(app);
+        #[cfg(target_os = "linux")]
+        drop(_instance_guard);
+        #[cfg(target_os = "linux")]
+        drop(ipc_server);
         updater::install_and_restart(&release)?;
     }
 

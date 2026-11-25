@@ -189,6 +189,19 @@ mod tests {
     }
 
     #[test]
+    fn shuffled_playback_follows_the_visible_order_after_manual_selection() {
+        let mut queue = PlaybackQueue::new();
+        queue.add_many((0..5).map(|i| PathBuf::from(format!("song{i}.mp3"))).collect());
+        queue.shuffle_indices = vec![3, 1, 4, 0, 2];
+        queue.current_index = Some(1);
+        for index in [4, 0, 2, 3, 1] {
+            assert_eq!(queue.next(true), Some(queue.items[index].clone()));
+        }
+        assert_eq!(queue.prev(true), Some(queue.items[3].clone()));
+        assert_eq!(queue.shuffle_indices, vec![3, 1, 4, 0, 2]);
+    }
+
+    #[test]
     fn test_queue_navigation() {
         let mut queue = PlaybackQueue::new();
         queue.add(PathBuf::from("song1.mp3"));
