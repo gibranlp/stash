@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.2 — 2026-11-26
+
+- Fix strict Clippy failures in shared-player settings, queue updates, and service migration without changing playback behavior.
+- Run strict Clippy checks before publishing release binaries.
+
 ## 1.0.1 — 2026-11-23
 
 - Select playback queue songs with `Insert`, `Shift+Up/Down`, or `*`, then copy them with `c` using the destination browser.

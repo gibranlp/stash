@@ -166,8 +166,11 @@ fn native_action(app: &mut App, request: &Value) -> Result<(), String> {
             state.visualizer_decay = request["decay"].as_f64().unwrap_or(0.88).clamp(0.0,1.0) as f32;
             app.config.repeat=state.repeat; app.config.shuffle=state.shuffle; app.config.visualizer_decay=state.visualizer_decay;
             drop(state);
-            if let Ok(folders) = serde_json::from_value::<Vec<String>>(request["folders"].clone()) {
-                if folders != app.config.music_folders { app.config.music_folders=folders; app.library.start_scan(&app.config.music_folders); }
+            if let Ok(folders) = serde_json::from_value::<Vec<String>>(request["folders"].clone())
+                && folders != app.config.music_folders
+            {
+                app.config.music_folders = folders;
+                app.library.start_scan(&app.config.music_folders);
             }
             app.config.save().map_err(|error|error.to_string())?;
         },
@@ -264,8 +267,12 @@ impl RemoteView {
     fn settings(app:&App)->Value { json!({"repeat":app.config.repeat,"shuffle":app.config.shuffle,"decay":app.config.visualizer_decay,"folders":app.config.music_folders}) }
     pub fn poll(&mut self, app:&mut App) {
         if self.last.elapsed()<Duration::from_millis(100) { return; }
-        if self.queue!=app.queue.items || self.index!=app.queue.current_index || self.shuffle_indices!=app.queue.shuffle_indices {
-            if let Err(error)=client_request(&json!({"action":"native-queue","paths":app.queue.items,"index":app.queue.current_index,"shuffle_indices":app.queue.shuffle_indices})) { app.notification=Some((error.to_string(),80)); }
+        if (self.queue != app.queue.items
+            || self.index != app.queue.current_index
+            || self.shuffle_indices != app.queue.shuffle_indices)
+            && let Err(error) = client_request(&json!({"action":"native-queue","paths":app.queue.items,"index":app.queue.current_index,"shuffle_indices":app.queue.shuffle_indices}))
+        {
+            app.notification = Some((error.to_string(), 80));
         }
         let settings=Self::settings(app);
         if settings!=self.settings {
@@ -342,12 +349,13 @@ pub fn ensure_compatible_service() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::spawn(move||{let _=child.wait();});
     let deadline=std::time::Instant::now()+Duration::from_secs(5);
     while std::time::Instant::now()<deadline {
-        if let Ok(value)=client_request(&json!({"action":"state"})) {
-            if value.get("status").is_some() && value.get("error").is_none() {
-                let result=client_request(&json!({"action":"native-volume","value":legacy["volume"].as_u64().unwrap_or(75)}))?;
-                if let Some(error)=result["error"].as_str() {return Err(error.to_string().into());}
-                return Ok(());
-            }
+        if let Ok(value) = client_request(&json!({"action":"state"}))
+            && value.get("status").is_some()
+            && value.get("error").is_none()
+        {
+            let result=client_request(&json!({"action":"native-volume","value":legacy["volume"].as_u64().unwrap_or(75)}))?;
+            if let Some(error)=result["error"].as_str() {return Err(error.to_string().into());}
+            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
     }

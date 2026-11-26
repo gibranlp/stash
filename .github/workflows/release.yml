@@ -43,6 +43,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+          components: clippy
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -67,6 +68,10 @@ jobs:
       - name: Install Linux system dependencies
         if: matrix.os == 'ubuntu-22.04'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libdbus-1-dev pkg-config playerctl ffmpeg
+
+      - name: Lint before publishing
+        if: matrix.os == 'ubuntu-22.04'
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test before publishing
         if: matrix.os == 'ubuntu-22.04'
